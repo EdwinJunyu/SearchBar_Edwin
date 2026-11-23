@@ -365,7 +365,19 @@ internal sealed class DictionaryStore : IDisposable
         {
             using var snapshot = db.BeginTransaction(deferred: true);
             var schema = SchemaIn(snapshot);
-            var hits = Lookup.Search(input, (key, reading) => Find(key, reading, only, snapshot, schema, token));
+            IEnumerable<LookupEntry> FindKey(string key, bool reading) => Find(key, reading, only, snapshot, schema, token);
+            var hits = Lookup.Search(input, FindKey);
+            if (hits.Count == 0)
+            {
+                hits = Lookup.SearchPhrases(input,
+                    (keys, reading, language) => ExistingTerms(keys, reading, language, only, snapshot, schema, token),
+                    FindKey, token);
+                hits = Lookup.SearchOxfordPhrases(input,
+                    key => Find(key, false, only, snapshot, schema, token, phrasalSenses: true), hits, token);
+            }
+            if (hits.Count == 0)
+                hits = SuggestSpelling(input, only, snapshot, schema, token);
+            hits = ApplyReadingPreferences(hits, snapshot, token);
             token.ThrowIfCancellationRequested();
             snapshot.Commit();
             return hits;
@@ -376,61 +388,243 @@ internal sealed class DictionaryStore : IDisposable
         }
     }
 
+    private HashSet<string> ExistingTerms(IEnumerable<string> keys, bool reading, string language, string? only,
+        SqliteTransaction snapshot, MetadataSchema schema, CancellationToken token)
+    {
+        var found = new HashSet<string>(StringComparer.Ordinal);
+        // 所有候选作为绑定参数，在同一读快照中按 terms_lookup 索引查找；分批避免 SQLite 参数上限。
+        foreach (var batch in keys.Distinct(StringComparer.Ordinal).Chunk(400))
+        {
+            token.ThrowIfCancellationRequested();
+            // 句内假名短语的预筛与 Find 采用同一读音来源。旧库的 kind=0 重定向可能仅有片假名词头。
+            bool kanaAliases = reading && language == "ja";
+            var probes = kanaAliases
+                ? batch.Concat(batch.Select(Lookup.ToKatakana)).Distinct(StringComparer.Ordinal).ToArray() : batch;
+            var names = Enumerable.Range(0, probes.Length).Select(i => "$k" + i).ToArray();
+            const string linkedAlias = "OR (t.kind=0 AND EXISTS (SELECT 1 FROM entries e WHERE e.dict=t.dict AND e.ordinal=t.ordinal AND e.link IS NOT NULL))";
+            using var cmd = Command($"""
+                SELECT DISTINCT t.term FROM terms t JOIN dictionaries d ON t.dict=d.id {schema.Join}
+                WHERE t.term IN ({string.Join(",", names)}) AND (t.kind=$kind {(kanaAliases ? linkedAlias : "")}) AND d.language=$lang
+                    AND ($only IS NULL OR d.id=$only) {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
+                """, snapshot);
+            cmd.Parameters.AddWithValue("$kind", reading ? 1 : 0);
+            cmd.Parameters.AddWithValue("$lang", language);
+            cmd.Parameters.AddWithValue("$only", (object?)only ?? DBNull.Value);
+            for (int i = 0; i < probes.Length; i++) cmd.Parameters.AddWithValue(names[i], probes[i]);
+            using var rows = cmd.ExecuteReader();
+            while (rows.Read())
+            {
+                string term = rows.GetString(0);
+                found.Add(kanaAliases ? Lookup.NormalizeReading(term) : term);
+            }
+        }
+        return found;
+    }
+
+    internal static string? PreferenceReading(LookupHit hit) =>
+        hit.Method is "reading" or "romaji" && hit.Entry.Language.StartsWith("ja", StringComparison.OrdinalIgnoreCase)
+        && !string.IsNullOrEmpty(hit.Term) ? Lookup.NormalizeReading(hit.Term) : null;
+
+    private bool HasReadingPreferences(SqliteTransaction? tx)
+    {
+        // 旧词库以只读方式打开时不做迁移，也可能被另一连接升级，按当前快照判断表是否存在。
+        using var cmd = Command("SELECT 1 FROM sqlite_master WHERE type='table' AND name='preferred_readings'", tx);
+        return cmd.ExecuteScalar() != null;
+    }
+
+    private string? PreferredHeadword(string reading, SqliteTransaction? tx)
+    {
+        using var cmd = Command("SELECT headword FROM preferred_readings WHERE reading=$reading", tx);
+        cmd.Parameters.AddWithValue("$reading", reading);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    internal string? ReadReadingPreference(string reading)
+    {
+        using var snapshot = db.BeginTransaction(deferred: true);
+        return HasReadingPreferences(snapshot) ? PreferredHeadword(reading, snapshot) : null;
+    }
+
+    private IReadOnlyList<LookupHit> ApplyReadingPreferences(IReadOnlyList<LookupHit> hits,
+        SqliteTransaction snapshot, CancellationToken token)
+    {
+        if (hits.Count < 2 || !hits.Any(hit => PreferenceReading(hit) != null) || !HasReadingPreferences(snapshot))
+            return hits;
+        LookupHit[]? ranked = null;
+        // 每组只使用原来的位置，让同音词的移动不挤走精确匹配、其他读音或变形结果。
+        foreach (var group in hits.Select((hit, i) => (Hit: hit, Slot: i)).GroupBy(row => PreferenceReading(row.Hit)))
+        {
+            token.ThrowIfCancellationRequested();
+            if (group.Key == null || group.Count() < 2 || PreferredHeadword(group.Key, snapshot) is not { } preferred) continue;
+            var ordered = group.OrderByDescending(row => Lookup.Normalize(row.Hit.Entry.Headword) == preferred);
+            ranked ??= hits.ToArray();
+            foreach (var (slot, item) in group.Zip(ordered))
+                ranked[slot.Slot] = item.Hit;
+        }
+        return ranked ?? hits;
+    }
+
+    public bool SetReadingPreference(LookupHit hit, bool clear)
+    {
+        if (PreferenceReading(hit) is not { } reading) return false;
+        using var tx = db.BeginTransaction();
+        // 在同一写事务里核对候选的词典版本、启用状态和原词头，拒绝重导前已过期的选择。
+        using var current = Command("""
+            SELECT 1 FROM entries e JOIN dictionaries d ON d.id=e.dict
+            LEFT JOIN dictionary_metadata m ON m.id=d.id
+            WHERE e.dict=$dict AND e.ordinal=$ordinal AND e.head=$head AND COALESCE(m.enabled,1)<>0
+              AND COALESCE(m.revision,d.sha256)=$revision
+            """, tx);
+        current.Parameters.AddWithValue("$dict", hit.Entry.DictionaryId);
+        current.Parameters.AddWithValue("$ordinal", hit.Entry.EntryId);
+        current.Parameters.AddWithValue("$head", hit.Entry.Headword);
+        current.Parameters.AddWithValue("$revision", (object?)hit.Entry.DictionaryRevision ?? DBNull.Value);
+        if (current.ExecuteScalar() == null) return false;
+        // 普通查词以及清除从未设置的首选不必升级旧库；首次有效保存与建表一起提交。
+        if (!HasReadingPreferences(tx))
+        {
+            if (clear) return true;
+            using var create = Command("CREATE TABLE preferred_readings(reading TEXT PRIMARY KEY, headword TEXT NOT NULL)", tx);
+            create.ExecuteNonQuery();
+        }
+        using var change = Command(clear ? "DELETE FROM preferred_readings WHERE reading=$reading" : """
+            INSERT INTO preferred_readings(reading,headword) VALUES($reading,$head)
+            ON CONFLICT(reading) DO UPDATE SET headword=excluded.headword
+            """, tx);
+        change.Parameters.AddWithValue("$reading", reading);
+        if (!clear) change.Parameters.AddWithValue("$head", Lookup.Normalize(hit.Entry.Headword));
+        change.ExecuteNonQuery();
+        tx.Commit();
+        return true;
+    }
+
     private IEnumerable<LookupEntry> Find(string key, bool reading, string? only, SqliteTransaction snapshot,
-        MetadataSchema schema, CancellationToken token)
+        MetadataSchema schema, CancellationToken token, bool phrasalSenses = false)
     {
         token.ThrowIfCancellationRequested();
-        // 旧库可能没有元数据或已记录上一个解析器版本。显式的解析器身份优先于词典 ID。
-        var oxfordParser = schema.HasRevision ? "m.parser_id" : "NULL";
-        // 旧库只为假名重定向键建立词头索引。按平、片假名补查这些别名，并沿同书链接传递其读音。
-        // UNION 按词条和起始读音去重，循环引用也会终止。
+        // 仅在原词典内跟随 MDX 重定向；UNION 去重可终止循环引用。
+        bool legacyChinese = !reading && !phrasalSenses && EntryParser.IsChineseExpression(key);
+        // 旧汉英库的索引只有「中文 英译」或「中文{学科} 英译」。两个窄区间均能使用 terms_lookup。
+        const string legacyCandidates = """
+            UNION ALL SELECT dict,ordinal,NULL,1 FROM terms WHERE kind=0 AND ($only IS NULL OR dict=$only)
+                AND ((term >= $startSpace AND term < $endSpace) OR (term >= $startTag AND term < $endTag))
+            """;
+        var hanyingParser = $"""
+            d.language='zh' AND d.filename LIKE '%.mdx' AND
+            COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
+                CASE WHEN d.id='hanying' OR d.filename=$hanyingName THEN 'hanying' END)='hanying'
+            """;
+        // 假名重定向也是读音证据。旧库没有这些读音键时，从词头索引补查两种假名书写。
+        // 非假名直接从 terms_lookup 出发，无需为了读音查询词典和正文。
         bool kana = Lookup.IsKana(key);
+        string seed = kana ? $"""
+            SELECT t.dict,t.ordinal,CASE WHEN e.link IS NOT NULL AND d.language='ja' THEN COALESCE(e.reading,e.head) END
+            FROM terms t JOIN entries e USING(dict,ordinal) JOIN dictionaries d ON d.id=t.dict
+            WHERE ($only IS NULL OR t.dict=$only) AND ((t.term=$key AND t.kind=$kind)
+                {(reading ? "OR (t.kind=0 AND t.term IN ($key,$katakana) AND e.link IS NOT NULL AND d.language='ja')" : "")})
+            """ : "SELECT dict,ordinal,NULL FROM terms WHERE term=$key AND kind=$kind AND ($only IS NULL OR dict=$only)";
         using var cmd = Command($"""
             WITH RECURSIVE found(dict,ordinal,aliasReading) AS (
-                SELECT t.dict,t.ordinal,CASE WHEN $kana AND e.link IS NOT NULL AND d.language='ja'
-                    THEN COALESCE(e.reading,e.head) END
-                FROM terms t JOIN entries e USING(dict,ordinal) JOIN dictionaries d ON d.id=t.dict
-                WHERE ($only IS NULL OR t.dict=$only) AND (
-                    (t.term=$key AND t.kind=$kind) OR
-                    ($fallback AND t.kind=0 AND t.term IN ($key,$katakana) AND e.link IS NOT NULL AND d.language='ja'))
+                {seed}
                 UNION
                 SELECT t.dict,t.ordinal,f.aliasReading FROM found f
                 JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
                 JOIN terms t ON t.dict=f.dict AND t.term=e.link AND t.kind=0
             )
             SELECT e.dict,e.ordinal,d.language,d.priority,e.head,COALESCE(f.aliasReading,e.reading),e.gloss,d.filename,{schema.Revision},
-                CASE WHEN {(schema.HasRevision ? "m.revision IS NULL AND" : "")} d.filename LIKE '%.mdx'
-                    AND (e.dict='shogakukan' OR e.evidence='MDX 正文首行假名')
-                    AND (e.reading IS NULL OR replace(replace(e.gloss,'・',''),'－','')=e.reading)
+                CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
+                    CASE WHEN e.dict='shogakukan' OR e.evidence='MDX 正文首行假名' THEN 'shogakukan' END)='shogakukan'
+                    AND (({(schema.HasRevision ? "m.revision IS NULL AND" : "")}
+                        (e.reading IS NULL OR replace(replace(e.gloss,'・',''),'－','')=e.reading))
+                        OR substr(e.gloss,-1)='〕' OR e.gloss GLOB '〈*〉' OR e.gloss GLOB '《*》')
                     THEN substr(e.raw,1,4096) END,
-                CASE WHEN d.filename LIKE '%.mdx' AND
-                    COALESCE({oxfordParser}, CASE WHEN d.id='oxford' OR d.filename=$oxfordName THEN 'oxford' END)='oxford'
-                    THEN e.raw END
-            FROM found f
+                CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
+                    CASE WHEN d.id='oxford' OR d.filename=$oxfordName THEN 'oxford' END)='oxford' THEN e.raw END,
+                CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
+                    CASE WHEN d.id='sanseido' OR d.filename=$sanseidoName THEN 'sanseido' END)='sanseido'
+                    THEN substr(e.raw,1,2048) END
+                ,CASE WHEN {hanyingParser} AND (instr(e.head,' ')>0 OR instr(e.head,'　')>0 OR instr(e.head,char(123))>0)
+                    THEN e.raw END, f.legacyChinese
+            FROM (SELECT dict,ordinal,aliasReading,0 AS legacyChinese FROM found
+                {(legacyChinese ? legacyCandidates : "")}) f
             JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
             JOIN dictionaries d ON d.id=e.dict {schema.Join} WHERE e.link IS NULL
+            {(legacyChinese ? $"AND (f.legacyChinese=0 OR ({hanyingParser}))" : "")}
             {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
             """, snapshot);
         cmd.Parameters.AddWithValue("$key",key);
-        cmd.Parameters.AddWithValue("$kana",kana);
-        cmd.Parameters.AddWithValue("$fallback",reading && kana);
-        cmd.Parameters.AddWithValue("$katakana",reading && kana ? Lookup.ToKatakana(key) : key);
+        cmd.Parameters.AddWithValue("$hanyingName", Path.GetFileName(Source.All.First(s => s.Id == "hanying").RelativePath));
+        if (legacyChinese)
+        {
+            cmd.Parameters.AddWithValue("$startSpace", key + " ");
+            cmd.Parameters.AddWithValue("$endSpace", key + "!");
+            cmd.Parameters.AddWithValue("$startTag", key + "{");
+            cmd.Parameters.AddWithValue("$endTag", key + "|");
+        }
+        cmd.Parameters.AddWithValue("$oxfordName", Path.GetFileName(Source.All.First(s => s.Id == "oxford").RelativePath));
+        cmd.Parameters.AddWithValue("$sanseidoName", Path.GetFileName(Source.All.First(s => s.Id == "sanseido").RelativePath));
         cmd.Parameters.AddWithValue("$kind",reading ? 1 : 0);
         cmd.Parameters.AddWithValue("$only",(object?)only ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$oxfordName",Path.GetFileName(Source.All.First(s => s.Id == "oxford").RelativePath));
+        if (reading && kana) cmd.Parameters.AddWithValue("$katakana", Lookup.ToKatakana(key));
         using var r = cmd.ExecuteReader();
         while (r.Read())
         {
             token.ThrowIfCancellationRequested();
             // 旧索引可能把读音存成首义。只检查本次命中且符合旧版回退特征的正文前缀。
-            var gloss = r.GetString(6);
-            if (!r.IsDBNull(9)) gloss = EntryParser.RefreshShogakukanGloss(gloss, r.GetString(9));
-            if (!r.IsDBNull(10)) gloss = EntryParser.OxfordGloss(r.GetString(10));
-            yield return new LookupEntry(r.GetString(0),r.GetInt64(1),r.GetString(2),r.GetInt32(3),
-                r.GetString(4), r.IsDBNull(5) ? null : r.GetString(5), gloss)
+            var entry = new LookupEntry(r.GetString(0), r.GetInt64(1), r.GetString(2), r.GetInt32(3),
+                r.GetString(4), r.IsDBNull(5) ? null : r.GetString(5), r.GetString(6))
                 { DictionaryName = r.GetString(7), DictionaryRevision = r.GetString(8) };
+            if (phrasalSenses)
+            {
+                // 第 10 列只给已识别的牛津 MDX 原文；继续保留父词条的词典、序号及版本以打开详情。
+                if (entry.Language == "en" && !r.IsDBNull(10) && Lookup.Normalize(entry.Headword) == key)
+                    foreach (var phrase in EntryParser.OxfordPhrasalSenses(r.GetString(10), key))
+                        yield return entry with { Headword = phrase.Headword, Gloss = phrase.Gloss, Anchor = phrase.Anchor };
+                continue;
+            }
+            var gloss = entry.Gloss;
+            var child = r.IsDBNull(12) ? null : EntryParser.HanyingReference(entry.Headword, r.GetString(12));
+            if (r.GetBoolean(13) && (child == null || Lookup.Normalize(child.Value.Headword) != key)) continue;
+            if (child is { } subentry)
+            {
+                yield return entry with { Headword = subentry.Headword, Gloss = subentry.Gloss };
+                continue;
+            }
+            if (!r.IsDBNull(9)) gloss = EntryParser.RefreshShogakukanGloss(gloss, r.GetString(9));
+            if (!r.IsDBNull(11)) gloss = EntryParser.RefreshSanseidoGloss(gloss, r.GetString(11));
+            // 已安装的牛津索引只存了首义。仅对本次命中的牛津词条从原文生成新版摘要。
+            (string Headword, string? Form)? reference = null;
+            if (!r.IsDBNull(10))
+            {
+                var body = r.GetString(10);
+                gloss = EntryParser.OxfordGloss(body);
+                if (Lookup.Normalize(gloss) == Lookup.Normalize(r.GetString(4)))
+                    reference = EntryParser.OxfordReferenceHeadword(body);
+            }
+            yield return entry with { Gloss = gloss, Reference = reference };
         }
         token.ThrowIfCancellationRequested();
+    }
+
+    private IReadOnlyList<LookupHit> SuggestSpelling(string input, string? only, SqliteTransaction snapshot,
+        MetadataSchema schema, CancellationToken token)
+    {
+        var keys = Lookup.SpellingKeys(Lookup.Normalize(input)).Distinct(StringComparer.Ordinal).ToArray();
+        if (keys.Length == 0) return [];
+        // 先批量探测词头索引，只为确实存在的词读取释义。同一拼写取用户排在最前的词典。
+        var known = ExistingTerms(keys, false, "en", only, snapshot, schema, token);
+        var choices = new List<LookupHit>(3);
+        foreach (var key in keys.Where(known.Contains))
+        {
+            var entry = Find(key, false, only, snapshot, schema, token)
+                .Where(e => e.Language == "en" && Lookup.Normalize(e.Headword) == key)
+                .OrderBy(e => e.Priority).ThenBy(e => e.DictionaryId, StringComparer.Ordinal).ThenBy(e => e.EntryId)
+                .FirstOrDefault();
+            if (entry == null) continue;
+            choices.Add(new(entry, "spelling", key, $"{entry.Headword} · {Lookup.Format(entry, "headword")}"));
+            if (choices.Count == 3) break;
+        }
+        return choices;
     }
 
     public string? CurrentBody(LookupEntry candidate)

@@ -10,6 +10,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Automation;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Threading;
@@ -60,6 +61,8 @@ public partial class SearchWindow : Window
         ClearButton.Click += (_, _) => { QueryBox.Clear(); QueryBox.Focus(); };
         DetailsButton.Click += (_, _) => ToggleDetails();
         InstallEverythingButton.Click += (_, _) => OpenWithShell("https://www.voidtools.com/downloads/");
+        SetReadingPreferenceButton.Click += async (_, _) => await ChangeReadingPreferenceAsync(clear: false);
+        ClearReadingPreferenceButton.Click += async (_, _) => await ChangeReadingPreferenceAsync(clear: true);
         CandidatePicker.SelectionChanged += (_, _) => { if (DetailsPanel.IsVisible) _ = ShowEntryAsync(); };
         SizeChanged += (_, e) =>
         {
@@ -207,12 +210,19 @@ public partial class SearchWindow : Window
     {
         // 设置变动只使词典结果失效；文件选择属于当前输入，可继续使用。
         catalogRevision++;
+        ClearDictionaryResults();
+        if (IsVisible && !composing && !string.IsNullOrWhiteSpace(QueryBox.Text) && !ShowCalculation(QueryBox.Text))
+            _ = SearchDictionaryAsync(QueryBox.Text, revision, CancellationToken.None);
+    }
+
+    private void ClearDictionaryResults()
+    {
         CloseDetails();
         CandidatePicker.ItemsSource = null;
         DetailsButton.Visibility = Visibility.Collapsed;
         GlossText.Text = "";
-        if (IsVisible && !composing && !string.IsNullOrWhiteSpace(QueryBox.Text) && !ShowCalculation(QueryBox.Text))
-            _ = SearchDictionaryAsync(QueryBox.Text, revision, CancellationToken.None);
+        OtherGlosses.ItemsSource = null;
+        SpellingChoices.ItemsSource = null;
     }
 
     private void RememberForeground(nint window)
@@ -542,11 +552,8 @@ public partial class SearchWindow : Window
         FilePanel.Visibility = Visibility.Collapsed;
         InstallEverythingButton.Visibility = Visibility.Collapsed;
         SetFileStatus("");
-        CloseDetails();
-        CandidatePicker.ItemsSource = null;
+        ClearDictionaryResults();
         ClearButton.Visibility = QueryBox.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
-        DetailsButton.Visibility = Visibility.Collapsed;
-        GlossText.Text = "";
         SetStatus("");
         if (!composing && IsVisible && !string.IsNullOrWhiteSpace(QueryBox.Text)) debounce.Start();
     }
@@ -732,8 +739,23 @@ public partial class SearchWindow : Window
                 using var store = new DictionaryStore(databasePath, readOnly: true);
                 return store.Search(text, dictionaryId, token);
             }, token);
-            if (request != revision || catalog != catalogRevision || !IsVisible || matches.Count == 0) return;
+            if (request != revision || catalog != catalogRevision || !IsVisible) return;
+            // 首选保存后的同词重查也可能遇到另一进程停用词库，先撤销已失效的详情。
+            if (matches.Count == 0)
+            {
+                ClearDictionaryResults();
+                return;
+            }
+            if (matches[0].Method == "spelling")
+            {
+                ClearDictionaryResults();
+                GlossText.Text = "你可能要查";
+                SpellingChoices.ItemsSource = matches;
+                return;
+            }
+            SpellingChoices.ItemsSource = null;
             GlossText.Text = matches[0].Display;
+            OtherGlosses.ItemsSource = Lookup.AdditionalPreviews(matches);
             var items = matches.Select(hit => new Candidate(hit)).ToArray();
             CandidatePicker.ItemsSource = items;
             CandidatePicker.SelectedIndex = 0;
@@ -744,6 +766,14 @@ public partial class SearchWindow : Window
         {
             if (IsVisible && request == revision && catalog == catalogRevision) SetStatus("词库读取失败：" + ex.Message);
         }
+    }
+
+    private void UseSpellingSuggestion(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement { DataContext: LookupHit { Method: "spelling" } hit }) return;
+        QueryBox.Text = hit.Entry.Headword;
+        QueryBox.CaretIndex = QueryBox.Text.Length;
+        QueryBox.Focus();
     }
 
     private async Task SearchFilesAsync(string text, long request, CancellationToken token)
@@ -821,31 +851,153 @@ public partial class SearchWindow : Window
 
     }
 
+    private async Task ChangeReadingPreferenceAsync(bool clear)
+    {
+        if (CandidatePicker.SelectedItem is not Candidate chosen || DictionaryStore.PreferenceReading(chosen.Hit) == null) return;
+        long request = revision, catalog = catalogRevision;
+        ReadingPreferencePanel.IsEnabled = false;
+        try
+        {
+            var saved = await Task.Run(() =>
+            {
+                using var store = new DictionaryStore(databasePath);
+                return store.SetReadingPreference(chosen.Hit, clear);
+            });
+            if (request != revision || catalog != catalogRevision || !IsVisible) return;
+            if (!saved)
+            {
+                RefreshDictionary();
+                SetStatus("词条已更新，请重新选择。");
+                return;
+            }
+
+            // 重新排序当前查询并保留详情选择；用户已切换查询时不触碰新的候选。
+            var selected = CandidatePicker.SelectedItem as Candidate;
+            long refreshed = ++catalogRevision;
+            await SearchDictionaryAsync(QueryBox.Text, request, CancellationToken.None);
+            if (request == revision && refreshed == catalogRevision && selected != null && DetailsPanel.IsVisible)
+            {
+                var same = CandidatePicker.Items.OfType<Candidate>().FirstOrDefault(item =>
+                    item.Hit.Entry.DictionaryId == selected.Hit.Entry.DictionaryId &&
+                    item.Hit.Entry.EntryId == selected.Hit.Entry.EntryId &&
+                    item.Hit.Entry.DictionaryRevision == selected.Hit.Entry.DictionaryRevision);
+                // WPF 对相等的选择不会触发 SelectionChanged，必须主动刷新首选按钮状态。
+                if (same != null && !Equals(CandidatePicker.SelectedItem, same)) CandidatePicker.SelectedItem = same;
+                else await ShowEntryAsync();
+            }
+        }
+        catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException)
+        {
+            if (request == revision && catalog == catalogRevision && IsVisible) SetStatus("读音首选保存失败：" + ex.Message);
+        }
+        finally { ReadingPreferencePanel.IsEnabled = true; }
+    }
+
+    private sealed record DetailBody(string Text, EntryAnchor? Anchor);
+
+    private static DetailBody FormatDetail(string raw, EntryAnchor? anchor)
+    {
+        // 坐标分界均在完整标签之间，先分段解码再映射。实体、嵌套标签和重复文字都不靠文本搜索定位。
+        static string Decode(string html)
+        {
+            var lines = Regex.Replace(html, @"<(?:br\b[^>]*|/p\s*|/div\s*|/li\s*|/tr\s*)>", "\n", RegexOptions.IgnoreCase);
+            return WebUtility.HtmlDecode(Regex.Replace(lines, @"</?[a-zA-Z][^>]*>", ""));
+        }
+        if (anchor == null)
+        {
+            var lines = Decode(raw).Split(['\r','\n'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            return new(string.Join(Environment.NewLine, lines), null);
+        }
+
+        var rawOffsets = new[] { anchor.Title.Start.Value, anchor.Title.End.Value, anchor.Sense.Start.Value, anchor.Sense.End.Value };
+        var offsets = new int[4];
+        var decoded = new StringBuilder();
+        int previous = 0;
+        for (int i = 0; i < offsets.Length; i++)
+        {
+            decoded.Append(Decode(raw[previous..rawOffsets[i]]));
+            offsets[i] = decoded.Length;
+            previous = rawOffsets[i];
+        }
+        decoded.Append(Decode(raw[previous..]));
+
+        // 与普通正文同样逐行裁切并省略空行，同时将四个解码后的边界换算为最终文本的位置。
+        var text = new StringBuilder();
+        int mapped = 0;
+        foreach (Match line in Regex.Matches(decoded.ToString(), @"[^\r\n]+"))
+        {
+            var trimmed = line.ValueSpan.Trim();
+            if (trimmed.IsEmpty) continue;
+            int start = line.Index + line.Length - line.ValueSpan.TrimStart().Length;
+            if (text.Length > 0) text.AppendLine();
+            while (mapped < offsets.Length && offsets[mapped] <= line.Index + line.Length)
+            {
+                offsets[mapped] = text.Length + Math.Clamp(offsets[mapped] - start, 0, trimmed.Length);
+                mapped++;
+            }
+            text.Append(trimmed);
+        }
+        while (mapped < offsets.Length) offsets[mapped++] = text.Length;
+        return new(text.ToString(), new EntryAnchor(offsets[0]..offsets[1], offsets[2]..offsets[3]));
+    }
+
+    private void DisplayDetail(DetailBody body)
+    {
+        DetailScroll.ScrollToTop();
+        if (body.Anchor is not { } anchor)
+        {
+            EntryText.Text = body.Text.Length == 0 ? "此词条正文为空。" : body.Text;
+            return;
+        }
+
+        var text = body.Text;
+        EntryText.Inlines.Clear();
+        Run Highlight(Range range) => new(text[range]) {
+            FontWeight = FontWeights.Bold, Background = System.Windows.Media.Brushes.LightGoldenrodYellow
+        };
+        var title = Highlight(anchor.Title);
+        EntryText.Inlines.Add(new Run(text[..anchor.Title.Start]));
+        EntryText.Inlines.Add(title);
+        EntryText.Inlines.Add(new Run(text[anchor.Title.End..anchor.Sense.Start]));
+        EntryText.Inlines.Add(Highlight(anchor.Sense));
+        EntryText.Inlines.Add(new Run(text[anchor.Sense.End..]));
+        // 按实际换行布局获得标题行的位置，长正文和缩放时仍滚到命中的小节。
+        EntryText.UpdateLayout();
+        var bounds = title.ContentStart.GetCharacterRect(LogicalDirection.Forward);
+        if (!bounds.IsEmpty) DetailScroll.ScrollToVerticalOffset(Math.Max(0, bounds.Top - 4));
+    }
+
     private async Task ShowEntryAsync()
     {
         if (CandidatePicker.SelectedItem is not Candidate chosen) return;
         long request = ++detailRevision;
         EntryText.Text = "正在读取词条…";
+        ReadingPreferencePanel.Visibility = Visibility.Collapsed;
+        var reading = DictionaryStore.PreferenceReading(chosen.Hit);
         try
         {
             var full = await Task.Run(() =>
             {
                 using var store = new DictionaryStore(databasePath, readOnly: true);
                 var raw = store.CurrentBody(chosen.Hit.Entry);
-                if (raw == null) return null;
-                // MDX HTML 仅作为文字呈现；保留义项和例句的段落，不执行外部资源。
-                var lines = Regex.Replace(raw, @"<(?:br\b[^>]*|/p\s*|/div\s*|/li\s*|/tr\s*)>", "\n", RegexOptions.IgnoreCase);
-                var plain = WebUtility.HtmlDecode(Regex.Replace(lines, @"</?[a-zA-Z][^>]*>", ""));
-                return string.Join(Environment.NewLine, plain.Split(['\r','\n'],
-                    StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries));
+                if (raw == null) return (Body: (DetailBody?)null, Preferred: (string?)null);
+                return (Body: FormatDetail(raw, chosen.Hit.Entry.Anchor), Preferred: reading == null ? null : store.ReadReadingPreference(reading));
             });
             if (request != detailRevision || !DetailsPanel.IsVisible) return;
-            if (full == null)
+            if (full.Body == null)
             {
                 RefreshDictionary();
                 return;
             }
-            EntryText.Text = full.Length == 0 ? "此词条正文为空。" : full;
+            DisplayDetail(full.Body);
+            if (reading != null)
+            {
+                bool current = Lookup.Normalize(chosen.Hit.Entry.Headword) == full.Preferred;
+                SetReadingPreferenceButton.Content = current ? "已设为此读音首选" : "设为此读音首选";
+                SetReadingPreferenceButton.IsEnabled = !current;
+                ClearReadingPreferenceButton.Visibility = full.Preferred == null ? Visibility.Collapsed : Visibility.Visible;
+                ReadingPreferencePanel.Visibility = Visibility.Visible;
+            }
         }
         catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or InvalidOperationException or UnauthorizedAccessException)
         {

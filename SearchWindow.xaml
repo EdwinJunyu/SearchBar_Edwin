@@ -98,6 +98,7 @@
                           StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
                 </Button>
                 <TextBlock x:Name="GlossText" AutomationProperties.AutomationId="GlossText"
+                           ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"
                            Grid.Column="3" VerticalAlignment="Center" TextAlignment="Right"
                            Margin="14,0,8,0" TextTrimming="CharacterEllipsis"
                            Foreground="{StaticResource Accent}" FontSize="17"/>
@@ -125,6 +126,29 @@
                 </Button>
             </Grid>
 
+            <ItemsControl x:Name="SpellingChoices" AutomationProperties.AutomationId="SpellingChoices"
+                          AutomationProperties.Name="拼写建议" Margin="20,0">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Button Click="UseSpellingSuggestion" AutomationProperties.Name="{Binding Display}"
+                                HorizontalContentAlignment="Left" ToolTip="{Binding Display}"
+                                Background="Transparent" BorderThickness="0" Padding="4,5" Margin="0,0,0,3">
+                            <TextBlock Text="{Binding Display}" TextTrimming="CharacterEllipsis"
+                                       Foreground="{StaticResource Accent}"/>
+                        </Button>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+            <ItemsControl x:Name="OtherGlosses" AutomationProperties.AutomationId="OtherGlosses"
+                          AutomationProperties.Name="其他词条预览" Margin="20,0">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <TextBlock Text="{Binding}" ToolTip="{Binding}" Margin="0,0,0,6"
+                                   Foreground="{StaticResource Accent}" TextTrimming="CharacterEllipsis"/>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
             <Border x:Name="DetailsPanel" AutomationProperties.AutomationId="DetailsPanel"
                     BorderThickness="0,1,0,0" BorderBrush="{StaticResource Divider}" Visibility="Collapsed">
                 <StackPanel Margin="20,15,20,17">
@@ -132,6 +156,12 @@
                               AutomationProperties.Name="选择词条和词典来源" DisplayMemberPath="Label"
                               HorizontalAlignment="Stretch" VerticalContentAlignment="Center"
                               Padding="8,3" MinHeight="30" MaxDropDownHeight="215" FontSize="13"/>
+                    <StackPanel x:Name="ReadingPreferencePanel" Orientation="Horizontal" Visibility="Collapsed" Margin="0,6,0,0">
+                        <Button x:Name="SetReadingPreferenceButton" AutomationProperties.AutomationId="SetReadingPreferenceButton"
+                                Content="设为此读音首选" Padding="7,3" Margin="0,0,7,0"/>
+                        <Button x:Name="ClearReadingPreferenceButton" AutomationProperties.AutomationId="ClearReadingPreferenceButton"
+                                Content="清除此读音首选" Padding="7,3"/>
+                    </StackPanel>
                     <ScrollViewer x:Name="DetailScroll" Margin="2,12,0,0" MaxHeight="215" VerticalScrollBarVisibility="Auto"
                                   HorizontalScrollBarVisibility="Disabled">
                         <TextBlock x:Name="EntryText" AutomationProperties.AutomationId="EntryText"
