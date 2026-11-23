@@ -1,7 +1,8 @@
 # 先执行 dotnet build -c Release。指定 -RealDatabase 可额外复验四本实际使用的词典。
 param([string] $RealDatabase, [switch] $Desktop, [switch] $FileDesktop, [string] $ColdStartFile,
       [switch] $SettingsDesktop, [string] $MdxSample, [string] $GuiExecutable, [switch] $OutOfOrder, [switch] $RestartEngine,
-      [ValidateSet('Files','Keyboard','ColdEdit','Tray')][string[]] $AcceptanceDesktop)
+      [ValidateSet('Files','Keyboard','ColdEdit','Tray')][string[]] $AcceptanceDesktop,
+      [string] $BackendTestDirectory)
 $ErrorActionPreference = 'Stop'
 # 失败重导本身也是验收项，命令退出码由 Invoke-Search 明确检查。
 $PSNativeCommandUseErrorActionPreference = $false
@@ -66,21 +67,86 @@ function Assert-Equal($Actual, $Expected, $Scenario) {
     if ($Actual -cne $Expected) { throw "$Scenario 预期「$Expected」，实际「$Actual」" }
 }
 
+function Test-EverythingRecovery([string]$Scratch, [Reflection.Assembly]$Assembly) {
+    # 使用独立管道对端模拟「收到请求但不返回」。不连接或停止用户的 Everything。
+    $marker = Join-Path $Scratch 'sdk-worker-accepted.txt'
+    $script = @'
+[Console]::InputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+while ($null -ne ($line = [Console]::ReadLine())) {
+    $query = ConvertFrom-Json -InputObject $line
+    if ($query -eq '无回包') {
+        [IO.File]::WriteAllText($env:E_SEARCH_WORKER_MARKER, [string]$PID)
+        [Threading.Thread]::Sleep(-1)
+    }
+    if ($query -eq '引擎未启动') { [Console]::WriteLine('{"Running":false}'); continue }
+    $file = @{ Name = $query; Parent = 'C:\test'; FullPath = "C:\test\$query" }
+    [Console]::WriteLine((ConvertTo-Json -Compress -Depth 4 -InputObject @{ Files = @($file) }))
+    if ($query -eq '结束') { break }
+}
+'@
+    $command = [Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
+    foreach ($arg in '-NoProfile','-NonInteractive','-EncodedCommand',[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))) {
+        $command.ArgumentList.Add($arg)
+    }
+    $command.Environment['E_SEARCH_WORKER_MARKER'] = $marker
+    $flags = [Reflection.BindingFlags]'Instance,Public,NonPublic'
+    $type = $Assembly.GetType('ESearch.EverythingSearch', $true)
+    $constructor = $type.GetConstructor($flags, $null, [type[]]@([Diagnostics.ProcessStartInfo],[TimeSpan]), $null)
+    if (!$constructor) { throw '文件搜索缺少可回收的独立 SDK 工作进程' }
+    $adapter = $constructor.Invoke(@($command, [TimeSpan]::FromSeconds(4)))
+    $method = $type.GetMethod('SearchAsync', $flags)
+    $status = [Console].GetMethod('WriteLine', [type[]]@([string])).CreateDelegate([Action[string]])
+    function Search-Worker([string]$query, [Threading.CancellationToken]$token = [Threading.CancellationToken]::None) {
+        $task = $method.Invoke($adapter, @($query, $status, $token))
+        $task.WaitAsync([TimeSpan]::FromSeconds(12)).GetAwaiter().GetResult()
+    }
+    Assert-Equal (Search-Worker '预热').Name '预热' '工作进程返回结果'
+    $failure = $null
+    try { $null = Search-Worker '无回包' } catch { $failure = $_.Exception }
+    while ($failure -and $failure -isnot [IO.IOException]) { $failure = $failure.InnerException }
+    if (!$failure -or $failure.InnerException -isnot [TimeoutException]) { throw '丢失回包应报告可恢复的查询超时' }
+    $stalled = [int][IO.File]::ReadAllText($marker)
+    Assert-Equal (Search-Worker '恢复查询').Name '恢复查询' '失联后同一适配器可再次搜索'
+    if (Get-Process -Id $stalled -ErrorAction SilentlyContinue) { throw '超时的 SDK 工作进程仍在运行' }
+    Write-Output 'PASS SDK 丢失回包后回收工作进程，同一适配器重新查询成功'
+    $previousEngine = $env:E_SEARCH_EVERYTHING_EXE
+    $retry = [Threading.CancellationTokenSource]::new()
+    $locked = $null
+    try {
+        $env:E_SEARCH_EVERYTHING_EXE = Join-Path $Scratch 'locked-engine.exe'
+        $locked = [IO.File]::Open($env:E_SEARCH_EVERYTHING_EXE, 'OpenOrCreate', 'ReadWrite', 'None')
+        $cause = $null
+        try { $null = Search-Worker '引擎未启动' } catch { $cause = $_.Exception.GetBaseException() }
+        if ($cause -isnot [ComponentModel.Win32Exception]) { throw "未观察到第一次启动失败：$cause" }
+        # 下一次查询仍应实际尝试启动。两次均由 Windows 报错，说明没有误入 60 秒冷却期。
+        $retry.CancelAfter(2000)
+        $cause = $null
+        try { $null = Search-Worker '引擎未启动' $retry.Token } catch { $cause = $_.Exception.GetBaseException() }
+        if ($cause -isnot [ComponentModel.Win32Exception]) { throw "启动失败后未立即重试：$cause" }
+        Write-Output 'PASS Everything 启动同步失败后，下一次查询立即重新尝试'
+    } finally {
+        if ($locked) { $locked.Dispose() }
+        $retry.Dispose()
+        $env:E_SEARCH_EVERYTHING_EXE = $previousEngine
+        $null = Search-Worker '结束'
+    }
+}
+
 # 从独立进程中的官方 SDK 直接取序，作为与浮窗比较的基线。只传入这次验收独有的关键词。
-function Get-EnginePaths([string]$Text, [switch]$IncludeFolders) {
-    if (-not ('ESearchEngineProbe' -as [type])) {
-        $suffix = switch ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
-            X64 { '64' } X86 { '32' } Arm64 { 'ARM64' } default { throw '当前进程架构不受支持' }
-        }
-        $sdk = Join-Path $PSScriptRoot "bin/Release/net10.0-windows/Everything$suffix.dll"
-        [void][Runtime.InteropServices.NativeLibrary]::Load($sdk)
-        Add-Type @'
+function Get-EngineProbe([Runtime.InteropServices.Architecture]$Architecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
+    $typeName = "ESearchEngineProbe$Architecture"
+    if ($typeName -as [type]) { return $typeName -as [type] }
+    $suffix = switch ($Architecture) {
+        X64 { '64' } X86 { '32' } Arm64 { 'ARM64' } default { throw '当前进程架构不受支持' }
+    }
+    $sdk = Join-Path $PSScriptRoot "bin/Release/net10.0-windows/Everything$suffix.dll"
+    Add-Type -PassThru -TypeDefinition @"
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
-public static class ESearchEngineProbe {
-    const string Dll = "Everything64.dll";
+public static class $typeName {
+    const string Dll = @"$sdk";
     [DllImport(Dll)] static extern void Everything_Reset();
     [DllImport(Dll, CharSet=CharSet.Unicode, ExactSpelling=true)] static extern void Everything_SetSearchW(string text);
     [DllImport(Dll)] static extern void Everything_SetRequestFlags(uint flags);
@@ -105,9 +171,10 @@ public static class ESearchEngineProbe {
         return files.ToArray();
     }
 }
-'@
-    }
-    [ESearchEngineProbe]::Paths($Text,$IncludeFolders.IsPresent)
+"@
+}
+function Get-EnginePaths([string]$Text, [switch]$IncludeFolders) {
+    (Get-EngineProbe)::Paths($Text,$IncludeFolders.IsPresent)
 }
 
 function FileRows {
@@ -124,6 +191,58 @@ function SelectedPath {
     }
 }
 function PathsOnScreen { (FileRows | ForEach-Object { $_.Current.Name }) -join "`n" }
+function Test-ImportIdentity([string]$Directory, [Reflection.Assembly]$Assembly) {
+    $source = $Assembly.GetType('Source', $true).GetField('All').GetValue($null) |
+        Where-Object Id -eq 'shogakukan'
+    $filename = [IO.Path]::GetFileName($source.RelativePath)
+    $first = [IO.Path]::Combine([IO.Directory]::CreateDirectory((Join-Path $Directory 'source-a')).FullName, $filename)
+    $second = [IO.Path]::Combine([IO.Directory]::CreateDirectory((Join-Path $Directory 'source-b')).FullName, $filename)
+    Write-Mdx $first ([ordered]@{'たべる'='たべる<br>【食べる】<br>吃'})
+    Write-Mdx $second ([ordered]@{'よむ'='よむ<br>【読む】<br>读'})
+    $type = $Assembly.GetType('DictionaryStore', $true)
+    $database = [IO.Path]::Combine($Directory,'identity.db')
+    # 从已有三列元数据表起步，覆盖已发布数据库的就地升级。
+    $connectionString = [Microsoft.Data.Sqlite.SqliteConnectionStringBuilder]::new()
+    $connectionString.DataSource = $database
+    $old = [Microsoft.Data.Sqlite.SqliteConnection]::new($connectionString.ToString())
+    try {
+        $old.Open()
+        $schema = $old.CreateCommand()
+        $schema.CommandText = 'CREATE TABLE dictionary_metadata(id TEXT PRIMARY KEY REFERENCES dictionaries ON DELETE CASCADE, source_path TEXT COLLATE NOCASE UNIQUE, enabled INTEGER NOT NULL DEFAULT 1)'
+        [void]$schema.ExecuteNonQuery()
+        $schema.Dispose()
+    } finally { $old.Dispose() }
+    $db = $type.GetConstructor([type[]]@([string],[bool])).Invoke(@($database, $false))
+    $import = $type.GetMethod('ImportDictionary')
+    try {
+        # 使用与设置窗口一致的入口；反射保留空替换目标，与显式指定 ID 区分。
+        $a = $import.Invoke($db, @($first, 'ja', $null, $null))
+        $b = $import.Invoke($db, @($second, 'ja', $null, $null))
+        Assert-Equal $a.Id $source.Id '第一次导入已知词典保留内置 ID'
+        Assert-Equal ($b.Id -ne $a.Id) $true '不同目录的同名词典拥有独立 ID'
+        Assert-Equal $db.ListDictionaries().Count 2 '默认导入保留两份来源'
+        Assert-Equal $db.Search('食べる', $a.Id, [Threading.CancellationToken]::None).Count 1 '原有来源仍可检索'
+        Assert-Equal $db.Search('読む', $b.Id, [Threading.CancellationToken]::None).Count 1 '同名新来源保留专用解析'
+        Write-Mdx $second ([ordered]@{'よむ'='よむ<br>【読む】<br>阅读'})
+        $updated = $import.Invoke($db, @($second, 'ja', $null, $null))
+        Assert-Equal $updated.Id $b.Id '再次导入相同来源只更新自己的词典'
+        Assert-Equal $db.Search('読む', $b.Id, [Threading.CancellationToken]::None)[0].Entry.Gloss '阅读' '同来源换版采用新词条'
+        Write-Output 'PASS 同名 MDX 按来源保留独立词库，同一路径更新原词典'
+        $renamed = [IO.Path]::Combine($Directory,'renamed.mdx')
+        [IO.File]::Copy($second, $renamed)
+        $replacement = $import.Invoke($db, @($renamed, 'ja', $null, $b.Id))
+        Assert-Equal $replacement.Sha256 $updated.Sha256 '改名替换使用完全相同的内容'
+        Assert-Equal $db.Search('読む', $b.Id, [Threading.CancellationToken]::None).Count 1 '显式替换改名 MDX 保留解析器'
+        Write-Mdx $renamed ([ordered]@{'みる'='みる<br>【見る】<br>看'})
+        $db.Dispose()
+        $db = $type.GetConstructor([type[]]@([string],[bool])).Invoke(@($database, $false))
+        $next = $import.Invoke($db, @($renamed, 'ja', $null, $null))
+        Assert-Equal $next.Id $b.Id '改名后的来源可独立更新'
+        Assert-Equal $db.Search('見る', $b.Id, [Threading.CancellationToken]::None).Count 1 '重开后换版继续使用已保存的 MDX 解析器'
+        Write-Output 'PASS 旧库元数据升级；改名替换及重启后换版仍保留专用解析'
+    } finally { $db.Dispose() }
+}
+
 function Write-HtmlFixture([string]$Path) {
     $title = 'ESearch-stage5-' + [Guid]::NewGuid().ToString('N')
     [IO.File]::WriteAllText($Path,"<!doctype html><meta charset=utf-8><title>$title</title><p>$title</p>")
@@ -165,7 +284,7 @@ function Test-FileSearch {
     $markers = @{}
     # 只探测初始状态，让正常输入负责后台启动，不主动结束任何已有 Everything 实例。
     $null = Get-EnginePaths $name
-    $cold = [ESearchEngineProbe]::Everything_GetMajorVersion() -eq 0
+    $cold = (Get-EngineProbe)::Everything_GetMajorVersion() -eq 0
     if ($ColdStartFile -and (!$cold -or !(Test-Path -LiteralPath $ColdStartFile -PathType Leaf))) {
         throw '-ColdStartFile 需要尚未启动的 Everything 和事先已进入索引的真实 taberu 文件'
     }
@@ -179,7 +298,7 @@ function Test-FileSearch {
         Write-Output "PASS 首次输入 taberu，仅输入一次；冷启动=$cold，观察到译义 ${glossMs}ms，文件 $($elapsed.ElapsedMilliseconds)ms；$probe"
     }
     # 普通模式允许索引中原先没有 taberu；待索引就绪后才创建本轮新的真实样本。
-    Wait-Desktop { [ESearchEngineProbe]::Everything_GetMajorVersion() -gt 0 } 'Everything 后台未就绪' 90000
+    Wait-Desktop { (Get-EngineProbe)::Everything_GetMajorVersion() -gt 0 } 'Everything 后台未就绪' 90000
     if ($AcceptanceDesktop) {
         $dirs=@('甲','乙') | ForEach-Object { [IO.Directory]::CreateDirectory((Join-Path $stage5Fixtures $_)).FullName }
         Wait-Desktop {
@@ -522,6 +641,60 @@ function Test-SettingsPage([switch]$Restarted) {
         Write-Output 'PASS Ctrl+Alt+F9 由独立进程真实注册占用，冲突后已有 Ctrl+Alt+F8 仍能实际唤起'
     } finally { [void][ESearchDesktop]::UnregisterHotKey($form.Handle,0x1471) }
 }
+function Test-JapaneseLookup([string]$Scratch, [Reflection.Assembly]$Assembly) {
+    $previous = $env:E_SEARCH_DB
+    $env:E_SEARCH_DB = Join-Path $Scratch 'japanese-lookup.db'
+    try {
+        # 「読む」的原键仅含汉字，假名变形须通过其读音索引找到同一词条。
+        $mdx = Join-Path $Scratch 'japanese-lookup.mdx'
+        Write-Mdx $mdx ([ordered]@{
+            '読む' = 'よむ<br>【読む】<br>读'
+            '赤' = 'あか<br>【赤】<p>例：<br>【１】<br>〔名〕<p>(1）红hóng,红色hóngsè<p>例：<br>赤い花'
+            'OK' = 'オー・ケー<br>【OK】<p>例：<br>【１】<br>〔感〕<br>好hǎo'
+            'けれど(も)' = 'けれど（も）<p>例：<br>【１】<br>《接続助詞》<p>(1)虽然suīrán'
+            '例示' = 'れいじ<br>【例示】<br>例：<br>例文だけ'
+        })
+        Invoke-Search @('import','shogakukan',$mdx) | Out-Null
+        foreach ($inputWord in 'よみました','ヨミマシタ') {
+            $result = @(Invoke-Search @('query',$inputWord,'shogakukan'))
+            Assert-Equal ($result -join "`n") "shogakukan:1`tdeinflection`tよむ`t読む（よむ） · 读" "$inputWord 还原后按读音匹配一次"
+        }
+        $connection = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$env:E_SEARCH_DB")
+        $connection.Open()
+        try {
+            $cmd = $connection.CreateCommand()
+            $cmd.CommandText = "SELECT gloss FROM entries WHERE dict='shogakukan' AND ordinal=2"
+            Assert-Equal ($cmd.ExecuteScalar()) '红,红色' '新导入的索引保存编号后的首义'
+            # 模拟已发布 SQLite 的旧摘要，覆盖读音含间隔点及读音为空的实际版式。
+            $cmd.CommandText = @"
+UPDATE entries SET gloss=CASE ordinal WHEN 2 THEN 'あか' WHEN 3 THEN 'オー・ケー' WHEN 4 THEN 'けれど（も）' END
+WHERE dict='shogakukan' AND ordinal BETWEEN 2 AND 4;
+UPDATE dictionary_metadata SET revision=NULL WHERE id='shogakukan'
+"@
+            [void]$cmd.ExecuteNonQuery()
+        } finally { $connection.Dispose() }
+        $ctor = $Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool]))
+        $reader = $ctor.Invoke([object[]]@($env:E_SEARCH_DB,$true))
+        try {
+            foreach ($row in @(@('赤','红,红色'), @('OK','好'), @('けれど(も)','虽然'), @('例示','れいじ'))) {
+                $hits = $reader.Search($row[0],'shogakukan',[Threading.CancellationToken]::None)
+                Assert-Equal $hits[0].Entry.Gloss $row[1] "旧库只读查询 $($row[0])"
+            }
+        } finally { $reader.Dispose() }
+        # 同一内置 ID 允许显式替换成个人词表，其多行释义须保留原样。
+        $csv = Join-Path $Scratch 'personal.csv'
+        [IO.File]::WriteAllText($csv, "word,gloss`nexample,`"序言`n例：`n【１】`n答案`"")
+        $writer = $ctor.Invoke([object[]]@($env:E_SEARCH_DB,$false))
+        try {
+            $mapping = [Activator]::CreateInstance($Assembly.GetType('TableMapping'),@(0,1,$null,$true))
+            $null = $writer.ImportDictionary($csv,'en',$mapping,'shogakukan')
+            $hit = $writer.Search('example','shogakukan',[Threading.CancellationToken]::None)[0]
+            Assert-Equal $hit.Display '序言' '个人词表沿用内置 ID 时仍显示自选释义首行'
+        } finally { $writer.Dispose() }
+        Write-Output 'PASS 纯假名还原、编号前置标签、例句边界和既有只读索引首义'
+    } finally { $env:E_SEARCH_DB = $previous }
+}
+
 # 实际桌面验收使用自建的原窗口。每次发键前检查前台句柄，避免输入到用户文档。
 function Test-Tray {
     if ((Control StatusText).Current.Name -notmatch '占用') { throw '预注册默认快捷键后浮窗没有显示冲突提示' }
@@ -784,7 +957,7 @@ public static class ESearchDesktop {
         }
         if ($Scenario -eq 'ColdEdit') {
             $null=Get-EnginePaths '冷启动'
-            if ([ESearchEngineProbe]::Everything_GetMajorVersion() -ne 0) { throw 'Everything 已启动，不能验证冷启动期间编辑' }
+            if ((Get-EngineProbe)::Everything_GetMajorVersion() -ne 0) { throw 'Everything 已启动，不能验证冷启动期间编辑' }
             $value.SetValue('taberu')
             Wait-Desktop { (Control FileStatusText).Current.Name -like '*等待 Everything*' } '未观察到等待 Everything 就绪'
             $value.SetValue('ext:pdf 报告')
@@ -982,6 +1155,166 @@ public static class ESearchDesktop {
     }
 }
 
+function Test-ReleaseDataLocation {
+    # 程序和两个启动目录均位于项目树外，以真实 CLI 进程验证发布版的默认位置。
+    $root = [IO.Directory]::CreateDirectory([IO.Path]::Combine([IO.Path]::GetTempPath(), 'ESearch-location-' + [guid]::NewGuid().ToString('N'))).FullName
+    $install = [IO.Directory]::CreateDirectory((Join-Path $root 'program')).FullName
+    $second = [IO.Directory]::CreateDirectory((Join-Path $root 'another-cwd')).FullName
+    $source = Split-Path $app
+    foreach ($file in Get-ChildItem -LiteralPath $source -File | Where-Object Extension -in '.dll','.json') {
+        [IO.File]::Copy($file.FullName, (Join-Path $install $file.Name))
+    }
+    $app = Join-Path $install 'E_Search.dll'
+    $fixture = Join-Path $root 'sample.mdx'
+    Write-Mdx $fixture ([ordered]@{example='verified definition'})
+    $oldDb = $env:E_SEARCH_DB
+    $oldProfile = $env:LOCALAPPDATA
+    Push-Location $install
+    try {
+        $env:E_SEARCH_DB = $null
+        $env:LOCALAPPDATA = Join-Path $root 'profile'
+        Invoke-Search @('import','oxford',$fixture) | Out-Null
+        Set-Location -LiteralPath $second
+        Assert-Equal @(Invoke-Search @('query','example','oxford')).Count 1 '更换工作目录后仍能使用个人词库'
+        Assert-Equal (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'E_Search/dictionaries.db')) $true '无种子包的用户数据库'
+    } finally {
+        Pop-Location
+        $env:E_SEARCH_DB = $oldDb
+        $env:LOCALAPPDATA = $oldProfile
+    }
+    Write-Output 'PASS 无种子发布版从不同目录启动共用个人词库'
+}
+
+function Test-EntryRevision([string]$Directory, [Reflection.Assembly]$Assembly) {
+    $path = Join-Path $Directory 'revision.csv'
+    [IO.File]::WriteAllText($path, "head,first,second`nexample,原义,新义")
+    $dbPath = Join-Path $Directory 'revision.db'
+    $storeType = $Assembly.GetType('DictionaryStore', $true)
+    $mappingType = $Assembly.GetType('TableMapping', $true)
+    $writer = [Activator]::CreateInstance($storeType, [object[]]@([string]$dbPath,$false))
+    try {
+        $import = $storeType.GetMethod('ImportDictionary')
+        $first = [Activator]::CreateInstance($mappingType, @(0,1,$null,$true))
+        $second = [Activator]::CreateInstance($mappingType, @(0,2,$null,$true))
+        $book = $import.Invoke($writer, @([string]$path,'en',$first,$null))
+        $old = $writer.Search('example',$book.Id,[Threading.CancellationToken]::None)[0].Entry
+        Assert-Equal ($writer.CurrentBody($old)) '原义' '同版本详情可读'
+        # 文件字节、词典 ID、序号均相同，仅映射改变，仍应判为新版本。
+        $null = $import.Invoke($writer, @([string]$path,'en',$second,$book.Id))
+        $reader = [Activator]::CreateInstance($storeType, [object[]]@([string]$dbPath,$true))
+        try {
+            if ($null -ne $reader.CurrentBody($old)) { throw '旧候选读取了另一版本的正文' }
+            $new = $reader.Search('example',$book.Id,[Threading.CancellationToken]::None)[0].Entry
+            Assert-Equal ($reader.CurrentBody($new)) '新义' '刷新后的候选指向新正文'
+        } finally { $reader.Dispose() }
+    } finally { $writer.Dispose() }
+    Write-Output 'PASS 相同文件换列重导后拒绝旧候选，刷新可读新正文'
+
+    # 把本测试库还原为旧版三列元数据，保持原词条、索引和文件哈希。
+    $config = [Microsoft.Data.Sqlite.SqliteConnectionStringBuilder]::new()
+    $config.DataSource = $dbPath
+    $legacy = [Microsoft.Data.Sqlite.SqliteConnection]::new($config.ToString())
+    try {
+        $legacy.Open()
+        $cmd = $legacy.CreateCommand()
+        $cmd.CommandText = @'
+BEGIN;
+CREATE TABLE legacy_metadata(id TEXT PRIMARY KEY REFERENCES dictionaries ON DELETE CASCADE,
+    source_path TEXT COLLATE NOCASE UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);
+INSERT INTO legacy_metadata SELECT id,source_path,enabled FROM dictionary_metadata;
+DROP TABLE dictionary_metadata;
+ALTER TABLE legacy_metadata RENAME TO dictionary_metadata;
+COMMIT;
+'@
+        [void]$cmd.ExecuteNonQuery()
+        $cmd.Dispose()
+    } finally { $legacy.Dispose() }
+    $reader = [Activator]::CreateInstance($storeType, [object[]]@([string]$dbPath,$true))
+    try {
+        $old = $reader.Search('example',$book.Id,[Threading.CancellationToken]::None)[0].Entry
+        Assert-Equal ($reader.CurrentBody($old)) '新义' '未迁移的旧库可读取详情'
+        $writer = [Activator]::CreateInstance($storeType, [object[]]@([string]$dbPath,$false))
+        try {
+            # 写连接此时才迁移 schema；同一文件重映射后，旧读连接也必须看到新的版本规则。
+            $null = $import.Invoke($writer, @([string]$path,'en',$first,$book.Id))
+            if ($null -ne $reader.CurrentBody($old)) { throw '迁移前打开的读连接把新正文配给了旧候选' }
+            $fresh = $reader.Search('example',$book.Id,[Threading.CancellationToken]::None)[0].Entry
+            Assert-Equal ($writer.CurrentBody($fresh)) '原义' '旧连接刷新后产生有效的新版本候选'
+        } finally { $writer.Dispose() }
+    } finally { $reader.Dispose() }
+    Write-Output 'PASS 旧读连接跨元数据迁移和相同文件重导，也能丢弃旧详情并刷新'
+}
+
+function Test-RunningCancellation([Reflection.Assembly]$Assembly) {
+    $storeType = $Assembly.GetType('DictionaryStore', $true)
+    $store = [Activator]::CreateInstance($storeType,@(':memory:',$false))
+    $cancel = [Threading.CancellationTokenSource]::new()
+    try {
+        $connection = $storeType.GetField('db',[Reflection.BindingFlags]'Instance,NonPublic').GetValue($store)
+        $cmd = $connection.CreateCommand()
+        $cmd.CommandText = @'
+INSERT INTO dictionaries VALUES('test','en',1,'source.csv','test-hash',512);
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<512)
+INSERT INTO entries(dict,ordinal,head,gloss,raw) SELECT 'test',i,'one1','sense','sense' FROM n;
+INSERT INTO terms SELECT dict,ordinal,0,head FROM entries;
+'@
+        [void]$cmd.ExecuteNonQuery()
+        $cmd.Dispose()
+        # 在 SQLite 已开始执行查询后触发取消，避免用延时猜测读到了哪一行。
+        $progress = [SQLitePCL.delegate_progress]{ param($state) $state.Cancel(); return 0 }
+        [SQLitePCL.raw]::sqlite3_progress_handler($connection.Handle,500,$progress,$cancel)
+        try {
+            $caught = $false
+            try { $null = $store.Search('one1','test',$cancel.Token) }
+            catch {
+                $cause = $_.Exception
+                while ($cause -and $cause -isnot [OperationCanceledException]) { $cause = $cause.InnerException }
+                if (!$cause) { throw }
+                $caught = $true
+            }
+            Assert-Equal $cancel.IsCancellationRequested $true '查询中触发取消'
+            Assert-Equal $caught $true '正在执行的查询应报告取消'
+        } finally { [SQLitePCL.raw]::sqlite3_progress_handler($connection.Handle,0,$null,$null) }
+        Assert-Equal $store.Search('one1','test',[Threading.CancellationToken]::None).Count 512 '取消后连接仍可查'
+    } finally { $cancel.Dispose(); $store.Dispose() }
+    Write-Output 'PASS 执行中取消词典查询，同一连接可继续检索'
+}
+
+function Test-EngineProbeBinding {
+    # 为三个目标生成实际探针并检查编译后的导入表；当前架构另外执行一次本地 SDK 调用。
+    foreach ($arch in 'X86','X64','Arm64') {
+        $probe = Get-EngineProbe $arch
+        $expected = @{ X86='Everything32.dll'; X64='Everything64.dll'; Arm64='EverythingARM64.dll' }[$arch]
+        $methods = $probe.GetMethods([Reflection.BindingFlags]'Static,Public,NonPublic') | Where-Object Name -like 'Everything_*'
+        if (!$methods) { throw "未找到 $arch 探针的原生绑定" }
+        foreach ($method in $methods) {
+            $attr = $method.GetCustomAttributes([Runtime.InteropServices.DllImportAttribute],$false)[0]
+            Assert-Equal ([IO.Path]::GetFileName($attr.Value)) $expected "$arch 的 $($method.Name) 绑定"
+            if (!(Test-Path -LiteralPath $attr.Value -PathType Leaf)) { throw "缺少 $arch SDK：$($attr.Value)" }
+        }
+        if ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString() -eq $arch) {
+            [void]$probe.GetMethod('Everything_Reset',[Reflection.BindingFlags]'Static,NonPublic').Invoke($null,$null)
+        }
+    }
+    Write-Output 'PASS 三种架构的探针绑定及当前架构的原生 SDK 调用'
+}
+
+if ($BackendTestDirectory) {
+    $uiDir = Join-Path $PSScriptRoot 'bin/Release/net10.0-windows'
+    foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search') {
+        $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $uiDir "$lib.dll"))
+    }
+    [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+    Test-ImportIdentity $BackendTestDirectory $assembly
+    Test-EverythingRecovery $BackendTestDirectory $assembly
+    Test-JapaneseLookup $BackendTestDirectory $assembly
+    Test-EntryRevision $BackendTestDirectory $assembly
+    Test-ReleaseDataLocation
+    Test-RunningCancellation $assembly
+    Test-EngineProbeBinding
+    return
+}
+
 $previousDb = $env:E_SEARCH_DB
 $previousEncoding = [Console]::OutputEncoding
 try {
@@ -1028,6 +1361,12 @@ try {
     Assert-Equal (Invoke-Search @('list') | Out-String) $before '失败重导后原词典元数据'
     Assert-Equal (Invoke-Search @('query','箸','shogakukan')) "shogakukan:4`theadword`t箸`tはし · 筷子" '失败重导后旧词条'
     Write-Output 'PASS 查询路径、候选排序、别名、未命中和失败重导回滚'
+    # 单独宿主运行接口回归，避免覆盖桌面验收实际加载的发布版程序集。
+    $psDll = Join-Path $PSHOME 'pwsh.dll'
+    if (!(Test-Path -LiteralPath $psDll)) { $psDll = Join-Path (Split-Path (Get-Command pwsh -ErrorAction Stop).Source) 'pwsh.dll' }
+    $config = Join-Path $PSScriptRoot 'bin/Release/net10.0-windows/E_Search.runtimeconfig.json'
+    & $dotnet exec --runtimeconfig $config --depsfile (Join-Path (Split-Path $psDll) 'pwsh.deps.json') $psDll -NoProfile -NonInteractive -File $PSCommandPath -BackendTestDirectory $scratch
+    if ($LASTEXITCODE -ne 0) { throw "接口回归退出码 $LASTEXITCODE" }
     if ($SettingsDesktop) {
         if ($MdxSample) { $MdxSample=(Resolve-Path -LiteralPath $MdxSample).Path }
         $settingsDb = Join-Path $scratch "settings.db"

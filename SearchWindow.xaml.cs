@@ -4,6 +4,7 @@ using System.IO;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Automation;
@@ -513,15 +514,21 @@ public partial class SearchWindow : Window
             var full = await Task.Run(() =>
             {
                 using var store = new DictionaryStore(databasePath, readOnly: true);
-                var raw = store.Detail(chosen.Hit.Entry.DictionaryId, chosen.Hit.Entry.EntryId).Raw;
+                var raw = store.CurrentBody(chosen.Hit.Entry);
+                if (raw == null) return null;
                 // MDX HTML 仅作为文字呈现；保留义项和例句的段落，不执行外部资源。
                 var lines = Regex.Replace(raw, @"<(?:br\b[^>]*|/p\s*|/div\s*|/li\s*|/tr\s*)>", "\n", RegexOptions.IgnoreCase);
                 var plain = WebUtility.HtmlDecode(Regex.Replace(lines, @"</?[a-zA-Z][^>]*>", ""));
                 return string.Join(Environment.NewLine, plain.Split(['\r','\n'],
                     StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries));
             });
-            if (request == detailRevision && DetailsPanel.IsVisible)
-                EntryText.Text = full.Length == 0 ? "此词条正文为空。" : full;
+            if (request != detailRevision || !DetailsPanel.IsVisible) return;
+            if (full == null)
+            {
+                RefreshDictionary();
+                return;
+            }
+            EntryText.Text = full.Length == 0 ? "此词条正文为空。" : full;
         }
         catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or InvalidOperationException or UnauthorizedAccessException)
         {
@@ -589,69 +596,156 @@ internal sealed class EverythingSearch
 {
     internal const int ResultLimit = 100;
     private const uint PageSize = 256;
-    // SDK 的搜索串、偏移和返回指针均为进程共享状态，直到路径复制完毕才允许下一次查询。
-    private static readonly SemaphoreSlim SdkGate = new(1);
-    private static long? lastStartupTick;
+    private readonly SemaphoreSlim gate = new(1);
+    private readonly ProcessStartInfo workerCommand;
+    private readonly TimeSpan replyTimeout;
+    private Process? worker;
+    private long? lastStartupTick;
+
+    // Files 为空表示引擎尚未就绪；就绪且零命中则返回空数组。
+    private sealed record WorkerReply(IReadOnlyList<FileHit>? Files = null, bool Running = false, string? Error = null);
+
+    internal EverythingSearch() : this(CreateWorkerCommand(), TimeSpan.FromSeconds(15)) { }
+
+    internal EverythingSearch(ProcessStartInfo workerCommand, TimeSpan replyTimeout)
+    {
+        this.workerCommand = workerCommand;
+        this.replyTimeout = replyTimeout;
+        workerCommand.UseShellExecute = false;
+        workerCommand.CreateNoWindow = true;
+        workerCommand.RedirectStandardInput = workerCommand.RedirectStandardOutput = true;
+        workerCommand.StandardInputEncoding = workerCommand.StandardOutputEncoding = new UTF8Encoding(false);
+    }
+
+    private static ProcessStartInfo CreateWorkerCommand()
+    {
+        var assembly = typeof(EverythingSearch).Assembly;
+        // DLL 由 dotnet 启动时复用相同的宿主；独立发布版直接启动自身。
+        var host = System.Reflection.Assembly.GetEntryAssembly() == assembly ? Environment.ProcessPath : null;
+        var command = new ProcessStartInfo(host ?? Path.ChangeExtension(assembly.Location, ".exe"));
+        if (string.Equals(Path.GetFileNameWithoutExtension(host), "dotnet", StringComparison.OrdinalIgnoreCase))
+            command.ArgumentList.Add(assembly.Location);
+        command.ArgumentList.Add("--everything-worker");
+        command.ArgumentList.Add(Environment.ProcessId.ToString());
+        return command;
+    }
 
     internal async Task<IReadOnlyList<FileHit>> SearchAsync(string input, Action<string> status, CancellationToken token)
     {
-        await SdkGate.WaitAsync(token).ConfigureAwait(false);
+        await gate.WaitAsync(token).ConfigureAwait(false);
         try
         {
-            return await Task.Run(async () =>
-            {
-                try
-                {
-                    await EnsureReadyAsync(status, token).ConfigureAwait(false);
-                    // 已连接表示这一轮启动结束。若用户随后退出引擎，下次输入应能立刻重新启动。
-                    lastStartupTick = null;
-                    token.ThrowIfCancellationRequested();
-                    return Search(input, token);
-                }
-                catch (Exception ex) when (ex is DllNotFoundException or BadImageFormatException or EntryPointNotFoundException)
-                {
-                    throw new IOException("无法加载与当前进程匹配的 Everything SDK。请检查程序目录中的官方 DLL。", ex);
-                }
-            }, token).ConfigureAwait(false);
+            return await Task.Run(() => SearchWhenReadyAsync(input, status, token), token).ConfigureAwait(false);
         }
-        finally
-        {
-            SdkGate.Release();
-        }
+        finally { gate.Release(); }
     }
 
-    private static async Task EnsureReadyAsync(Action<string> status, CancellationToken token)
+    private async Task<IReadOnlyList<FileHit>> SearchWhenReadyAsync(string input, Action<string> status, CancellationToken token)
     {
-        if (Native.Everything_IsDBLoaded()) return;
-        if (Native.Everything_GetMajorVersion() == 0)
+        string request = JsonSerializer.Serialize(input);
+        var watch = Stopwatch.StartNew();
+        bool waiting = false;
+        while (true)
         {
-            var executable = LocateEverything() ?? throw new FileNotFoundException("尚未找到 Everything。");
-            // 连续输入可能数次取消等待；启动冷却由所有查询共用，避免重复启动或弹出权限提示。
-            if (lastStartupTick is not long previous || Environment.TickCount64 - previous >= 60_000)
+            var reply = await RequestAsync(request, token).ConfigureAwait(false);
+            if (reply.Error != null) throw new IOException(reply.Error);
+            if (reply.Files != null)
             {
-                lastStartupTick = Environment.TickCount64;
-                var start = new System.Diagnostics.ProcessStartInfo(executable, "-startup") {
-                    UseShellExecute = false, CreateNoWindow = true, WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
-                };
-                try { using var process = System.Diagnostics.Process.Start(start); }
-                catch (System.ComponentModel.Win32Exception ex)
-                {
-                    throw new IOException("无法在后台启动 Everything。请先手动启动普通版后重试。" + ex.Message, ex);
-                }
+                lastStartupTick = null;
+                return reply.Files;
             }
-        }
-        status("正在等待 Everything 索引就绪…");
-        var watch = System.Diagnostics.Stopwatch.StartNew();
-        while (!Native.Everything_IsDBLoaded())
-        {
             // 大型个人索引可能加载数分钟。能连接到引擎时继续等待，输入变化仍可取消。
-            if (watch.Elapsed >= TimeSpan.FromSeconds(35) && Native.Everything_GetMajorVersion() == 0)
+            if (!reply.Running && watch.Elapsed >= TimeSpan.FromSeconds(35))
             {
                 lastStartupTick = null;
                 throw new IOException("Everything 尚未就绪。请确认普通版已运行且索引可用，然后重新查询。");
             }
+            if (!reply.Running && (lastStartupTick is not long previous || Environment.TickCount64 - previous >= 60_000))
+            {
+                var executable = LocateEverything() ?? throw new FileNotFoundException("尚未找到 Everything。");
+                try
+                {
+                    using var process = Process.Start(new ProcessStartInfo(executable, "-startup") {
+                        UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden
+                    });
+                    // 已有启动请求才需要抑制重复启动；同步失败后允许下次输入立即重试。
+                    if (process != null) lastStartupTick = Environment.TickCount64;
+                }
+                catch (Win32Exception ex) { throw new IOException("无法在后台启动 Everything。请先手动启动普通版后重试。" + ex.Message, ex); }
+            }
+            if (!waiting) { status("正在等待 Everything 索引就绪…"); waiting = true; }
             await Task.Delay(200, token).ConfigureAwait(false);
         }
+    }
+
+    private async Task<WorkerReply> RequestAsync(string request, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (worker is { HasExited: true } exited) { ClosePipes(exited); worker = null; }
+        worker ??= Process.Start(workerCommand) ?? throw new IOException("无法启动文件查询工作进程。");
+        var process = worker;
+        async Task<WorkerReply> Exchange()
+        {
+            await process.StandardInput.WriteLineAsync(request).ConfigureAwait(false);
+            var line = await process.StandardOutput.ReadLineAsync().ConfigureAwait(false);
+            if (line == null) throw new IOException("文件查询工作进程已退出，请重新查询。");
+            return JsonSerializer.Deserialize<WorkerReply>(line) ?? throw new IOException("文件查询响应为空。");
+        }
+
+        var exchange = Exchange();
+        try { return await exchange.WaitAsync(replyTimeout, token).ConfigureAwait(false); }
+        catch (Exception error)
+        {
+            // 同步 SDK 即使在就绪探测中也可能永久阻塞。先终止独立进程，再让下一次查询使用新管道。
+            worker = null;
+            try { if (!process.HasExited) process.Kill(); }
+            catch (InvalidOperationException) when (process.HasExited) { }
+            finally { ClosePipes(process); }
+            _ = exchange.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+            if (error is not OperationCanceledException) lastStartupTick = null;
+            if (error is TimeoutException) throw new IOException("Everything 查询未在时限内响应，请重新查询。", error);
+            if (error is JsonException) throw new IOException("无法读取文件查询响应。", error);
+            throw;
+        }
+    }
+
+    private static void ClosePipes(Process process)
+    {
+        // 取消时可能仍有异步读写。直接关闭旧管道，不尝试刷新已经作废的查询。
+        process.StandardInput.BaseStream.Dispose();
+        process.StandardOutput.Dispose();
+        process.Dispose();
+    }
+
+    internal static int RunWorker(int parentId)
+    {
+        try
+        {
+            // 父进程意外退出时，即使 SDK 正在等待回包，工作进程也能自行结束。
+            using var parent = Process.GetProcessById(parentId);
+            parent.Exited += (_, _) => Environment.Exit(0);
+            parent.EnableRaisingEvents = true;
+            using var input = new StreamReader(Console.OpenStandardInput(), Encoding.UTF8);
+            using var output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+            while (input.ReadLine() is string line)
+            {
+                var query = JsonSerializer.Deserialize<string>(line);
+                if (query == null) return 1;
+                WorkerReply reply;
+                try
+                {
+                    reply = Native.Everything_IsDBLoaded()
+                        ? new WorkerReply(Search(query))
+                        : new WorkerReply(Running: Native.Everything_GetMajorVersion() != 0);
+                }
+                catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
+                { reply = new WorkerReply(Error: "无法加载与当前进程匹配的 Everything SDK。请检查程序目录中的官方 DLL。"); }
+                catch (IOException ex) { reply = new WorkerReply(Error: ex.Message); }
+                output.WriteLine(JsonSerializer.Serialize(reply));
+            }
+            return 0;
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or Win32Exception or IOException or JsonException) { return 1; }
     }
 
     private static string? LocateEverything()
@@ -674,7 +768,7 @@ internal sealed class EverythingSearch
         return null;
     }
 
-    private static IReadOnlyList<FileHit> Search(string input, CancellationToken token)
+    private static IReadOnlyList<FileHit> Search(string input)
     {
         // 额外的精确查询覆盖整个索引，避免普通查询先截断时，漏掉排在后面的同名文件。
         // 原查询始终原样发送；原生表达式只走原查询。两批内部均保留 SDK 的原始顺序。
@@ -683,8 +777,8 @@ internal sealed class EverythingSearch
         var output = new List<FileHit>(ResultLimit);
         try
         {
-            if (plain) AppendFiles($"file:wfn:\"{input}\"", input, true, output, token);
-            AppendFiles(input, plain ? input : null, false, output, token);
+            if (plain) AppendFiles($"file:wfn:\"{input}\"", input, true, output);
+            AppendFiles(input, plain ? input : null, false, output);
             return output;
         }
         finally
@@ -693,14 +787,13 @@ internal sealed class EverythingSearch
         }
     }
 
-    private static void AppendFiles(string query, string? exactName, bool exactPass, List<FileHit> output, CancellationToken token)
+    private static void AppendFiles(string query, string? exactName, bool exactPass, List<FileHit> output)
     {
         Native.Everything_SetSearchW(query);
         Native.Everything_SetRequestFlags(3); // EVERYTHING_REQUEST_FILE_NAME | EVERYTHING_REQUEST_PATH
         Native.Everything_SetMax(PageSize);
         for (uint offset = 0; ; offset += PageSize)
         {
-            token.ThrowIfCancellationRequested();
             Native.Everything_SetOffset(offset);
             if (!Native.Everything_QueryW(true))
                 throw new IOException($"Everything 查询失败（SDK 错误 {Native.Everything_GetLastError()}）。");

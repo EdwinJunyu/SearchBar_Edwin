@@ -1,6 +1,10 @@
 using System.Text;
 
 #if WINDOWS
+// 文件查询工作进程只读写父进程的管道，无需打开数据库或创建桌面窗口。
+if (args is ["--everything-worker", var parent] && int.TryParse(parent, out int parentId))
+    return ESearch.EverythingSearch.RunWorker(parentId);
+
 // WinExe 默认从托盘浮窗进入；独立的 net10.0 入口继续承载原命令行操作。
 if (args.Length == 0 || args[0] == "gui")
 {
@@ -44,37 +48,32 @@ static string FindDatabase()
     var configured = Environment.GetEnvironmentVariable("E_SEARCH_DB");
     if (!string.IsNullOrWhiteSpace(configured)) return Path.GetFullPath(configured);
     string seed = Path.Combine(AppContext.BaseDirectory, "Data", "dictionaries.db");
-    if (File.Exists(seed))
+    bool hasSeed = File.Exists(seed);
+    if (!hasSeed)
     {
-        // 安装目录可以只读。首启用完整快照初始化个人词库，后续发布也保留已导入的词典及热键。
-        string profile = Environment.GetEnvironmentVariable("LOCALAPPDATA") ??
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        string directory = Path.Combine(profile, "E_Search");
-        string database = Path.Combine(directory, "dictionaries.db");
-        if (File.Exists(database)) return database;
-        Directory.CreateDirectory(directory);
-        string temporary = Path.Combine(directory, $"dictionaries-{Guid.NewGuid():N}.tmp");
-        try
-        {
-            // 只复制内容，避免把安装介质的只读文件属性带入个人词库。
-            using (var source = File.OpenRead(seed))
-            using (var target = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                source.CopyTo(target);
-            // 同时启动的另一个进程只能看见已经复制完整的数据库。
-            try { File.Move(temporary, database); }
-            catch (IOException) when (File.Exists(database)) { }
-        }
-        finally
-        {
-            File.Delete(temporary);
-        }
-        return database;
+        // 工程内的开发输出沿用项目词库；独立安装的位置与启动时的工作目录无关。
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
+            if (File.Exists(Path.Combine(dir.FullName, "E_Search.csproj")))
+                return Path.Combine(dir.FullName, ".data", "dictionaries.db");
     }
-    // 开发构建继续使用项目内已导入的词库。
-    for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
-        if (File.Exists(Path.Combine(dir.FullName, "E_Search.csproj")))
-            return Path.Combine(dir.FullName, ".data", "dictionaries.db");
-    return Path.GetFullPath(".data/dictionaries.db");
+    string profile = Environment.GetEnvironmentVariable("LOCALAPPDATA") ??
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    string directory = Path.Combine(profile, "E_Search");
+    string database = Path.Combine(directory, "dictionaries.db");
+    if (!hasSeed || File.Exists(database)) return database;
+    Directory.CreateDirectory(directory);
+    string temporary = Path.Combine(directory, $"dictionaries-{Guid.NewGuid():N}.tmp");
+    try
+    {
+        // 安装目录可以只读。并发首启只发布一份复制完整且可写的种子库。
+        using (var source = File.OpenRead(seed))
+        using (var target = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            source.CopyTo(target);
+        try { File.Move(temporary, database); }
+        catch (IOException) when (File.Exists(database)) { }
+    }
+    finally { File.Delete(temporary); }
+    return database;
 }
 
 Console.OutputEncoding = new UTF8Encoding(false);

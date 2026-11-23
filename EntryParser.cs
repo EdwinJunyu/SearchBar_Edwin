@@ -97,20 +97,35 @@ internal static partial class EntryParser
         var reading = Kana(lines[0]);
         var written = lines.Length > 1 ? WrittenForms(lines[1]) : [];
         var head = written.FirstOrDefault() ?? reading ?? key;
+        return new(head, reading, reading == null ? null : "MDX 正文首行假名",
+            Preview(ShogakukanSense(lines, out _), body), null, written.Skip(1).ToArray());
+    }
+
+    // 已发布的索引保存了旧摘要。只修正可辨认的编号段，其他版式沿用已存结果。
+    internal static string RefreshShogakukanGloss(string storedGloss, string rawPrefix)
+    {
+        var sense = ShogakukanSense(Lines(rawPrefix, 4096), out bool numberedSection);
+        return numberedSection && sense != null ? Preview(sense, rawPrefix) : storedGloss;
+    }
+
+    private static string? ShogakukanSense(string[] lines, out bool numberedSection)
+    {
         var start = lines.Length > 1 && lines[1].StartsWith('【') ? 2 : 1;
-        string? gloss = null;
-        foreach (var line in lines.Skip(start))
+        // 此书将「例：」也用于引出【１】义项分组。正常例句仍是首义提取的停止边界。
+        numberedSection = start + 1 < lines.Length && lines[start] is "例：" or "例:"
+            && lines[start + 1] is "【１】" or "【1】";
+        if (numberedSection) start += 2;
+        for (int i = start; i < lines.Length; i++)
         {
+            var line = lines[i];
             if (line.StartsWith("例：") || line.StartsWith("例:")) break;
+            if (numberedSection && line.StartsWith('《') && line.EndsWith('》')) continue;
             var sense = LeadingLabels().Replace(line, "").Trim();
             if (sense.Length == 0) continue;
             // 注音附在汉字后，如“吃chī”。只移除可辨识的拼音，正文保持原样。
-            sense = Pinyin().Replace(sense, m => ToneMark().IsMatch(m.Value) ? "" : m.Value);
-            gloss = sense;
-            break;
+            return Pinyin().Replace(sense, m => ToneMark().IsMatch(m.Value) ? "" : m.Value);
         }
-        return new(head, reading, reading == null ? null : "MDX 正文首行假名",
-            Preview(gloss, body), null, written.Skip(1).ToArray());
+        return null;
     }
 
     private static ParsedEntry Sanseido(string key, string body)

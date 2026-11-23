@@ -9,6 +9,7 @@ public sealed record LookupEntry(string DictionaryId, long EntryId, string Langu
     string Headword, string? Reading, string Gloss)
 {
     public string? DictionaryName { get; init; }
+    public string? DictionaryRevision { get; init; }
 }
 
 public sealed record LookupHit(LookupEntry Entry, string Method, string Term, string Display);
@@ -57,8 +58,13 @@ public static class Lookup
             Collect(kana, true, "romaji", 1, true);
 
         // 还原规则只生成候选。存在于启用的日语词库中的候选才参与排序。
-        foreach (var lemma in Lemmas(term).Distinct(StringComparer.Ordinal))
+        var inflected = IsKana(term) ? NormalizeReading(term) : term;
+        foreach (var lemma in Lemmas(inflected).Distinct(StringComparer.Ordinal))
+        {
             Collect(lemma, false, "deinflection", 2, true);
+            // 纯假名变形的原形可能只存在于汉字词头的读音索引。两路按同一条目标识去重。
+            if (IsKana(lemma)) Collect(NormalizeReading(lemma), true, "deinflection", 2, true);
+        }
         return hits.Values.OrderBy(x => x.Rank).ThenBy(x => x.Hit.Entry.Priority)
             .ThenBy(x => x.Hit.Entry.DictionaryId, StringComparer.Ordinal)
             .ThenBy(x => x.Hit.Entry.EntryId).Select(x => x.Hit).ToArray();

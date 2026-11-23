@@ -7,6 +7,7 @@ internal sealed class DictionaryStore : IDisposable
 {
     private readonly SqliteConnection db;
     private readonly bool hasMetadata;
+    private readonly bool hasRevision;
 
     public DictionaryStore(string path, bool readOnly = false)
     {
@@ -17,9 +18,8 @@ internal sealed class DictionaryStore : IDisposable
         db.Open();
         if (readOnly)
         {
-            // 老数据库仍能直接只读查询；第一次进入设置时才补上元数据表。
-            using var check = Command("SELECT 1 FROM sqlite_master WHERE type='table' AND name='dictionary_metadata'");
-            hasMetadata = check.ExecuteScalar() != null;
+            // 只读查词不修改旧库；用实际列信息选择该版本能执行的查询。
+            (hasMetadata, hasRevision) = ReadMetadataSchema();
             return;
         }
         using var schema = Command("""
@@ -40,12 +40,49 @@ internal sealed class DictionaryStore : IDisposable
             CREATE INDEX IF NOT EXISTS terms_lookup ON terms(term,kind,dict,ordinal);
             CREATE TABLE IF NOT EXISTS dictionary_metadata(
                 id TEXT PRIMARY KEY REFERENCES dictionaries ON DELETE CASCADE,
-                source_path TEXT COLLATE NOCASE UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);
+                source_path TEXT COLLATE NOCASE UNIQUE, enabled INTEGER NOT NULL DEFAULT 1,
+                parser_id TEXT, revision TEXT);
             CREATE TABLE IF NOT EXISTS app_settings(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
             """);
         schema.ExecuteNonQuery();
-        hasMetadata = true;
+        if (!ReadMetadataSchema().HasRevision)
+        {
+            // 并发首次打开旧库时，取得写锁后重新检查，两列须一起生效。
+            using var migration = db.BeginTransaction();
+            if (!ReadMetadataSchema(migration).HasRevision)
+            {
+                using var upgrade = Command("""
+                    ALTER TABLE dictionary_metadata ADD COLUMN parser_id TEXT;
+                    ALTER TABLE dictionary_metadata ADD COLUMN revision TEXT;
+                    """, migration);
+                upgrade.ExecuteNonQuery();
+            }
+            migration.Commit();
+        }
+        hasMetadata = hasRevision = true;
     }
+
+    private readonly record struct MetadataSchema(bool HasMetadata, bool HasRevision)
+    {
+        public string Join => HasMetadata ? "LEFT JOIN dictionary_metadata m ON m.id=d.id" : "";
+        // 旧库首次重导前由文件哈希标识；新版本号还能区分相同文件的不同列映射。
+        public string Revision => HasRevision ? "COALESCE(m.revision,d.sha256)" : "d.sha256";
+    }
+
+    private MetadataSchema ReadMetadataSchema(SqliteTransaction? tx = null)
+    {
+        using var check = Command("""
+            SELECT COUNT(*), COUNT(CASE WHEN name='revision' THEN 1 END)
+            FROM pragma_table_info('dictionary_metadata')
+            """, tx);
+        using var columns = check.ExecuteReader();
+        columns.Read();
+        return new(columns.GetInt32(0) > 0, columns.GetInt32(1) > 0);
+    }
+
+    // 长时间打开的旧库连接可能遇到另一进程升级。列结构与读取的数据必须来自同一快照。
+    private MetadataSchema SchemaIn(SqliteTransaction snapshot) =>
+        hasRevision ? new(true,true) : ReadMetadataSchema(snapshot);
 
     private SqliteCommand Command(string sql, SqliteTransaction? tx = null)
     {
@@ -86,36 +123,50 @@ internal sealed class DictionaryStore : IDisposable
         input.Position = 0;
         // 在写事务内确定身份及优先级，避免两次并发导入同一路径时创建两个词库。
         using var tx = db.BeginTransaction();
-        var known = cliSource ?? Source.All.FirstOrDefault(s =>
-            filename.Equals(Path.GetFileName(s.RelativePath), StringComparison.OrdinalIgnoreCase));
+        static Source? SourceForFilename(string name) => Source.All.FirstOrDefault(s =>
+            name.Equals(Path.GetFileName(s.RelativePath), StringComparison.OrdinalIgnoreCase));
+        var known = cliSource ?? SourceForFilename(filename);
         var dictionaries = ReadCatalog(tx);
         using var fromPath = Command("SELECT id FROM dictionary_metadata WHERE source_path=$path", tx);
         fromPath.Parameters.AddWithValue("$path", path);
         var originalId = fromPath.ExecuteScalar() as string;
-        // 第一阶段只保存文件名。仅在唯一旧记录与文件名相符时自动认领，避免同名新文件被误替换。
+        // 旧库没有来源路径。仅当文件名和内容哈希都指向唯一旧记录时才自动认领。
         using var legacy = Command("""
             SELECT d.id FROM dictionaries d LEFT JOIN dictionary_metadata m ON m.id=d.id
-            WHERE d.filename=$filename COLLATE NOCASE AND m.source_path IS NULL LIMIT 2
+            WHERE d.filename=$filename COLLATE NOCASE AND d.sha256=$hash AND m.source_path IS NULL LIMIT 2
             """, tx);
         legacy.Parameters.AddWithValue("$filename", filename);
+        legacy.Parameters.AddWithValue("$hash", hash);
         string? legacyId = null;
-        if (cliSource == null && replaceId == null && originalId == null && known == null)
+        if (cliSource == null && replaceId == null && originalId == null)
         {
             using var matches = legacy.ExecuteReader();
             if (matches.Read()) legacyId = matches.GetString(0);
             if (matches.Read()) legacyId = null;
         }
-        var id = cliSource?.Id ?? replaceId ?? originalId ?? known?.Id ?? legacyId ?? Guid.NewGuid().ToString("N");
+        // 内置文件名可以识别排版，但不能证明两个目录中的文件属于同一词库。
+        var newKnownId = known != null && !dictionaries.Any(d => d.Id == known.Id) ? known.Id : null;
+        var id = cliSource?.Id ?? replaceId ?? originalId ?? legacyId ?? newKnownId ?? Guid.NewGuid().ToString("N");
         var existing = dictionaries.FirstOrDefault(item => item.Id == id);
         if (replaceId != null && existing == null) throw new ArgumentException("要替换的词典已不存在，请刷新列表");
         if (originalId != null && originalId != id) throw new InvalidDataException("此文件已属于另一词典，请选择对应词典重新导入");
+        string parserId = known?.Id ?? "";
+        if (mapping == null && known == null && existing != null && (originalId == id || existing.Sha256 == hash))
+        {
+            // 内容相同的改名文件、同一来源的后续版本均沿用排版。旧库尚未记录解析器时从原书识别。
+            using var previous = Command("SELECT parser_id FROM dictionary_metadata WHERE id=$id", tx);
+            previous.Parameters.AddWithValue("$id", id);
+            parserId = previous.ExecuteScalar() as string ?? SourceForFilename(existing.Filename)?.Id ??
+                Source.All.FirstOrDefault(s => s.Id == existing.Id && Path.GetExtension(existing.Filename)
+                    .Equals(".mdx", StringComparison.OrdinalIgnoreCase))?.Id ?? "";
+        }
         int priority;
         if (existing != null) priority = existing.Priority;
         else if (mapping != null) priority = checked(dictionaries.Select(d => d.Priority).Append(1).Min() - 1);
         else
         {
             using var order = Command("SELECT 1 FROM app_settings WHERE name='order_saved'", tx);
-            priority = known != null && order.ExecuteScalar() == null ? known.Priority
+            priority = known != null && id == known.Id && order.ExecuteScalar() == null ? known.Priority
                 : checked(dictionaries.Select(d => d.Priority).Append(Source.All.Max(s => s.Priority)).Max() + 1);
         }
 
@@ -131,11 +182,14 @@ internal sealed class DictionaryStore : IDisposable
         catalog.Parameters.AddWithValue("$hash", hash);
         catalog.ExecuteNonQuery();
         using var metadata = Command("""
-            INSERT INTO dictionary_metadata(id,source_path) VALUES($id,$path)
-            ON CONFLICT(id) DO UPDATE SET source_path=excluded.source_path
+            INSERT INTO dictionary_metadata(id,source_path,parser_id,revision) VALUES($id,$path,$parser,$revision)
+            ON CONFLICT(id) DO UPDATE SET source_path=excluded.source_path,parser_id=excluded.parser_id,revision=excluded.revision
             """, tx);
         metadata.Parameters.AddWithValue("$id", id);
         metadata.Parameters.AddWithValue("$path", path);
+        metadata.Parameters.AddWithValue("$parser", parserId);
+        // 同一文件使用不同的列映射也可能产生不同正文，文件哈希不能单独标识一次成功导入。
+        metadata.Parameters.AddWithValue("$revision", Guid.NewGuid().ToString("N"));
         metadata.ExecuteNonQuery();
         using var delete = Command("DELETE FROM entries WHERE dict=$id", tx);
         delete.Parameters.AddWithValue("$id", id);
@@ -160,8 +214,6 @@ internal sealed class DictionaryStore : IDisposable
             index.ExecuteNonQuery();
         }
         int count = 0;
-        var parserId = known?.Id ?? (existing != null && filename.Equals(existing.Filename, StringComparison.OrdinalIgnoreCase)
-            ? existing.Id : "");
         var rows = mapping == null
             ? MdxReader.Read(path).Select(row => (row.Ordinal, row.Headword, row.Body,
                 EntryParser.Parse(parserId, row.Headword, row.Body, language)))
@@ -306,19 +358,28 @@ internal sealed class DictionaryStore : IDisposable
 
     public IReadOnlyList<LookupHit> Search(string input, string? only = null, CancellationToken token = default)
     {
-        // 同一次输入会检索多个候选。导入或调序同时提交时，各路命中仍共享同一份读快照。
-        using var snapshot = db.BeginTransaction(deferred: true);
-        var hits = Lookup.Search(input, (key, reading) =>
+        token.ThrowIfCancellationRequested();
+        // 同一连接只处理本轮查询。SQLite 在递归查别名期间也能响应取消，无须等到返回第一行。
+        using var registration = token.Register(() => SQLitePCL.raw.sqlite3_interrupt(db.Handle));
+        try
         {
+            using var snapshot = db.BeginTransaction(deferred: true);
+            var schema = SchemaIn(snapshot);
+            var hits = Lookup.Search(input, (key, reading) => Find(key, reading, only, snapshot, schema, token));
             token.ThrowIfCancellationRequested();
-            return Find(key, reading, only, snapshot);
-        });
-        snapshot.Commit();
-        return hits;
+            snapshot.Commit();
+            return hits;
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == SQLitePCL.raw.SQLITE_INTERRUPT && token.IsCancellationRequested)
+        {
+            throw new OperationCanceledException("词典查询已取消", ex, token);
+        }
     }
 
-    private IEnumerable<LookupEntry> Find(string key, bool reading, string? only, SqliteTransaction snapshot)
+    private IEnumerable<LookupEntry> Find(string key, bool reading, string? only, SqliteTransaction snapshot,
+        MetadataSchema schema, CancellationToken token)
     {
+        token.ThrowIfCancellationRequested();
         // 仅在原词典内跟随 MDX 重定向；UNION 去重可终止循环引用。
         using var cmd = Command($"""
             WITH RECURSIVE found(dict,ordinal) AS (
@@ -328,17 +389,48 @@ internal sealed class DictionaryStore : IDisposable
                 JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
                 JOIN terms t ON t.dict=f.dict AND t.term=e.link AND t.kind=0
             )
-            SELECT e.dict,e.ordinal,d.language,d.priority,e.head,e.reading,e.gloss,d.filename FROM found f
+            SELECT e.dict,e.ordinal,d.language,d.priority,e.head,e.reading,e.gloss,d.filename,{schema.Revision},
+                CASE WHEN {(schema.HasRevision ? "m.revision IS NULL AND" : "")} d.filename LIKE '%.mdx'
+                    AND (e.dict='shogakukan' OR e.evidence='MDX 正文首行假名')
+                    AND (e.reading IS NULL OR replace(replace(e.gloss,'・',''),'－','')=e.reading)
+                    THEN substr(e.raw,1,4096) END
+            FROM found f
             JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
-            JOIN dictionaries d ON d.id=e.dict WHERE e.link IS NULL
-            {(hasMetadata ? "AND NOT EXISTS(SELECT 1 FROM dictionary_metadata m WHERE m.id=d.id AND m.enabled=0)" : "")}
+            JOIN dictionaries d ON d.id=e.dict {schema.Join} WHERE e.link IS NULL
+            {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
             """, snapshot);
         cmd.Parameters.AddWithValue("$key",key);
         cmd.Parameters.AddWithValue("$kind",reading ? 1 : 0);
         cmd.Parameters.AddWithValue("$only",(object?)only ?? DBNull.Value);
         using var r = cmd.ExecuteReader();
-        while (r.Read()) yield return new LookupEntry(r.GetString(0),r.GetInt64(1),r.GetString(2),r.GetInt32(3),
-            r.GetString(4), r.IsDBNull(5) ? null : r.GetString(5), r.GetString(6)) { DictionaryName = r.GetString(7) };
+        while (r.Read())
+        {
+            token.ThrowIfCancellationRequested();
+            // 旧索引可能把读音存成首义。只检查本次命中且符合旧版回退特征的正文前缀。
+            var gloss = r.GetString(6);
+            if (!r.IsDBNull(9)) gloss = EntryParser.RefreshShogakukanGloss(gloss, r.GetString(9));
+            yield return new LookupEntry(r.GetString(0),r.GetInt64(1),r.GetString(2),r.GetInt32(3),
+                r.GetString(4), r.IsDBNull(5) ? null : r.GetString(5), gloss)
+                { DictionaryName = r.GetString(7), DictionaryRevision = r.GetString(8) };
+        }
+        token.ThrowIfCancellationRequested();
+    }
+
+    public string? CurrentBody(LookupEntry candidate)
+    {
+        // 同一条 SQL 同时核对词库版本和读取正文，避免跨进程重导复用原序号。
+        using var snapshot = db.BeginTransaction(deferred: true);
+        var schema = SchemaIn(snapshot);
+        using var cmd = Command($"""
+            SELECT e.raw FROM entries e JOIN dictionaries d ON d.id=e.dict {schema.Join}
+            WHERE e.dict=$id AND e.ordinal=$ordinal AND {schema.Revision}=$revision
+            """, snapshot);
+        cmd.Parameters.AddWithValue("$id", candidate.DictionaryId);
+        cmd.Parameters.AddWithValue("$ordinal", candidate.EntryId);
+        cmd.Parameters.AddWithValue("$revision", (object?)candidate.DictionaryRevision ?? DBNull.Value);
+        var body = cmd.ExecuteScalar() as string;
+        snapshot.Commit();
+        return body;
     }
 
     public (string? Evidence,string Raw) Detail(string id, long ordinal)
