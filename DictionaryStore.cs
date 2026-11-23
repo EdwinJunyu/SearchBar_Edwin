@@ -494,6 +494,17 @@ internal sealed class DictionaryStore : IDisposable
     {
         token.ThrowIfCancellationRequested();
         // 仅在原词典内跟随 MDX 重定向；UNION 去重可终止循环引用。
+        bool legacyChinese = !reading && !phrasalSenses && EntryParser.IsChineseExpression(key);
+        // 旧汉英库的索引只有「中文 英译」或「中文{学科} 英译」。两个窄区间均能使用 terms_lookup。
+        const string legacyCandidates = """
+            UNION ALL SELECT dict,ordinal,1 FROM terms WHERE kind=0 AND ($only IS NULL OR dict=$only)
+                AND ((term >= $startSpace AND term < $endSpace) OR (term >= $startTag AND term < $endTag))
+            """;
+        var hanyingParser = $"""
+            d.language='zh' AND d.filename LIKE '%.mdx' AND
+            COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
+                CASE WHEN d.id='hanying' OR d.filename=$hanyingName THEN 'hanying' END)='hanying'
+            """;
         using var cmd = Command($"""
             WITH RECURSIVE found(dict,ordinal) AS (
                 SELECT dict,ordinal FROM terms WHERE term=$key AND kind=$kind AND ($only IS NULL OR dict=$only)
@@ -503,19 +514,37 @@ internal sealed class DictionaryStore : IDisposable
                 JOIN terms t ON t.dict=f.dict AND t.term=e.link AND t.kind=0
             )
             SELECT e.dict,e.ordinal,d.language,d.priority,e.head,e.reading,e.gloss,d.filename,{schema.Revision},
-                CASE WHEN {(schema.HasRevision ? "m.revision IS NULL AND" : "")} d.filename LIKE '%.mdx'
-                    AND (e.dict='shogakukan' OR e.evidence='MDX 正文首行假名')
-                    AND (e.reading IS NULL OR replace(replace(e.gloss,'・',''),'－','')=e.reading)
+                CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
+                    CASE WHEN e.dict='shogakukan' OR e.evidence='MDX 正文首行假名' THEN 'shogakukan' END)='shogakukan'
+                    AND (({(schema.HasRevision ? "m.revision IS NULL AND" : "")}
+                        (e.reading IS NULL OR replace(replace(e.gloss,'・',''),'－','')=e.reading))
+                        OR substr(e.gloss,-1)='〕' OR e.gloss GLOB '〈*〉' OR e.gloss GLOB '《*》')
                     THEN substr(e.raw,1,4096) END,
                 CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
-                    CASE WHEN d.id='oxford' OR d.filename=$oxfordName THEN 'oxford' END)='oxford' THEN e.raw END
-            FROM found f
+                    CASE WHEN d.id='oxford' OR d.filename=$oxfordName THEN 'oxford' END)='oxford' THEN e.raw END,
+                CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
+                    CASE WHEN d.id='sanseido' OR d.filename=$sanseidoName THEN 'sanseido' END)='sanseido'
+                    THEN substr(e.raw,1,2048) END
+                ,CASE WHEN {hanyingParser} AND (instr(e.head,' ')>0 OR instr(e.head,'　')>0 OR instr(e.head,char(123))>0)
+                    THEN e.raw END, f.legacyChinese
+            FROM (SELECT dict,ordinal,0 AS legacyChinese FROM found
+                {(legacyChinese ? legacyCandidates : "")}) f
             JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
             JOIN dictionaries d ON d.id=e.dict {schema.Join} WHERE e.link IS NULL
+            {(legacyChinese ? $"AND (f.legacyChinese=0 OR ({hanyingParser}))" : "")}
             {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
             """, snapshot);
         cmd.Parameters.AddWithValue("$key",key);
+        cmd.Parameters.AddWithValue("$hanyingName", Path.GetFileName(Source.All.First(s => s.Id == "hanying").RelativePath));
+        if (legacyChinese)
+        {
+            cmd.Parameters.AddWithValue("$startSpace", key + " ");
+            cmd.Parameters.AddWithValue("$endSpace", key + "!");
+            cmd.Parameters.AddWithValue("$startTag", key + "{");
+            cmd.Parameters.AddWithValue("$endTag", key + "|");
+        }
         cmd.Parameters.AddWithValue("$oxfordName", Path.GetFileName(Source.All.First(s => s.Id == "oxford").RelativePath));
+        cmd.Parameters.AddWithValue("$sanseidoName", Path.GetFileName(Source.All.First(s => s.Id == "sanseido").RelativePath));
         cmd.Parameters.AddWithValue("$kind",reading ? 1 : 0);
         cmd.Parameters.AddWithValue("$only",(object?)only ?? DBNull.Value);
         using var r = cmd.ExecuteReader();
@@ -535,7 +564,15 @@ internal sealed class DictionaryStore : IDisposable
                 continue;
             }
             var gloss = entry.Gloss;
+            var child = r.IsDBNull(12) ? null : EntryParser.HanyingReference(entry.Headword, r.GetString(12));
+            if (r.GetBoolean(13) && (child == null || Lookup.Normalize(child.Value.Headword) != key)) continue;
+            if (child is { } subentry)
+            {
+                yield return entry with { Headword = subentry.Headword, Gloss = subentry.Gloss };
+                continue;
+            }
             if (!r.IsDBNull(9)) gloss = EntryParser.RefreshShogakukanGloss(gloss, r.GetString(9));
+            if (!r.IsDBNull(11)) gloss = EntryParser.RefreshSanseidoGloss(gloss, r.GetString(11));
             // 已安装的牛津索引只存了首义。仅对本次命中的牛津词条从原文生成新版摘要。
             (string Headword, string? Form)? reference = null;
             if (!r.IsDBNull(10))

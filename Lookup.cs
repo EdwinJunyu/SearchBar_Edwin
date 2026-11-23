@@ -63,8 +63,8 @@ public static partial class Lookup
         Collect(term, false, "headword", 0, null);
         if (IsKana(term))
             Collect(NormalizeReading(term), true, "reading", 1, "ja");
-        else if (ToHiragana(term) is string kana)
-            Collect(kana, true, "romaji", 1, "ja");
+        else
+            foreach (var kana in RomajiReadings(term)) Collect(kana, true, "romaji", 1, "ja");
 
         // 还原规则只生成候选。存在于启用的日语词库中的候选才参与排序。
         var inflected = IsKana(term) ? NormalizeReading(term) : term;
@@ -107,7 +107,11 @@ public static partial class Lookup
             {
                 // 原书的明确参见优先，即使另一个拼写也符合词尾规则。
                 if (reference == Normalize(hit.Entry.Headword)) continue;
-                donors = find(reference, false).Where(e => Normalize(e.Headword) == reference);
+                var matching = find(reference, false).Where(e => e.DictionaryId == hit.Entry.DictionaryId
+                    && IsEnglish(e) && Normalize(e.Headword) == reference).ToArray();
+                // 内置链接保留原始拼写。mac 和 Mac 同在一部词典时，优先使用链接明确指定的那一个。
+                var exactCase = matching.Where(e => e.Headword == hit.Entry.Reference?.Headword).ToArray();
+                donors = exactCase.Length == 0 ? matching : exactCase;
             }
             else
             {
@@ -201,8 +205,8 @@ public static partial class Lookup
                     var label = phrase.Surface == head ? phrase.Surface : $"{phrase.Surface} → {head}";
                     var hit = new LookupHit(entry, "phrase", phrase.Surface, $"{label} · {Format(entry, "headword")}");
                     // 同一双占位标题可经 sb、sth 两条路径命中一次；相同父词头下不同标题仍保留各自的释义。
-                    var anchor = phrase.Canonical == null ? null : entry.Anchor;
-                    hits.TryAdd((entry.DictionaryId, entry.EntryId, anchor == null ? entry.Headword : head, anchor), (phrase, hit));
+                    var identity = (entry.DictionaryId, entry.EntryId, entry.Anchor == null ? entry.Headword : head, entry.Anchor);
+                    hits.TryAdd(identity, (phrase, hit));
                 }
             }
             if (hits.Count > 0)
@@ -234,7 +238,7 @@ public static partial class Lookup
                 var gap = input.AsSpan(previous.Index + previous.Length, last.Index - previous.Index - previous.Length);
                 if (gap.IsEmpty || gap.IndexOfAnyExcept(' ', '\t', '　') >= 0) break;
                 var lastKey = Normalize(last.Value);
-                if (phrasalVerbs && end == start + 1 && lastKey is not ("about" or "across" or "after"
+                if (phrasalVerbs && end == start + 1 && lastKey is not ("about" or "across" or "after" or "apart" or "aside"
                     or "against" or "along" or "around" or "as" or "at" or "away" or "back" or "by"
                     or "down" or "for" or "forward" or "from" or "in" or "into" or "of" or "off"
                     or "on" or "onto" or "out" or "over" or "round" or "through" or "to" or "together"
@@ -430,6 +434,16 @@ public static partial class Lookup
             "did" or "done" => "do", "made" => "make", "came" => "come",
             "saw" or "seen" => "see", "took" or "taken" => "take", "wrote" or "written" => "write",
             "got" or "gotten" => "get", "bought" => "buy", "uses" => "use",
+            // 词典不一定把每个不规则变形单独收为词头。原形需在启用的英语词库中存在才会展示。
+            "ate" or "eaten" => "eat", "gave" or "given" => "give", "spoke" or "spoken" => "speak",
+            "rode" or "ridden" => "ride", "sang" or "sung" => "sing", "drank" or "drunk" => "drink",
+            "drove" or "driven" => "drive", "chose" or "chosen" => "choose", "knew" or "known" => "know",
+            "grew" or "grown" => "grow", "began" or "begun" => "begin", "broke" or "broken" => "break",
+            "flew" or "flown" => "fly", "threw" or "thrown" => "throw", "wore" or "worn" => "wear",
+            "felt" => "feel", "left" => "leave", "found" => "find", "lost" => "lose", "met" => "meet",
+            "kept" => "keep", "built" => "build", "brought" => "bring", "caught" => "catch", "taught" => "teach",
+            "children" => "child", "people" => "person", "men" => "man", "women" => "woman",
+            "mice" => "mouse", "geese" => "goose", "teeth" => "tooth", "feet" => "foot",
             "died" or "dying" => "die", "lied" or "lying" => "lie", "tied" or "tying" => "tie",
             _ => null
         };
@@ -463,7 +477,7 @@ public static partial class Lookup
         if (last == stem[^2] && !IsVowel(last))
         {
             // running → run；falling 等词的双写本来就属于词干。
-            if ("bdgmnprt".Contains(last) || (stem.Length > 4 && stem.EndsWith("ell", StringComparison.Ordinal)))
+            if ("bdgmnprt".Contains(last) || (stem.Length > 4 && last == 'l'))
                 yield return stem[..^1];
             yield return stem;
             yield break;
@@ -524,20 +538,49 @@ public static partial class Lookup
             for (int i = 0; i < 3; i++) syllables[prefix + "auo"[i]] = kana + "ゃゅょ"[i];
 
         foreach (var (latin, kana) in new[] { ("shi", "し"), ("chi", "ち"), ("tsu", "つ"), ("fu", "ふ"),
-            ("ji", "じ"), ("ya", "や"), ("yu", "ゆ"), ("yo", "よ"), ("wa", "わ"), ("wo", "を"),
+            ("ji", "じ"), ("dzu", "づ"), ("ya", "や"), ("yu", "ゆ"), ("yo", "よ"), ("wa", "わ"), ("wo", "を"),
             ("fa", "ふぁ"), ("fi", "ふぃ"), ("fe", "ふぇ"), ("fo", "ふぉ") })
             syllables[latin] = kana;
         return syllables;
     }
 
-    private static string? ToHiragana(string text)
+    [GeneratedRegex(@"(?<v>[aeiou])(?:\k<v>|(?<=o)u|(?<=e)i|-)")]
+    private static partial Regex LongVowel();
+
+    private static IEnumerable<string> RomajiReadings(string term)
     {
-        if (!text.All(c => c is >= 'a' and <= 'z' or '\'')) return null;
+        if (!term.All(c => c is >= 'a' and <= 'z' or '\'' or '-' or 'ā' or 'ī' or 'ū' or 'ē' or 'ō')) yield break;
+        var latin = term.Replace("ā","a-").Replace("ī","i-").Replace("ū","u-").Replace("ē","e-").Replace("ō","o-");
+        // 最多四种整词长音写法，避免多个长音各自组合导致查询数指数增长。
+        var marked = LongVowel().Replace(latin, "${v}-");
+        var native = marked.Replace("o-", "ou").Replace("e-", "ei");
+        string[] forms = marked.Contains('-') ? [latin, marked, ExpandDoubledVowels(native), ExpandDoubledVowels(marked)] : [latin];
+        bool hasLoanSound = latin.Contains("di") || latin.Contains("ti") || latin.Contains("du") || latin.Contains("tu");
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var form in forms.Distinct(StringComparer.Ordinal))
+        {
+            if (ToHiragana(form, false) is string kana && seen.Add(kana)) yield return kana;
+            if (hasLoanSound && ToHiragana(form, true) is string loan && seen.Add(loan)) yield return loan;
+        }
+    }
+
+    private static string ExpandDoubledVowels(string text) =>
+        text.Replace("a-","aa").Replace("i-","ii").Replace("u-","uu").Replace("e-","ee").Replace("o-","oo");
+
+    private static string? ToHiragana(string text, bool loanSounds)
+    {
         var kana = new StringBuilder();
         for (int i = 0; i < text.Length;)
         {
             char current = text[i];
             char next = i + 1 < text.Length ? text[i + 1] : '\0';
+            if (current == '-')
+            {
+                if (i == 0 || !"aeiou".Contains(text[i - 1])) return null;
+                kana.Append('ー');
+                i++;
+                continue;
+            }
             if (current == 'n' && (next == '\0' || !"aeiouy".Contains(next)))
             {
                 kana.Append('ん');
@@ -555,7 +598,12 @@ public static partial class Lookup
             int length = Math.Min(3, text.Length - i);
             while (length > 0 && !Syllables.ContainsKey(text.Substring(i, length))) length--;
             if (length == 0) return null;
-            kana.Append(Syllables[text.Substring(i, length)]);
+            var syllable = text.Substring(i, length);
+            // 本土转写 di/ti/du/tu 和外来语小假名都可成立，由实际的读音索引筛选。
+            kana.Append(loanSounds ? syllable switch
+            {
+                "di" => "でぃ", "ti" => "てぃ", "du" => "どぅ", "tu" => "とぅ", _ => Syllables[syllable]
+            } : Syllables[syllable]);
             i += length;
         }
         return kana.ToString();
@@ -605,6 +653,12 @@ public static partial class Lookup
         {
             if (form.Length < 2) continue;
             foreach (var root in VoiceRoots(form, guessPotential)) yield return root;
+            // 「辞书形＋ことができる」可用于所有动词类型；只还原明确写出的谓语，避免误猜名词。
+            const int constructionLength = 6;
+            if (form.Length > constructionLength && (form.EndsWith("ことができる", StringComparison.Ordinal)
+                || form.EndsWith("ことが出来る", StringComparison.Ordinal))
+                && "うくぐすつぬぶむる".Contains(form[^(constructionLength + 1)]))
+                yield return form[..^constructionLength];
             int auxiliaryLength = form.EndsWith("いる", StringComparison.Ordinal) ? 2 :
                 form.EndsWith("しまう", StringComparison.Ordinal) ? 3 :
                 form.EndsWith("おく", StringComparison.Ordinal) ? 2 : 0;

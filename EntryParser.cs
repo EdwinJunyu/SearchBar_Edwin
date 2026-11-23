@@ -26,6 +26,8 @@ internal static partial class EntryParser
         string? gloss = null;
         if (sourceId == "hanying")
         {
+            if (HanyingReference(key, body) is { } child)
+                return new(child.Headword, null, null, child.Gloss, null, []);
             // 只读第一义项的 JX 区，遇到“常用词组”时结束，避免误取短语翻译。
             var start = body.IndexOf("<span class=\"JX\">", IgnoreCase);
             var phrases = body.IndexOf("<span class=\"CZ\">", IgnoreCase);
@@ -37,6 +39,32 @@ internal static partial class EntryParser
         var summary = sourceId == "oxford" ? OxfordGloss(body) : Preview(gloss, body);
         return new(key, reading, reading == null ? null : "MDX 假名词头", summary, null, []);
     }
+
+    internal static bool IsChineseExpression(string text) => text.Length > 0 && text[0] is >= '㐀' and <= '鿿'
+        && text.All(c => c is >= '㐀' and <= '鿿' or '(' or ')' or '[' or ']' or '、' or '·' or '-');
+
+    internal static (string Headword, string Gloss)? HanyingReference(string storedHead, string raw)
+    {
+        // 这部词典把常用词组单独收录为双语键。只有带父词头和编号锚点的参见才可拆出译文。
+        var link = HanyingSubentryLink().Match(raw);
+        if (!link.Success) return null;
+        string parent = WebUtility.HtmlDecode(link.Groups["parent"].Value);
+        string label = Plain(link.Groups["label"].Value);
+        if (!label.StartsWith(parent, StringComparison.Ordinal)) return null;
+        string tail = label[parent.Length..].TrimStart();
+        if (tail.Length == 0 || tail[0] is not (':' or '：')) return null;
+        string bilingual = tail[1..].Trim();
+        int split = bilingual.IndexOfAny([' ', '{', '　']);
+        if (split <= 0) return null;
+        string head = bilingual[..split];
+        string gloss = bilingual[split..].Trim();
+        if (!IsChineseExpression(Lookup.Normalize(head)) || !gloss.Any(char.IsAsciiLetter)
+            || (storedHead != bilingual && storedHead != head)) return null;
+        return (head, gloss);
+    }
+
+    [GeneratedRegex(@"<span\s+class=[""']reference[""']\s*>\s*<span\s+class=[""']ref_title[""']\s*>\s*见\s*[:：]\s*</span>\s*<a\s+href=[""']entry://(?<parent>[^#""'<>]+)#subEntry[0-9]+[""']\s*>(?<label>[^<]+)</a>", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex HanyingSubentryLink();
 
     internal static string OxfordGloss(string body)
     {
@@ -82,6 +110,9 @@ internal static partial class EntryParser
             {
                 "pt" or "past tense" => "过去式",
                 "pp" or "past participle" => "过去分词",
+                "pl" or "pl." or "plural" => "复数",
+                var both when both.StartsWith("pt", StringComparison.Ordinal) && both.EndsWith("pp", StringComparison.Ordinal)
+                    => "过去式和过去分词",
                 _ => null
             };
             if (target is { } previous)
@@ -96,12 +127,12 @@ internal static partial class EntryParser
 
     [GeneratedRegex(@"【(?:IDIOMS|PHR V|HELP|ORIGIN)】|♦", RegexOptions.IgnoreCase)]
     private static partial Regex OxfordReferenceBoundary();
-    [GeneratedRegex(@"(?:^|>)\s*(?:=|(?:--›\s*)?see\b|(?<form>pt|pp|past tense|past participle)\s+of\b)\s*(?:<b\s*>\s*)?<a\s+href\s*=\s*[""']entry://(?<word>[a-z]+(?:[ '\-][a-z]+)*)[""']", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"(?:^|>)\s*(?:\)\s*)?(?:=|(?:--›\s*)?see\b|(?<form>pt\s*(?:,|and|/)\s*pp|pt|pp|pl\.?|plural|past tense|past participle)\s+of\b)\s*(?:<b\s*>\s*)?<a\s+href\s*=\s*[""']entry://(?<word>[a-z]+(?:[ '\-][a-z]+)*)[""']", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex OxfordReference();
 
     private static IEnumerable<(string Part, string Gloss, Range RawSpan)> OxfordSenses(string body)
     {
-        int divDepth = 0, noteDepth = 0, fontDepth = 0, start = 0;
+        int divDepth = 0, noteDepth = 0, fontDepth = 0, start = 0, formsEnd = 0;
         string part = "";
         bool inPhrases = false;
         foreach (Match tag in OxfordTokens().Matches(body))
@@ -133,14 +164,40 @@ internal static partial class EntryParser
                 part = label switch { "noun" => "n.", "verb" => "v.", "adjective" => "adj.",
                     "adverb" => "adv.", "preposition" => "prep.", "pronoun" => "pron.", _ => label };
                 inPhrases = false;
+                formsEnd = OxfordFormsEnd(body, tag.Index + tag.Length);
             }
-            if (!inPhrases && tag.Groups["openFont"].Success && OxfordTranslationColor().IsMatch(tag.Value))
+            if (!inPhrases && tag.Index >= formsEnd && tag.Groups["openFont"].Success && OxfordTranslationColor().IsMatch(tag.Value))
             {
                 fontDepth = 1;
                 start = tag.Index + tag.Length;
             }
         }
     }
+
+    private static int OxfordFormsEnd(string body, int afterPartOfSpeech)
+    {
+        // 牛津用同一橙色标记词义和词形说明。只在词性后确有带蓝色粗体变体的括号时跳过该表，
+        // 例如 show 的 “or, rarely, 有时或作 showed”。原文位置保留给详情定位。
+        var opening = OxfordFormsOpening().Match(body, afterPartOfSpeech);
+        if (!opening.Success) return afterPartOfSpeech;
+        int depth = 1;
+        int limit = Math.Min(body.Length, afterPartOfSpeech + 4096);
+        for (int i = opening.Index + opening.Length; i < limit; i++)
+        {
+            if (body[i] == '<')
+            {
+                int endTag = body.IndexOf('>', i, limit - i);
+                if (endTag < 0) break;
+                i = endTag;
+            }
+            else if (body[i] == '(') depth++;
+            else if (body[i] == ')' && --depth == 0) return i + 1;
+        }
+        return afterPartOfSpeech;
+    }
+
+    [GeneratedRegex(@"\G(?:\s|<br\s*/?>)*\(\s*(?:pl\.\s*)?<span\s+style=[""']color:\s*blue;\s*font-weight:\s*bold;?[""']>", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex OxfordFormsOpening();
 
     [GeneratedRegex(@"<font\b[^>]*\scolor\s*=\s*[""']?darkred(?=[""'\s>])[^>]*>\s*<b>\s*<i>(?<pos>[a-z. -]+)</i>\s*</b>\s*</font>|(?<openDiv><div\b[^>]*>)|(?<closeDiv></div\s*>)|(?<openFont><font\b[^>]*>)|(?<closeFont></font\s*>)|(?<note>【(?:HELP|ORIGIN)】)|(?<section>【(?:IDIOMS|PHR V)】)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex OxfordTokens();
@@ -185,7 +242,7 @@ internal static partial class EntryParser
         }
     }
 
-    [GeneratedRegex(@"<div\b[^>]*>\s*<b>\s*【(?<section>PHR V|IDIOMS)】|<font\b[^>]*\scolor\s*=\s*[""']?darkred(?=[""'\s>])[^>]*>\s*<b>\s*<i>|(?<title><span\s+style\s*=\s*[""']color:\s*blue;\s*font-weight:\s*bold;?[""']>\s*<font\s+color\s*=\s*[""']?red[""']?>\s*◘\s*</font>)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"<(?:div|span)\b[^>]*>\s*<b>\s*【(?<section>PHR V|IDIOMS)】|<font\b[^>]*\scolor\s*=\s*[""']?darkred(?=[""'\s>])[^>]*>\s*<b>\s*<i>|(?<title><span\s+style\s*=\s*[""']color:\s*blue;\s*font-weight:\s*bold;?[""']>\s*<font\s+color\s*=\s*[""']?red[""']?>\s*◘\s*</font>)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex OxfordPhraseMarker();
 
     private static IEnumerable<string> OxfordPhraseKeys(string title, string parent)
@@ -280,27 +337,49 @@ internal static partial class EntryParser
             Preview(ShogakukanSense(lines, out _), body), null, written.Skip(1).ToArray());
     }
 
-    // 已发布的索引保存了旧摘要。只修正可辨认的编号段，其他版式沿用已存结果。
+    // 只修正能从原文确认的旧版摘要；未识别的排版沿用已存结果。
     internal static string RefreshShogakukanGloss(string storedGloss, string rawPrefix)
     {
-        var sense = ShogakukanSense(Lines(rawPrefix, 4096), out bool numberedSection);
-        return numberedSection && sense != null ? Preview(sense, rawPrefix) : storedGloss;
+        var sense = ShogakukanSense(Lines(rawPrefix, 4096), out bool recognized);
+        return recognized && sense != null ? Preview(sense, rawPrefix) : storedGloss;
     }
 
-    private static string? ShogakukanSense(string[] lines, out bool numberedSection)
+    private static string? ShogakukanSense(string[] lines, out bool recognized)
     {
         var start = lines.Length > 1 && lines[1].StartsWith('【') ? 2 : 1;
         // 此书将「例：」也用于引出【１】义项分组。正常例句仍是首义提取的停止边界。
-        numberedSection = start + 1 < lines.Length && lines[start] is "例：" or "例:"
+        bool numberedSection = start + 1 < lines.Length && lines[start] is "例：" or "例:"
             && lines[start + 1] is "【１】" or "【1】";
+        recognized = numberedSection;
         if (numberedSection) start += 2;
         for (int i = start; i < lines.Length; i++)
         {
             var line = lines[i];
             if (line.StartsWith("例：") || line.StartsWith("例:")) break;
-            if (numberedSection && line.StartsWith('《') && line.EndsWith('》')) continue;
+            if (ShogakukanLabel().IsMatch(line))
+            {
+                recognized = true;
+                continue;
+            }
             var sense = LeadingLabels().Replace(line, "").Trim();
             if (sense.Length == 0) continue;
+            // 这部词典有时把「时间〔时光〕机器」拆成两行，再分行给出整组拼音。
+            // 需要下一行的中文和带调拼音作证；不把下一例句、义项或词头并入当前释义。
+            if (sense.EndsWith('〕') && i + 1 < lines.Length)
+            {
+                var continuation = ShogakukanContinuation().Match(lines[i + 1]);
+                if (continuation.Success && ToneMark().IsMatch(continuation.Groups["sound"].Value))
+                {
+                    recognized = true;
+                    sense += continuation.Groups["text"].Value + lines[i + 1][continuation.Length..];
+                    if (continuation.Groups["alternative"].Success && i + 2 < lines.Length)
+                    {
+                        var pronunciation = ShogakukanPronunciation().Match(lines[i + 2]);
+                        if (pronunciation.Success && ToneMark().IsMatch(pronunciation.Value))
+                            sense += lines[i + 2][pronunciation.Length..];
+                    }
+                }
+            }
             // 注音附在汉字后，如“吃chī”。只移除可辨识的拼音，正文保持原样。
             return Pinyin().Replace(sense, m => ToneMark().IsMatch(m.Value) ? "" : m.Value);
         }
@@ -322,30 +401,58 @@ internal static partial class EntryParser
         var headerEnd = prefix.IndexOf("</body2>", IgnoreCase);
         var header = headerEnd < 0 ? prefix : prefix[..headerEnd];
         var title = SanseidoTitle().Match(header);
-        var written = title.Success ? WrittenForms(title.Groups[1].Value) : [];
+        // 标题内嵌另一种拼写时继续沿用原索引键，避免将排版标签或方括号写入词头。
+        var written = title.Success && !title.Groups[1].Value.Contains('<') ? WrittenForms(title.Groups[1].Value) : [];
         var head = written.Contains(key) ? key : written.FirstOrDefault() ?? key;
-        const string firstSense = "<font color=\"#008000\">(1)</font>";
-        var first = body.IndexOf(firstSense, IgnoreCase);
-        string? gloss = null;
-        if (first >= 0 && first < 768)
-            gloss = Lines(body[(first + firstSense.Length)..], 300).FirstOrDefault();
-        else if (headerEnd >= 0)
-            gloss = Lines(body[(headerEnd + "</body2>".Length)..], 300).FirstOrDefault();
-        else if (title.Success)
-        {
-            // 同一本书还收录了日英词条，其红色词头后以两个换行引出英文释义。
-            const string separator = "</font><br><br>";
-            var firstLine = body.IndexOf(separator, title.Index + title.Length, IgnoreCase);
-            if (firstLine >= 0 && firstLine < 380)
-                gloss = Lines(body[(firstLine + separator.Length)..], 300).FirstOrDefault();
-        }
-        if (gloss != null)
-        {
-            var sentenceEnd = gloss.IndexOf('。');
-            gloss = sentenceEnd >= 0 ? gloss[..(sentenceEnd + 1)] : gloss.TrimEnd('；', ';');
-        }
-        return new(head, reading, evidence, Preview(gloss, body), null,
+        var gloss = SanseidoSense(body);
+        return new(head, reading, evidence, Preview(FirstSentence(gloss), body), null,
             written.Where(s => s != head).ToArray());
+    }
+
+    // 同一书含日语、日英和英日三类排版。旧库只有显示摘要需要更新，词头和正文身份可以沿用。
+    internal static string RefreshSanseidoGloss(string storedGloss, string prefix)
+    {
+        var gloss = SanseidoSense(prefix);
+        return gloss == null ? storedGloss : Preview(FirstSentence(gloss), prefix);
+    }
+
+    private static string? SanseidoSense(string body)
+    {
+        var prefix = body[..Math.Min(body.Length, 2048)];
+        static string? ReadSense(string text)
+        {
+            var lines = Lines(text, 1536);
+            return lines.FirstOrDefault(s => !SanseidoGrammarLine().IsMatch(s)) ?? lines.FirstOrDefault();
+        }
+        const string firstSense = "<font color=\"#008000\">(1)</font>";
+        var first = prefix.IndexOf(firstSense, IgnoreCase);
+        if (first is >= 0 and < 768) return ReadSense(prefix[(first + firstSense.Length)..]);
+        var end = prefix.IndexOf("</body2>", IgnoreCase);
+        if (end is >= 0 and < 380) return ReadSense(prefix[(end + "</body2>".Length)..]);
+        var title = SanseidoTitle().Match(prefix);
+        if (title.Success && title.Index < 380)
+        {
+            // 换行可能位于红色标题标签内部，随后一行可能只标词性，如「(名)スル」。
+            var tail = prefix[(title.Index + title.Length)..].TrimStart();
+            if (tail.StartsWith("<br></font>", IgnoreCase))
+                return ReadSense(tail["<br></font>".Length..]);
+            if (tail.StartsWith("</font><br>", IgnoreCase))
+                return ReadSense(tail["</font><br>".Length..]);
+        }
+        // 蓝色粗体英文词头可能带音标，第一行之后才是日语释义。
+        if (prefix.StartsWith("<font face=\"Arial\"><b><font color=\"#0000FF\">", IgnoreCase))
+        {
+            var lineBreak = prefix.IndexOf("<br>", IgnoreCase);
+            if (lineBreak >= 0) return ReadSense(prefix[(lineBreak + 4)..]);
+        }
+        return null;
+    }
+
+    private static string? FirstSentence(string? gloss)
+    {
+        if (gloss == null) return null;
+        var end = gloss.IndexOf('。');
+        return end >= 0 ? gloss[..(end + 1)] : gloss.TrimEnd('；', ';').TrimEnd();
     }
 
     private static string? Kana(string text)
@@ -394,12 +501,20 @@ internal static partial class EntryParser
     private static partial Regex Tags();
     [GeneratedRegex(@"^(?:(?:[（(]\d+[)）]|〔[^〕]*〕|［[^］]*］)\s*)+")]
     private static partial Regex LeadingLabels();
+    [GeneratedRegex(@"^(?:《[^《》]+》|〈[^〈〉]+〉)$")]
+    private static partial Regex ShogakukanLabel();
+    [GeneratedRegex(@"^(?<text>[\u3400-\u9fff]+)(?<sound>[A-Za-zÀ-žǍ-ǜ]+(?:[ ’'][A-Za-zÀ-žǍ-ǜ]+)*)(?:\s*〔(?<alternative>[A-Za-zÀ-žǍ-ǜ ,，’']+)〕)?")]
+    private static partial Regex ShogakukanContinuation();
+    [GeneratedRegex(@"^[A-Za-zÀ-žǍ-ǜ]+(?:[ ’'][A-Za-zÀ-žǍ-ǜ]+)*(?=[,，;；、。]|$)")]
+    private static partial Regex ShogakukanPronunciation();
     [GeneratedRegex(@"(?<=[\u3400-\u9fff])[A-Za-zÀ-žǍ-ǜ]+(?:[ ’'][A-Za-zÀ-žǍ-ǜ]+)*")]
     private static partial Regex Pinyin();
     [GeneratedRegex("[āáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ]", RegexOptions.IgnoreCase)]
     private static partial Regex ToneMark();
     [GeneratedRegex(@"^\s*<font\b[^>]*>\s*<b>([^<>]+)</b>", RegexOptions.IgnoreCase)]
     private static partial Regex LeadingBold();
-    [GeneratedRegex(@"<font color=""#FF0000"">\s*(?:<br>\s*)?(【[^【】<>]+】)", RegexOptions.IgnoreCase)]
+    [GeneratedRegex(@"<font color=""#FF0000"">\s*(?:<br>\s*)?(【(?:[^【】<>]|</?font\b[^>]*>)+】)", RegexOptions.IgnoreCase)]
     private static partial Regex SanseidoTitle();
+    [GeneratedRegex(@"^(?:■[一二三四五六七八九十]+■\s*)?(?:\((?:(?:動|形|名|副|連|接|感|代|枕|助)[^)]*|[サカ]変動詞「[^」]+」の五段化)\)(?:スル|\[文\].*)?)?$")]
+    private static partial Regex SanseidoGrammarLine();
 }
