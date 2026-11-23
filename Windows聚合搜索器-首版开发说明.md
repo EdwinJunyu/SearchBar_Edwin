@@ -337,7 +337,7 @@ pwsh -NoProfile -File .\regressions.ps1 -SettingsDesktop -MdxSample $sample
 
 完整解压 `E_Search-win-x64.zip`，双击 `E_Search.exe`。在本项目中可直接运行 `bin/release-delivery/E_Search-win-x64/E_Search.exe`。包内附有 .NET 10.0.15 桌面运行时、Everything SDK 和可直接查询的四库索引。首次启动会将约 827 MiB 的索引初始化到 `%LOCALAPPDATA%\E_Search\dictionaries.db`，后续启动沿用个人词库、顺序和快捷键。默认使用 `Alt + Space` 唤起，方向键选文件，回车打开，Tab 查看词条详情。
 
-文件结果来自本机 Everything。Edwin 电脑安装的是 1.4.1.1024 x64，个人配置使用管理员模式，未安装 Everything 服务。如果文件区持续等待，可从开始菜单打开 Everything，按 Windows 提示确认，待 Everything 自己能搜到文件后再查询。词典查询可独立使用。
+文件结果来自本机 Everything。Edwin 电脑安装的是 1.4.1.1024 x64，个人配置使用管理员模式，未安装 Everything 服务。Everything 已退出时，在浮窗输入文件名即可触发启动。看到 Windows 的 Everything 权限提示后点“是”，保留当前查询，索引就绪后文件会自动出现。词典查询可独立使用。
 
 ### 环境与样本
 
@@ -380,7 +380,26 @@ pwsh -NoProfile -File .\regressions.ps1 -SettingsDesktop -MdxSample $sample
 
 **最终状态。** 第 9 节 11 项均已在上述环境执行，表中无遗留失败项。另用坏 CSV 和截短正文块的真实牛津 MDX 测试了失败重导。CSV 中途写入的数据回滚，牛津旧书全部词条和索引的摘要与失败前相同。
 
-**未验证范围。** 个人管理员模式 Everything 启动时的 UAC 交互、个人 C/D/E 三卷的全盘结果，以及其他中文输入法用回车直接上屏汉字的行为。本机搜狗拼音用空格上屏汉字。第 13 节记载的有道词典偶发取焦仍是本机环境因素，本轮最终回归实际观察到了原文本框收到输入。
+**未验证范围。** 三盘索引的完整性没有逐文件核对。其他中文输入法用回车直接上屏汉字的行为也未验证。本机搜狗拼音用空格上屏汉字。第 13 节记载的有道词典偶发取焦仍是本机环境因素，本轮最终回归实际观察到了原文本框收到输入。
+
+### 日常 Everything 管理员模式与三盘实测
+
+2026-11-22 晚，在 Edwin 的 Windows 桌面使用正式交付目录中的 `E_Search.exe` 和个人默认 Everything 实例。开始时 Everything 未运行。搜索器以普通权限启动，通过默认发现路径找到 `C:\Program Files\Everything\Everything.exe`。个人配置启用了 C、D、E 三个 NTFS 卷。
+
+| 验收项 | 判定 | 实际观察 |
+|---|---|---|
+| 管理员冷启动及 UAC | 通过 | 20:42:53 在浮窗输入一次 C 盘样本的完整路径。Windows 随即启动 `consent.exe`。Edwin 确认亲眼看到 Everything 的 UAC 提示并点击“是”。同一安装目录的管理员 Everything 随后出现，E_Search 始终使用普通权限。 |
+| 原查询接续 | 通过 | 浮窗先显示“正在等待 Everything 索引就绪…”，20:43:31 返回所查文件。首次输入到观察到结果约 38 秒，期间没有重新输入。 |
+
+三次打开均先在浮窗核对选中行的完整路径，然后向有焦点的搜索框发送实际 Enter。通过关联程序 Windows 记事本读取已打开文档的标题和正文首行。C、D 两份许可文件名仅大小写不同，正文可将它们区分。
+
+| 盘 | 浮窗中选中并打开的既有文件 | 记事本正文首行 | 判定 |
+|---|---|---|---|
+| C | `C:\Program Files\Everything\License.txt` | `Everything` | 通过 |
+| D | `D:\D_Main\JP\日语\文法词汇查阅excel+GoldenDict电子词典+potplayer播放器+honeyview看图器\GoldenDict\GoldenDict\LICENSE.txt` | `GoldenDict, a dictionary lookup program.` | 通过 |
+| E | `E:\SteamLibrary\steamapps\common\CLANNAD\LICENSE\LICENSE_OFL.txt` | `This Font Software is licensed under the SIL Open Font License,` | 通过 |
+
+20:46 通过交付包 SDK 再次查询，默认实例版本为 1.4.1.1024，索引状态为就绪。个人索引 `%LOCALAPPDATA%\Everything\Everything.db` 仍为 288,302,208 字节。对照启动前快照，索引、个人配置、安装配置和 Everything 可执行文件四者的 SHA-256、大小、最后写入时间全部相同。结束时保留日常 Everything 运行。项目 `.data/` 内的 `personal-everything-baseline.txt`、`personal-everything-process-observations.txt`、`personal-everything-desktop.txt`、`personal-everything-postcheck.txt` 分别记录基线、UAC 进程、逐盘打开和结束核对。
 
 ### 证据与复验
 
