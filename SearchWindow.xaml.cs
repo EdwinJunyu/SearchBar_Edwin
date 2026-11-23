@@ -21,6 +21,7 @@ namespace ESearch;
 public partial class SearchWindow : Window
 {
     private int hotkeyId = 1;
+    private int pendingHotkeyId;
     private const uint NoRepeat = 0x4000;
     private (uint Modifiers, uint Key) hotkey = (1, 0x20);
     private SettingsWindow? settings;
@@ -134,8 +135,10 @@ public partial class SearchWindow : Window
         return string.Join(" + ", parts);
     }
 
-    private string? ApplyHotkey(uint modifiers, uint key)
+    private async Task<string?> ApplyHotkeyAsync(uint modifiers, uint key)
     {
+        if (exiting) return "应用正在退出。";
+        if (pendingHotkeyId != 0) return "正在保存上一组快捷键。";
         if (key is 0 or > 0xfe or 0x10 or 0x11 or 0x12 or 0x5b or 0x5c or (>= 0xa0 and <= 0xa5)
             || (modifiers & ~15u) != 0 || (modifiers == 0 && !(key is >= 0x70 and <= 0x87)))
             return "请选择带修饰键的组合，或单独使用功能键。";
@@ -147,34 +150,48 @@ public partial class SearchWindow : Window
             string reason = Marshal.GetLastWin32Error() == 1409 ? "已被占用" : "无法注册，可能是系统保留键";
             return $"{FormatHotkey(modifiers, key)} {reason}。";
         }
+        pendingHotkeyId = nextId;
         try
         {
-            using var store = new DictionaryStore(databasePath);
-            store.SaveHotkey(modifiers, key);
+            // 只有 SQLite 在后台等锁。await 后回到窗口线程，才能切换该 HWND 的注册。
+            await Task.Run(() =>
+            {
+                using var store = new DictionaryStore(databasePath);
+                store.SaveHotkey(modifiers, key);
+            });
+            if (exiting) return "应用正在退出。";
+            if (registered) UnregisterHotKey(hwnd, hotkeyId);
+            hotkeyId = nextId;
+            pendingHotkeyId = 0;
+            registered = true;
+            hotkey = (modifiers, key);
+            hotkeyWarning = "";
+            return null;
         }
         catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException)
         {
-            UnregisterHotKey(hwnd, nextId);
             return "快捷键保存失败：" + ex.Message;
         }
-        if (registered) UnregisterHotKey(hwnd, hotkeyId);
-        hotkeyId = nextId;
-        registered = true;
-        hotkey = (modifiers, key);
-        hotkeyWarning = "";
-        return null;
+        finally { ReleasePendingHotkey(); }
+    }
+
+    private void ReleasePendingHotkey()
+    {
+        if (pendingHotkeyId == 0) return;
+        UnregisterHotKey(hwnd, pendingHotkeyId);
+        pendingHotkeyId = 0;
     }
 
     private void OpenSettings()
     {
         if (settings == null)
         {
-            var page = new SettingsWindow(databasePath, ApplyHotkey, RefreshDictionary, hotkeyWarning);
+            var page = new SettingsWindow(databasePath, ApplyHotkeyAsync, RefreshDictionary, hotkeyWarning);
             settings = page;
             page.Closing += (_, e) =>
             {
-                if (!page.IsImporting || exiting) return;
-                // 导入仍由此页接收结果。用户可先回到搜索，再打开同一页查看进度或错误。
+                if (!page.HasPendingWrite || exiting) return;
+                // 保存快捷键或导入期间沿用原页接收结果，重开设置也不能重复提交。
                 e.Cancel = true;
                 page.Hide();
                 ReturnFromSettings();
@@ -1062,6 +1079,8 @@ public partial class SearchWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        exiting = true;
+        ReleasePendingHotkey();
         revision++;
         detailRevision++;
         debounce.Stop();

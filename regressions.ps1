@@ -2,12 +2,178 @@
 param([string] $RealDatabase, [switch] $Desktop, [switch] $FileDesktop, [string] $ColdStartFile,
       [switch] $SettingsDesktop, [string] $MdxSample, [string] $GuiExecutable, [switch] $OutOfOrder, [switch] $RestartEngine,
       [ValidateSet('Files','Keyboard','ColdEdit','Tray')][string[]] $AcceptanceDesktop,
-      [string] $BackendTestDirectory, [switch] $PrepareDesktop, [switch] $WindowDesktop, [switch] $FileActionsDesktop, [string] $FileFixtureRoot)
+      [string] $BackendTestDirectory, [switch] $PrepareDesktop, [switch] $WindowDesktop, [switch] $FileActionsDesktop, [string] $FileFixtureRoot,
+      [string] $PackageSeed, [string] $VerifyReleaseZip)
 $ErrorActionPreference = 'Stop'
 # 失败重导本身也是验收项，命令退出码由 Invoke-Search 明确检查。
 $PSNativeCommandUseErrorActionPreference = $false
 $dotnet = Join-Path $PSScriptRoot '.tools/dotnet/dotnet.exe'
 if (-not (Test-Path -LiteralPath $dotnet)) { $dotnet = (Get-Command dotnet -ErrorAction Stop).Path }
+function Get-ReleaseEvidence([string]$Directory, [string]$Database) {
+    # 从 EXE 读取支持的辞书，再用包内种子运行验收。个人安装和用户词库不参与发布测试。
+    $previousDb = $env:E_SEARCH_DB
+    try {
+        $env:E_SEARCH_DB = $Database
+        $exe = Join-Path $Directory 'E_Search.exe'
+        $version = @(& $exe --version | ForEach-Object { $_ })
+        if ($LASTEXITCODE -ne 0) { throw '发布程序无法输出版本' }
+        $info = ($version -join "") | ConvertFrom-Json
+        $catalog = @(& $exe list | ForEach-Object { ($_ -split "`t")[0] })
+        if ($LASTEXITCODE -ne 0) { throw '包内种子词库无法读取' }
+        $samples = @(& $exe verify | ForEach-Object { $_ })
+        if ($LASTEXITCODE -ne 0 -or $samples.Count -lt 7 -or @($samples -notmatch '^PASS\t').Count) {
+            throw '发布程序的词典样本验收失败'
+        }
+        return [ordered]@{ version=$info.version; build=$info.build; supportedDictionaries=$info.supportedDictionaries
+            bundledDictionaries=$catalog; samples=$samples }
+    } finally { $env:E_SEARCH_DB = $previousDb }
+}
+
+function Get-ReleaseFingerprint($Hashes) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $Hashes -Compress))
+    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+function Get-ReleaseSources {
+    $files = @(git @gitArgs -c core.quotepath=false ls-files --cached --others --exclude-standard -- $inputs)
+    if ($LASTEXITCODE -ne 0 -or !$files.Count) { throw '无法枚举构建输入' }
+    $hashes = [ordered]@{}
+    foreach ($file in ($files | Sort-Object -Unique -CaseSensitive)) {
+        $path = Join-Path $PSScriptRoot $file
+        if (Test-Path -LiteralPath $path -PathType Leaf) { $hashes[$file] = (Get-FileHash -LiteralPath $path).Hash }
+    }
+    return $hashes
+}
+
+function Get-ReleaseBinaries([string]$Directory) {
+    $binaries = [ordered]@{}
+    foreach ($name in 'E_Search.exe','E_Search.dll','Everything32.dll','Everything64.dll','EverythingARM64.dll') {
+        $binaries[$name] = (Get-FileHash -LiteralPath (Join-Path $Directory $name)).Hash
+    }
+    return $binaries
+}
+
+function Test-ReleaseZip([string]$Archive, [string]$Cache) {
+    # 只复用本脚本的验证目录。独占锁覆盖解压和执行，避免并发复验交叉使用两包的文件。
+    [void][IO.Directory]::CreateDirectory($Cache)
+    $guard = [IO.File]::Open((Join-Path $Cache 'verify.lock'),'OpenOrCreate','ReadWrite','None')
+    try {
+        $extract = [IO.Directory]::CreateDirectory((Join-Path $Cache 'extracted')).FullName
+        $archiveFile = [IO.Compression.ZipFile]::OpenRead($Archive)
+        try {
+            $members = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($entry in $archiveFile.Entries) { [void]$members.Add($entry.FullName.Replace('\','/')) }
+            # 隔离旧包独有的 DLL 和上次 SQLite 生成的旁文件，不能让残留文件使当前包误过验收。
+            foreach ($file in [IO.Directory]::EnumerateFiles($extract,'*',[IO.SearchOption]::AllDirectories)) {
+                $relative = [IO.Path]::GetRelativePath($extract,$file)
+                if ($members.Contains($relative.Replace('\','/'))) { continue }
+                $retired = Join-Path $Cache ('previous/' + [guid]::NewGuid().ToString('N') + '/' + $relative)
+                [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($retired))
+                [IO.File]::Move($file,$retired)
+            }
+            [IO.Compression.ZipFileExtensions]::ExtractToDirectory($archiveFile,$extract,$true)
+        } finally { $archiveFile.Dispose() }
+        $directory = Join-Path $extract 'E_Search-win-x64'
+        $manifest = Get-Content -Raw -Encoding utf8 -LiteralPath (Join-Path $directory 'release.json') | ConvertFrom-Json -AsHashtable
+        $seed = Join-Path $directory 'Data/dictionaries.db'
+        $binaries = Get-ReleaseBinaries $directory
+        foreach ($name in $binaries.Keys) {
+            if ($binaries[$name] -cne $manifest.binaries[$name]) { throw "ZIP 内 $name 的 SHA-256 与发布记录不一致" }
+        }
+        if ((Get-ReleaseFingerprint $manifest.sourceFiles) -cne $manifest.sourceSha256 -or
+            (Get-FileHash -LiteralPath $seed).Hash -cne $manifest.seedSha256) { throw 'ZIP 的源码清单或种子与发布记录不一致' }
+        $observed = Get-ReleaseEvidence $directory $seed
+        foreach ($field in $observed.Keys) {
+            if ((ConvertTo-Json -Compress -InputObject $observed[$field]) -cne
+                (ConvertTo-Json -Compress -InputObject $manifest.verified[$field])) { throw "ZIP 内程序的 $field 与发布记录不一致" }
+        }
+        if ($observed.build -cne "$($observed.version)+$($manifest.baseCommit).$($manifest.sourceSha256)") {
+            throw 'ZIP 内程序的构建标识与源码清单不一致'
+        }
+        Write-Output "PASS 最终 ZIP $($observed.build)，种子 $($observed.bundledDictionaries.Count) 本，$($observed.samples.Count) 项样本全部通过"
+    } finally { $guard.Dispose() }
+}
+
+if ($PackageSeed -or $VerifyReleaseZip) {
+    if ($PackageSeed -and $VerifyReleaseZip) { throw '打包和复验已有 ZIP 请分别执行。' }
+    $delivery = Join-Path $PSScriptRoot 'bin/release-delivery'
+    $cache = Join-Path $delivery '.work/verify'
+    if ($VerifyReleaseZip) {
+        Test-ReleaseZip (Resolve-Path -LiteralPath $VerifyReleaseZip).Path $cache
+        return
+    }
+    $work = [IO.Directory]::CreateDirectory((Join-Path $delivery ('.work/' + [guid]::NewGuid().ToString('N')))).FullName
+
+    $seed = (Resolve-Path -LiteralPath $PackageSeed).Path
+    $stage = Join-Path $work 'stage'
+    $directory = [IO.Directory]::CreateDirectory((Join-Path $stage 'E_Search-win-x64')).FullName
+    $gitArgs = @('-c',('safe.directory=' + $PSScriptRoot.Replace('\','/')),'-C',$PSScriptRoot)
+    $commit = (git @gitArgs rev-parse --verify HEAD)
+    if ($LASTEXITCODE -ne 0) { throw '无法读取发布源码的 Git 提交' }
+    # 一并记录未提交改动。按路径和内容计算构建身份，使同一提交上的两份工作区也可区分。
+    $inputs = @('*.cs','*.xaml','*.csproj','regressions.ps1')
+    $hashes = Get-ReleaseSources
+    $fingerprint = Get-ReleaseFingerprint $hashes
+    $tag = "$commit.$fingerprint"
+    & $dotnet publish (Join-Path $PSScriptRoot 'E_Search.csproj') -c Release -f net10.0-windows -r win-x64 --self-contained true "-p:SourceRevisionId=$tag" -o $directory
+    if ($LASTEXITCODE -ne 0) { throw "发布构建失败，退出码 $LASTEXITCODE" }
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'reports') -Destination $directory -Recurse
+    # 基准提交加本次源码差异可以还原尚未提交的构建；仅打包参与构建与验收的文件。
+    $reports = Join-Path $directory 'reports'
+    git @gitArgs diff --quiet HEAD -- $inputs
+    if ($LASTEXITCODE -eq 1) {
+        $patch = Join-Path $reports 'working-tree.patch'
+        git @gitArgs diff --binary --no-ext-diff --no-color "--output=$patch" HEAD -- $inputs
+        if ($LASTEXITCODE -ne 0) { throw '无法记录本次构建的源码差异' }
+    } elseif ($LASTEXITCODE -ne 0) { throw '无法检查构建输入的改动' }
+    $untracked = @(git @gitArgs -c core.quotepath=false ls-files --others --exclude-standard -- $inputs)
+    if ($LASTEXITCODE -ne 0) { throw '无法枚举新增源码' }
+    foreach ($file in $untracked) {
+        $copy = Join-Path $reports "untracked-source/$file"
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($copy))
+        [IO.File]::Copy((Join-Path $PSScriptRoot $file),$copy)
+    }
+    if ((git @gitArgs rev-parse --verify HEAD) -cne $commit -or
+        (Get-ReleaseFingerprint (Get-ReleaseSources)) -cne $fingerprint) { throw '构建时源码发生变化，请用当前工作区重新发布。' }
+    $evidence = Get-ReleaseEvidence $directory $seed
+    if ($evidence.build -cne "$($evidence.version)+$tag") { throw '编译标识与本次源码不一致' }
+    $manifest = [ordered]@{ baseCommit=$commit; sourceSha256=$fingerprint; sourceFiles=$hashes
+        binaries=(Get-ReleaseBinaries $directory)
+        seedSha256=(Get-FileHash -LiteralPath $seed).Hash
+        verified=$evidence }
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $directory 'release.json')
+    $filename = "E_Search-$($evidence.version)-$($commit.Substring(0,7))-$($fingerprint.Substring(0,12))-win-x64.zip"
+    $candidate = Join-Path $work $filename
+    # 以流式创建模式写入程序和种子，避免在内存或暂存目录中再复制整份大数据库。
+    $source = [IO.File]::Open($seed,'Open','Read','Read')
+    try {
+        foreach ($suffix in '-wal','-journal') {
+            if ([IO.File]::Exists($seed+$suffix) -and (Get-Item -LiteralPath ($seed+$suffix)).Length -gt 0) {
+                throw '请通过 SQLite 备份生成独立种子，再用于发布。'
+            }
+        }
+        $zip = [IO.Compression.ZipFile]::Open($candidate,'Create')
+        try {
+            foreach ($file in [IO.Directory]::EnumerateFiles($directory,'*',[IO.SearchOption]::AllDirectories)) {
+                $member = [IO.Path]::GetRelativePath($stage,$file).Replace('\','/')
+                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,$member,[IO.Compression.CompressionLevel]::Fastest)
+            }
+            $entry = $zip.CreateEntry('E_Search-win-x64/Data/dictionaries.db',[IO.Compression.CompressionLevel]::Fastest)
+            $stream = $entry.Open()
+            try { $source.CopyTo($stream) } finally { $stream.Dispose() }
+        } finally { $zip.Dispose() }
+    } finally { $source.Dispose() }
+    Test-ReleaseZip $candidate $cache
+    $destination = Join-Path $delivery $filename
+    if ([IO.File]::Exists($destination)) {
+        # 重新发布同一源码时，给本次通过验收的包独立命名，保留以前的交付。
+        $destination = Join-Path $delivery ([IO.Path]::GetFileNameWithoutExtension($filename) + '-' + [guid]::NewGuid().ToString('N').Substring(0,8) + '.zip')
+    }
+    [IO.File]::Move($candidate,$destination)
+    Write-Output "发布包 $destination"
+    return
+}
+
 $app = Join-Path $PSScriptRoot 'bin/Release/net10.0/E_Search.dll'
 if (-not (Test-Path -LiteralPath $app)) { throw '请先执行 dotnet build -c Release' }
 if ($RealDatabase) { $RealDatabase = (Resolve-Path -LiteralPath $RealDatabase).Path }
@@ -323,6 +489,64 @@ function Test-ImportIdentity([string]$Directory, [Reflection.Assembly]$Assembly)
         } finally { $env:E_SEARCH_DB = $previous }
         Write-Output 'PASS 旧设置来源升级为英辞郎后仍保留原 GUID、排序和启停'
     } finally { $db.Dispose() }
+}
+
+function Test-WindowsImportPaths([string]$Directory, [Reflection.Assembly]$Assembly) {
+    $folder = [IO.Directory]::CreateDirectory((Join-Path $Directory 'Étage')).FullName
+    $other = [IO.Directory]::CreateDirectory((Join-Path $Directory 'Autre')).FullName
+    $mixed = [IO.Path]::Combine($folder,'Résumé.csv')
+    $lower = [IO.Path]::Combine($Directory,'étage','résumé.csv')
+    $upper = [IO.Path]::Combine($Directory,'ÉTAGE','RÉSUMÉ.CSV')
+    $separate = [IO.Path]::Combine($other,'Résumé.csv')
+    [IO.File]::WriteAllText($mixed,"word,gloss`nalpha,原义")
+    [IO.File]::Copy($mixed,$separate)
+    $dbPath = [IO.Path]::Combine($Directory,'windows-paths.db')
+    $store = [Activator]::CreateInstance($Assembly.GetType('DictionaryStore'), @($dbPath,$false))
+    $mapping = [Activator]::CreateInstance($Assembly.GetType('TableMapping'), @(0,1,$null,$true))
+    $config = [Microsoft.Data.Sqlite.SqliteConnectionStringBuilder]::new()
+    $config.DataSource = $dbPath
+    $history = [Microsoft.Data.Sqlite.SqliteConnection]::new($config.ToString())
+    try {
+        $a = $store.ImportDictionary($mixed,'en',$mapping)
+        $b = $store.ImportDictionary($separate,'en',$mapping)
+        Assert-Equal ($a.Id -ne $b.Id) $true '不同目录的同名同内容 CSV 分别入库'
+        $store.SaveDictionaryOrder([string[]]@($a.Id,$b.Id))
+        $store.SetDictionaryEnabled($a.Id,$false)
+        [IO.File]::WriteAllText($mixed,"word,gloss`nbeta,更新")
+        $update = $store.ImportDictionary($lower,'en',$mapping)
+        Assert-Equal $update.Id $a.Id '目录和文件的非 ASCII 大小写变化仍更新原 ID'
+        Assert-Equal $store.ListDictionaries().Count 2 '按 Windows 路径重导没有新建副本'
+        Assert-Equal $update.Enabled $false '识别同一来源后仍停用'
+        Assert-Equal $store.ListDictionaries()[0].Id $a.Id '识别同一来源后仍在原位置'
+        $store.SetDictionaryEnabled($a.Id,$true)
+        Assert-Equal $store.Search('beta',$a.Id,[Threading.CancellationToken]::None)[0].Entry.Gloss '更新' '原 ID 可检索换版内容'
+        Assert-Equal $store.Search('alpha',$b.Id,[Threading.CancellationToken]::None)[0].Entry.Gloss '原义' '另一目录同名词库保留旧内容'
+
+        # 用旧 schema 的 NOCASE 唯一索引允许的两种历史拼写，验证升级不会替用户合并两本词典。
+        $history.Open()
+        $cmd = $history.CreateCommand()
+        $cmd.CommandText = 'UPDATE dictionary_metadata SET source_path=$path WHERE id=$id'
+        $null = $cmd.Parameters.AddWithValue('$path',$upper)
+        $null = $cmd.Parameters.AddWithValue('$id',$b.Id)
+        [void]$cmd.ExecuteNonQuery()
+        Assert-Equal $store.ImportDictionary($lower,'en',$mapping).Id $a.Id '历史重复路径优先完全一致的小写拼写'
+        Assert-Equal $store.ImportDictionary($upper,'en',$mapping).Id $b.Id '历史重复路径优先完全一致的大写拼写'
+        $ambiguity = ''
+        try { $null = $store.ImportDictionary($mixed,'en',$mapping) }
+        catch { $ambiguity = $_.Exception.GetBaseException().Message }
+        Assert-Equal ($ambiguity -match '拼写') $true '历史重复路径遇到第三种拼写须提示选择原拼写'
+        Assert-Equal $store.ListDictionaries().Count 2 '历史歧义保留两本原词典'
+
+        $legacy = [IO.Path]::Combine($folder,'Éclair.csv')
+        [IO.File]::WriteAllText($legacy,"word,gloss`nlegacy,旧版")
+        $old = $store.ImportDictionary($legacy,'en',$mapping)
+        $cmd.Parameters['$path'].Value = [DBNull]::Value
+        $cmd.Parameters['$id'].Value = $old.Id
+        [void]$cmd.ExecuteNonQuery()
+        $legacyCase = [IO.Path]::Combine($folder,'éclair.csv')
+        Assert-Equal $store.ImportDictionary($legacyCase,'en',$mapping).Id $old.Id '缺少来源路径的旧词典按唯一同名和相同哈希认领'
+    } finally { $history.Dispose(); $store.Dispose() }
+    Write-Output 'PASS 非 ASCII 路径大小写重导保持原 ID、排序和启停，异目录同名及旧库路径歧义分别处理'
 }
 
 function Write-HtmlFixture([string]$Path) {
@@ -766,8 +990,7 @@ function Test-SettingsPage([switch]$Restarted) {
         Wait-Desktop { @(Invoke-Search @('list') | Where-Object { $_.EndsWith(("`t"+$name),[StringComparison]::OrdinalIgnoreCase) }).Count -eq 1 } "词典未入库：$name" 120000
         Wait-Desktop { (Control ImportButton).Current.IsEnabled -and (Control ImportStatus).Current.Name.StartsWith("已导入 $name，",[StringComparison]::OrdinalIgnoreCase) } '导入结果没有返回设置页'
     }
-    function Start-ImportAndReopen {
-        # 暂时持有测试库的写事务，使快慢机器上都能在提交前关闭、重新打开真实设置窗口。
+    function Open-SettingsWriter {
         if (!('Microsoft.Data.Sqlite.SqliteConnection' -as [type])) {
             $uiDir=Join-Path $PSScriptRoot 'bin/Release/net10.0-windows'
             foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite') {
@@ -778,8 +1001,13 @@ function Test-SettingsPage([switch]$Restarted) {
         $config=[Microsoft.Data.Sqlite.SqliteConnectionStringBuilder]::new()
         $config.DataSource=$Database
         $writer=[Microsoft.Data.Sqlite.SqliteConnection]::new($config.ToString())
+        $writer.Open()
+        return $writer
+    }
+    function Start-ImportAndReopen {
+        # 暂时持有测试库的写事务，使快慢机器上都能在提交前关闭、重新打开真实设置窗口。
+        $writer=Open-SettingsWriter
         try {
-            $writer.Open()
             $tx=$writer.BeginTransaction()
             Click ImportButton
             Wait-Desktop { (Control ImportStatus).Current.Name -like '正在导入*' } '导入没有开始'
@@ -868,6 +1096,15 @@ function Test-SettingsPage([switch]$Restarted) {
     if ((Invoke-Search @('query','ちゃ') | Out-String) -notlike '*茶叶样本*茶*') { throw 'CSV 可选读音列未建立正确索引' }
     Write-Output 'PASS CSV 预览并按列序号映射，跳过表头，空读音、UTF-8 BOM、带逗号和双引号的释义均已验证'
 
+    Stage-File $csv
+    [IO.File]::WriteAllText($csv, "词头,读音,释义`r`n错列样本,,另一个解释")
+    Click ImportButton
+    Wait-Desktop { (Control ImportStatus).Current.Name -like '*重新预览*' } '设置页没有拒绝预览后换列的词表'
+    Assert-Equal (Invoke-Search @('list') | Where-Object { $_ -like '*优先级甲.csv*' }) $csvLine '设置页拒绝旧映射后保留原词库'
+    Stage-File $csv
+    Assert-Equal (Control HeadColumn).GetCurrentPattern([Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()[0].Current.Name '第 1 列 · 词头' '重新预览后按新表头建议词头列'
+    Write-Output 'PASS 设置页拒绝预览后互换的表头，并按新表头重新建议词头列'
+
     $tsvRows=@("乙释义`t$rankWord")
     $tsvRows+=foreach ($i in 2..6) { "普通释义$i`t样本词$i" }
     $tsvRows+="第七行释义`t迟到的读音`tななめ"
@@ -933,7 +1170,46 @@ function Test-SettingsPage([switch]$Restarted) {
     Wait-Desktop { $capture.GetCurrentPattern($valuePattern).Current.Value -match 'Ctrl.*Alt.*F8' } '真实按键未捕获 Ctrl+Alt+F8'
     Click SaveHotkeyButton
     Wait-Desktop { (Control CurrentHotkey).Current.Name -match 'F8' } '保存 Ctrl+Alt+F8 失败'
-    if (![ESearchDesktop]::RegisterHotKey($form.Handle,0x1471,3,120)) { throw '无法预留冲突验收键 Ctrl+Alt+F9' }
+    if (![ESearchDesktop]::RegisterHotKey($form.Handle,0x1471,3,120)) { throw '专项快捷键 Ctrl+Alt+F9 已被占用' }
+    [void][ESearchDesktop]::UnregisterHotKey($form.Handle,0x1471)
+    $writer=Open-SettingsWriter
+    try {
+        $tx=$writer.BeginTransaction()
+        $sql=$writer.CreateCommand()
+        $sql.Transaction=$tx
+        # 持锁时观察窗口，提交后用数据库触发器确定性地拒绝候选键。
+        $sql.CommandText="CREATE TRIGGER reject_hotkey BEFORE INSERT ON app_settings WHEN NEW.name='hotkey' BEGIN SELECT RAISE(ABORT, 'hotkey-test-failure'); END"
+        [void]$sql.ExecuteNonQuery()
+        Edit HotkeyCapture 'Ctrl + Alt + F9'
+        Click SaveHotkeyButton
+        Wait-Desktop { !(Control SaveHotkeyButton).Current.IsEnabled } '数据库写锁期间快捷键保存未进入可响应的等待状态'
+        Tab CatalogTab
+        $window.GetCurrentPattern([Windows.Automation.WindowPattern]::Pattern).Close()
+        Wait-Desktop { [ESearchDesktop]::FindSearch($appProcess.Id) -eq $handle } '快捷键等待写锁时无法返回搜索'
+        $window=$searchWindow
+        Click SettingsButton
+        $settingsFilter=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,'E_Search 设置')
+        $settingsCondition=[Windows.Automation.AndCondition]::new($windows,$settingsFilter)
+        Wait-Desktop { $root.FindFirst([Windows.Automation.TreeScope]::Children,$settingsCondition) } '快捷键保存期间无法重新进入设置'
+        $window=$root.FindFirst([Windows.Automation.TreeScope]::Children,$settingsCondition)
+        Tab HotkeyTab
+        Assert-Equal (Control SaveHotkeyButton).Current.IsEnabled $false '重开设置时不能重复提交快捷键'
+        Assert-Equal (Control CurrentHotkey).Current.Name 'Ctrl + Alt + F8' '锁未释放前保留原快捷键'
+        $tx.Commit()
+        Wait-Desktop { (Control HotkeyStatus).Current.Name -like '*hotkey-test-failure*' -and (Control SaveHotkeyButton).Current.IsEnabled } '保存失败后未显示 SQLite 错误或未恢复按钮'
+        Assert-Equal (Control CurrentHotkey).Current.Name 'Ctrl + Alt + F8' '持久化失败后保留原快捷键'
+        $sql.Transaction=$null
+        $sql.CommandText="SELECT value FROM app_settings WHERE name='hotkey'"
+        Assert-Equal $sql.ExecuteScalar() (([long]3 -shl 32) + 119) '失败后磁盘仍保存 Ctrl+Alt+F8'
+        $sql.CommandText='DROP TRIGGER reject_hotkey'
+        [void]$sql.ExecuteNonQuery()
+    } finally {
+        if ($sql) { $sql.Dispose() }
+        if ($tx) { $tx.Dispose() }
+        $writer.Dispose()
+    }
+    if (![ESearchDesktop]::RegisterHotKey($form.Handle,0x1471,3,120)) { throw '数据库保存失败后没有释放候选键 Ctrl+Alt+F9' }
+    Write-Output 'PASS 快捷键等待 SQLite 写锁期间可切页、关闭并重开设置，写入失败后保留旧设置并释放候选键'
     try {
         Edit HotkeyCapture 'Ctrl + Alt + F9'; Click SaveHotkeyButton
         Wait-Desktop { (Control HotkeyStatus).Current.Name -match '冲突|占用' } '外部进程占用热键时没有冲突提示'
@@ -1023,6 +1299,7 @@ function Test-LookupAudit([string]$Scratch, [Reflection.Assembly]$Assembly) {
                     # 仅改本测试库，重建旧版本实际存下的摘要、词头索引及空读音。
                     $cmd.CommandText = @"
 UPDATE entries SET gloss='been 是过去分词' WHERE dict='oxford' AND head='go';
+UPDATE dictionary_metadata SET revision='previous-import' WHERE id='oxford';
 DELETE FROM terms WHERE kind=1 AND (dict,ordinal) IN (SELECT dict,ordinal FROM entries WHERE link IS NOT NULL);
 UPDATE entries SET reading=NULL,evidence=NULL WHERE link IS NOT NULL;
 "@
@@ -1191,6 +1468,27 @@ function Test-OxfordSummary([string]$Scratch, [Reflection.Assembly]$Assembly) {
             $cmd = $connection.CreateCommand()
             $cmd.CommandText = "SELECT gloss FROM entries WHERE head='light'"
             Assert-Equal ($cmd.ExecuteScalar()) 'n. 光 / adj. 明亮' '导入时选择两个不同词性的主词条义项'
+            # 当前格式使用已存摘要。只在隔离库中注入不同正文，观察查询取值来源。
+            $cmd.CommandText = "UPDATE entries SET raw='<font color=#FF5000>另一版释义</font>' WHERE head='light'"
+            [void]$cmd.ExecuteNonQuery()
+            $hit = Invoke-Search @('query','light','oxford')
+            Assert-Equal ($hit -split "`t")[-1] 'n. 光 / adj. 明亮' '当前格式查询直接使用已存摘要'
+            $cmd.CommandText = 'UPDATE entries SET raw=$body WHERE head=''light'''
+            $cmd.Parameters.AddWithValue('$body',$light) | Out-Null
+            [void]$cmd.ExecuteNonQuery()
+            $cmd.Parameters.Clear()
+            # b4b29a4 重导同一个文件时照常更新来源路径，却不会写后来新增的版本列。
+            $cmd.CommandText = @'
+BEGIN IMMEDIATE;
+UPDATE dictionaries SET sha256=sha256 WHERE id='oxford';
+INSERT INTO dictionary_metadata(id,source_path) SELECT id,source_path FROM dictionary_metadata WHERE id='oxford'
+    ON CONFLICT(id) DO UPDATE SET source_path=excluded.source_path;
+UPDATE entries SET gloss='光' WHERE dict='oxford' AND head='light';
+COMMIT;
+'@
+            [void]$cmd.ExecuteNonQuery()
+            $hit = Invoke-Search @('query','light','oxford')
+            Assert-Equal ($hit -split "`t")[-1] 'n. 光 / adj. 明亮' '不认识版本列的旧程序重导同一文件后仍按当前规则提取摘要'
             $cmd.CommandText = "UPDATE entries SET gloss='旧版摘要'"
             [void]$cmd.ExecuteNonQuery()
             $cmd.CommandText = 'ALTER TABLE dictionary_metadata DROP COLUMN parser_id; ALTER TABLE dictionary_metadata DROP COLUMN revision;'
@@ -1313,11 +1611,12 @@ function Test-SentencePhrases([string]$Scratch) {
             $mark + 'run into sth </SPAN><br>no translation' +
             $mark + 'run across sb / sth </SPAN><br><font color=#FF5000>偶遇</font>' +
             '<div><b>【IDIOMS】</b></div>' + $mark + 'run away </SPAN><font color=#FF5000>其他义区</font>'
-        Write-Mdx $en ([ordered]@{run=$run})
+        Write-Mdx $en ([ordered]@{run=$run; 'traffic light'='信号灯'})
         Invoke-Search @('import','oxford',$en) | Out-Null
         $parts=@(Invoke-Search @('query','I ran out of time.'))[0] -split "`t"
         Assert-Equal $parts[0] 'oxford:1' '内嵌短语指向原书父词条'
         Assert-Equal $parts[3] 'ran out of → run out of · 用完,耗尽(供应品)' '可选介词和宾语按原文匹配并提取同标题中文'
+        Assert-Equal (@(Invoke-Search @('query','I ran out of time at the traffic light.'))[0] -split "`t")[3] 'ran out of → run out of · 用完,耗尽(供应品)' '较短的独立词头不能遮住更长的连续牛津短语'
         Assert-Equal (@(Invoke-Search @('query','We ran across friends.'))[0] -split "`t")[3] 'ran across → run across · 偶遇' '尾部代词占位符不当作固定用词'
         foreach($text in 'We ran into trouble.','We ran away happily.','We ran down the road.') {
             Assert-Equal @(Invoke-Search @('query',$text)).Count 0 "不从缺义小标题、其他义区或例句取义 $text"
@@ -1445,6 +1744,48 @@ function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly
             Assert-Equal ($null -eq $reader.CurrentBody($entry)) $true '过期的正文位置不得套用在新版本'
         } finally { $reader.Dispose() }
         Write-Output 'PASS 内嵌词条原文位置、重名文本、转义字符和词库版本'
+    } finally { $env:E_SEARCH_DB=$previous }
+}
+
+function Test-LatinPunctuation([string]$Scratch) {
+    $previous=$env:E_SEARCH_DB
+    $env:E_SEARCH_DB=Join-Path $Scratch 'latin-punctuation.db'
+    try {
+        $en=Join-Path $Scratch 'latin-punctuation.mdx'
+        $ja=Join-Path $Scratch 'ja-punctuation.mdx'
+        $right=[char]0x2019; $left=[char]0x2018; $modifier=[char]0x02bc
+        $hyphen=[char]0x2010; $nbHyphen=[char]0x2011
+        $mixed="rock${right}n-roll show"
+        Write-Mdx $en ([ordered]@{ "don't"='不要'; 're-enter'='再进入'; "it${right}s"='它的'; $mixed='演出'
+            'concert'="@@@LINK=rock${right}n-roll show" })
+        Write-Mdx $ja ([ordered]@{ "猫${right}犬"='原标点' })
+        Invoke-Search @('import','oxford',$en) | Out-Null
+        Invoke-Search @('import','shogakukan',$ja) | Out-Null
+        foreach ($stage in '新导入','旧只读库') {
+            if ($stage -eq '旧只读库') {
+                # 旧索引只经过 NFKC，弯撇号和 U+2010 连字符仍是原字符。
+                $sql=[Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$env:E_SEARCH_DB")
+                $sql.Open()
+                try {
+                    $cmd=$sql.CreateCommand()
+                    $cmd.CommandText="UPDATE terms SET term='it${right}s' WHERE dict='oxford' AND ordinal=3;
+                        UPDATE terms SET term='rock${right}n${hyphen}roll show' WHERE dict='oxford' AND ordinal=4;
+                        UPDATE entries SET link='rock''n-roll show' WHERE dict='oxford' AND ordinal=5;"
+                    [void]$cmd.ExecuteNonQuery()
+                } finally { $sql.Dispose() }
+            }
+            foreach ($row in @(@("don${right}t",'不要'),@("don${left}t",'不要'),@("don${modifier}t",'不要'),
+                    @("re${nbHyphen}enter",'再进入'),@("it's",'它的'),@('concert','演出'))) {
+                $lines=@(Invoke-Search @('query',$row[0],'oxford'))
+                Assert-Equal ($lines -join '|' -like "*`theadword`t*`t$($row[1])") $true "$stage 标点等价词头及跳转 $($row[0])"
+            }
+            $span="ROCK'n${nbHyphen}ROLL  show"
+            $hits=@(Invoke-Search @('query',"I saw the $span yesterday.",'oxford'))
+            Assert-Equal ($hits -join '|') "oxford:4`tphrase`t$span`t$span → $mixed · 演出" "$stage 句中保留原文，兼容混合标点的既有索引"
+            Assert-Equal @(Invoke-Search @('query',"猫'犬",'shogakukan')).Count 0 "$stage 日文词头区分中间标点"
+            Assert-Equal @(Invoke-Search @('query',"猫${right}犬",'shogakukan')).Count 1 "$stage 原日文标点仍可查"
+        }
+        Write-Output 'PASS 拉丁词撇号和连字符的新旧索引、句中原文和链接'
     } finally { $env:E_SEARCH_DB=$previous }
 }
 
@@ -2540,6 +2881,12 @@ function Test-CliAccess([string]$Directory) {
     try {
         $empty = Join-Path $Directory 'missing-cli-profile'
         $env:E_SEARCH_DB = Join-Path $empty 'missing.db'
+        $release = (Invoke-Search @('--version') | Out-String) | ConvertFrom-Json
+        Assert-Equal ($release.version -match '^\d+\.\d+\.\d+$') $true '发布信息含版本号'
+        foreach ($id in 'oxford','sango','eijiro','shogakukan-zhja') {
+            Assert-Equal ($release.supportedDictionaries -ccontains $id) $true "发布信息列出支持的词典 $id"
+        }
+        Assert-Equal (Test-Path -LiteralPath $empty) $false '查看版本不需要创建词库'
         foreach ($arguments in @(@('oops'), @('entry','oxford','bad-ordinal'), @('import','unknown','sample.mdx'))) {
             Invoke-Search $arguments 1 | Out-Null
             Assert-Equal (Test-Path -LiteralPath $empty) $false '无效参数不得创建数据库目录'
@@ -2623,6 +2970,64 @@ function Test-ReleaseDataLocation {
         $env:LOCALAPPDATA = $oldProfile
     }
     Write-Output 'PASS 无种子发布版跨工作目录共用个人词库；首次只读查询直接读取发布种子'
+}
+
+function Test-TablePreviewImport([string]$Directory, [Reflection.Assembly]$Assembly) {
+    $storeType = $Assembly.GetType('DictionaryStore', $true)
+    $mappingType = $Assembly.GetType('TableMapping', $true)
+    $store = [Activator]::CreateInstance($storeType, @([string](Join-Path $Directory 'preview.db'),$false))
+    try {
+        foreach ($extension in 'csv','tsv') {
+            $header = $extension -eq 'csv'
+            $delimiter = if ($header) { ',' } else { "`t" }
+            $path = [string](Join-Path $Directory "preview.$extension")
+            # 无表头时首行两个单元格相同，须核对后面的样例才能发现换列。
+            $labels = if ($header) { "词头${delimiter}释义" } else { "same${delimiter}same" }
+            [IO.File]::WriteAllLines($path, [string[]]@($labels,"example${delimiter}原义"))
+            $mapping = [Activator]::CreateInstance($mappingType, @(0,1,$null,$header))
+            $preview = $storeType.GetMethod('PreviewTable').Invoke($null,@($path))
+            $property = $mappingType.GetProperty('PreviewRows')
+            $property.SetValue($mapping,$preview)
+            $book = $store.ImportDictionary($path,'en',$mapping)
+            $old = $store.Search('example',$book.Id,[Threading.CancellationToken]::None)[0].Entry
+            $newLabels = if ($header) { "释义${delimiter}词头" } else { $labels }
+            [IO.File]::WriteAllLines($path, [string[]]@($newLabels,"新义${delimiter}updated"))
+            $failure = ''
+            try { $null = $store.ImportDictionary($path,'en',$mapping,$book.Id) }
+            catch { $failure = $_.Exception.GetBaseException().Message }
+            Assert-Equal ($failure -match '重新预览') $true "$extension 预览后换列必须提示重新预览"
+            Assert-Equal ($store.CurrentBody($old)) '原义' "$extension 拒绝过期映射后原词条及版本仍可用"
+            Assert-Equal (@($store.ListDictionaries() | Where-Object Id -eq $book.Id)[0].Sha256) $book.Sha256 "$extension 拒绝换列后保留原哈希"
+
+            $fresh = [Activator]::CreateInstance($mappingType, @(1,0,$null,$header))
+            $property.SetValue($fresh,$storeType.GetMethod('PreviewTable').Invoke($null,@($path)))
+            $updated = $store.ImportDictionary($path,'en',$fresh,$book.Id)
+            Assert-Equal $updated.Id $book.Id "$extension 重新预览和选择新映射后可更新原词典"
+            Assert-Equal $store.Search('updated',$book.Id,[Threading.CancellationToken]::None)[0].Entry.Gloss '新义' "$extension 使用新列顺序"
+        }
+        # 重复或空白列名无法标识被互换的两列。唯一表头仍应允许预览后只更新正文。
+        $path = [string](Join-Path $Directory 'header-identity.csv')
+        foreach ($labels in 'word,translation,translation','word, ,','word,gloss,notes') {
+            [IO.File]::WriteAllLines($path,[string[]]@($labels,'example,原义,备注'))
+            $mapping = [Activator]::CreateInstance($mappingType, @(0,1,$null,$true))
+            $property.SetValue($mapping,$storeType.GetMethod('PreviewTable').Invoke($null,@($path)))
+            $book = $store.ImportDictionary($path,'en',$mapping)
+            $old = $store.Search('example',$book.Id,[Threading.CancellationToken]::None)[0].Entry
+            if ($labels -eq 'word,gloss,notes') {
+                [IO.File]::WriteAllLines($path,[string[]]@($labels,'example,新义,备注'))
+                $null = $store.ImportDictionary($path,'en',$mapping)
+                Assert-Equal $store.Search('example',$book.Id,[Threading.CancellationToken]::None)[0].Entry.Gloss '新义' '稳定的唯一表头允许仅更新正文'
+            } else {
+                [IO.File]::WriteAllLines($path,[string[]]@($labels,'example,备注,原义'))
+                $failure = ''
+                try { $null = $store.ImportDictionary($path,'en',$mapping) }
+                catch { $failure = $_.Exception.GetBaseException().Message }
+                Assert-Equal ($failure -match '重新预览') $true "歧义表头 $labels 换列后必须重新预览"
+                Assert-Equal ($store.CurrentBody($old)) '原义' "歧义表头 $labels 拒绝旧映射后保留正文和版本"
+            }
+        }
+    } finally { $store.Dispose() }
+    Write-Output 'PASS CSV 与 TSV 换列后拒绝旧映射、保留原词条，重复或空表头核对样例，唯一表头允许更新正文'
 }
 
 function Test-EntryRevision([string]$Directory, [Reflection.Assembly]$Assembly) {
@@ -2773,6 +3178,7 @@ if ($BackendTestDirectory) {
     Assert-Equal $url ('https://chatgpt.com/?q=' + [Uri]::EscapeDataString($prompt)) '中文与 URL 特殊字符'
     Write-Output 'PASS AI 前缀、空提示词与 ChatGPT 链接编码'
     Test-ImportIdentity $BackendTestDirectory $assembly
+    Test-WindowsImportPaths $BackendTestDirectory $assembly
     Test-AdditionalDictionaries $BackendTestDirectory $assembly
     Test-EverythingRecovery $BackendTestDirectory $assembly
     Test-SanseidoSummary $BackendTestDirectory $assembly
@@ -2786,8 +3192,10 @@ if ($BackendTestDirectory) {
     Test-SentencePhrases $BackendTestDirectory
     Test-PhraseDetailAnchor $BackendTestDirectory $assembly
     Test-HanyingReferences $BackendTestDirectory $assembly
+    Test-LatinPunctuation $BackendTestDirectory
     Test-EnglishLookup $BackendTestDirectory $assembly
     Test-SpellingSuggestions $BackendTestDirectory $assembly
+    Test-TablePreviewImport $BackendTestDirectory $assembly
     Test-EntryRevision $BackendTestDirectory $assembly
     Test-CliAccess $BackendTestDirectory
     Test-ReleaseDataLocation

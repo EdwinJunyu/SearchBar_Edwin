@@ -11,16 +11,16 @@ namespace ESearch;
 public partial class SettingsWindow : Window
 {
     private readonly string databasePath;
-    private readonly Func<uint, uint, string?> applyHotkey;
+    private readonly Func<uint, uint, Task<string?>> applyHotkey;
     private readonly Action onCatalogChanged;
     private IReadOnlyList<string[]> sample = [];
     private string? preparedPath;
     private int previewVersion;
     private bool busy, ready, closed;
-    internal bool IsImporting { get; private set; }
+    internal bool HasPendingWrite { get; private set; }
     private const string NoReading = "不导入读音";
 
-    internal SettingsWindow(string databasePath, Func<uint, uint, string?> applyHotkey, Action onCatalogChanged, string hotkeyWarning)
+    internal SettingsWindow(string databasePath, Func<uint, uint, Task<string?>> applyHotkey, Action onCatalogChanged, string hotkeyWarning)
     {
         this.databasePath = databasePath;
         this.applyHotkey = applyHotkey;
@@ -93,7 +93,7 @@ public partial class SettingsWindow : Window
     {
         busy = value;
         ImportForm.IsEnabled = !busy && ready;
-        SaveHotkeyButton.IsEnabled = !busy && ready;
+        SaveHotkeyButton.IsEnabled = HotkeyCapture.IsEnabled = !busy && ready;
         ImportButton.IsEnabled = !busy && ready && preparedPath != null;
         UpdateCatalogActions();
     }
@@ -201,9 +201,11 @@ public partial class SettingsWindow : Window
             if (version != previewVersion || closed) return;
             if (ext != ".mdx" && (rows.Count == 0 || rows.Max(row => row.Length) < 2))
                 throw new InvalidDataException("词表至少需要词头和释义两列。");
+            bool preserveMapping = rows.Count > 0 && string.Equals(path, oldPath, StringComparison.OrdinalIgnoreCase)
+                && TableMapping.MatchesPreview(sample, rows, HasHeader.IsChecked == true);
             sample = rows;
             TablePanel.Visibility = rows.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
-            if (rows.Count > 0) BuildTable(string.Equals(path, oldPath, StringComparison.OrdinalIgnoreCase));
+            if (rows.Count > 0) BuildTable(preserveMapping);
             if (ImportTarget.SelectedItem is Target { Book: null } && ext == ".mdx")
             {
                 var known = Source.All.FirstOrDefault(s => string.Equals(Path.GetFileName(s.RelativePath), Path.GetFileName(path), StringComparison.OrdinalIgnoreCase));
@@ -297,11 +299,11 @@ public partial class SettingsWindow : Window
                 Message(ImportStatus, "词头、释义和可选读音必须映射到不同的列。", true);
                 return;
             }
-            mapping = new TableMapping(head, gloss, read, HasHeader.IsChecked == true);
+            mapping = new TableMapping(head, gloss, read, HasHeader.IsChecked == true) { PreviewRows = sample };
         }
 
         Busy(true);
-        IsImporting = true;
+        HasPendingWrite = true;
         Message(ImportStatus, "正在导入词条并建立索引…");
         try
         {
@@ -323,7 +325,7 @@ public partial class SettingsWindow : Window
             // 失败时仍停留在当前词表和映射，可直接改列后重试。
             if (!closed) Message(ImportStatus, $"导入失败。{ex.Message}", true);
         }
-        finally { IsImporting = false; Busy(false); }
+        finally { HasPendingWrite = false; Busy(false); }
     }
 
     private void CaptureKey(object sender, KeyEventArgs e)
@@ -343,18 +345,27 @@ public partial class SettingsWindow : Window
         HotkeyCapture.SelectAll();
     }
 
-    private void SaveHotkey(object sender, RoutedEventArgs e)
+    private async void SaveHotkey(object sender, RoutedEventArgs e)
     {
         if (busy || !ready) return;
         try
         {
             var (modifiers, key) = ParseHotkey(HotkeyCapture.Text);
-            var error = applyHotkey(modifiers, key);
+            HasPendingWrite = true;
+            Busy(true);
+            Message(HotkeyStatus, "正在保存快捷键…");
+            var error = await applyHotkey(modifiers, key);
+            if (closed) return;
             if (error != null) { Message(HotkeyStatus, error, true); return; }
             CurrentHotkey.Text = HotkeyCapture.Text = SearchWindow.FormatHotkey(modifiers, key);
             Message(HotkeyStatus, "已保存快捷键。");
         }
-        catch (Exception ex) { Message(HotkeyStatus, ex.Message, true); }
+        catch (Exception ex) { if (!closed) Message(HotkeyStatus, ex.Message, true); }
+        finally
+        {
+            HasPendingWrite = false;
+            if (!closed) Busy(false);
+        }
     }
 
     private static (uint Modifiers, uint Key) ParseHotkey(string text)

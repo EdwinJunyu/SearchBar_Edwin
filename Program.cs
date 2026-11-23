@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text;
 #if WINDOWS
 using System.IO.Pipes;
@@ -198,6 +199,16 @@ static string FindDatabase(bool readOnly = false)
 }
 
 Console.OutputEncoding = new UTF8Encoding(false);
+if (args is ["--version"] or ["version"])
+{
+    // 发布包可直接报告编译身份和支持的来源；版本查询无需打开用户数据库。
+    var assembly = typeof(Source).Assembly;
+    var build = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion;
+    Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new {
+        version = build.Split('+')[0], build, supportedDictionaries = Source.All.Select(source => source.Id)
+    }));
+    return 0;
+}
 if (args is [] or ["help"] or ["--help"])
 {
     Console.WriteLine("""
@@ -208,6 +219,7 @@ if (args is [] or ["help"] or ["--help"])
         query <输入> [词典ID]        查询全部词库或限定一本
         entry <词典ID> <序号>        查看读音依据与 MDX 原始正文
         verify                      核对四本基础词典和已启用的扩展词典样本
+        --version                   查看版本、构建标识和支持的词典（JSON）
         """);
 #if WINDOWS
     Console.WriteLine("桌面验收可以用 E_SEARCH_TEST_INSTANCE（32 位十六进制 GUID）及独立的 E_SEARCH_DB 路径创建隔离实例。");

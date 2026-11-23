@@ -2,12 +2,31 @@ using Microsoft.Data.Sqlite;
 using System.Security.Cryptography;
 
 internal sealed record DictionaryInfo(string Id, string Filename, string Language, int Priority, int Records, string Sha256, bool Enabled);
-internal sealed record TableMapping(int Headword, int Gloss, int? Reading, bool HasHeader);
+internal sealed record TableMapping(int Headword, int Gloss, int? Reading, bool HasHeader)
+{
+    public IReadOnlyList<string[]>? PreviewRows { get; init; }
+
+    // 只有非空且互不重复的列名才能标识列顺序，否则需同时核对用户看过的样例。
+    internal static bool MatchesPreview(IReadOnlyList<string[]> expected, IEnumerable<string[]> current, bool hasHeader)
+    {
+        using var rows = current.GetEnumerator();
+        int count = expected.Count;
+        if (hasHeader && count > 0)
+        {
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (expected[0].All(name => !string.IsNullOrWhiteSpace(name) && names.Add(name.Trim()))) count = 1;
+        }
+        for (int i = 0; i < count; i++)
+            if (!rows.MoveNext() || !expected[i].SequenceEqual(rows.Current, StringComparer.Ordinal)) return false;
+        return true;
+    }
+}
 internal sealed class DictionaryStore : IDisposable
 {
     private readonly SqliteConnection db;
-    private readonly bool hasMetadata;
-    private readonly bool hasRevision;
+    private readonly MetadataSchema openedSchema;
+    // 摘要标记同时绑定提取格式和导入批次。
+    private const string OxfordSummaryFormat = "oxford/1:";
 
     public DictionaryStore(string path, bool readOnly = false)
     {
@@ -16,12 +35,16 @@ internal sealed class DictionaryStore : IDisposable
             DataSource = path, Mode = readOnly ? SqliteOpenMode.ReadOnly : SqliteOpenMode.ReadWriteCreate
         }.ToString());
         db.Open();
+        db.CreateFunction("latin_bound", (string? key, int variant, bool upper) => Lookup.LegacyLatinBound(key, variant, upper), isDeterministic: true);
+        db.CreateFunction("term_key", (string key) => Lookup.Normalize(key), isDeterministic: true);
         if (readOnly)
         {
             // 只读查词不修改旧库；用实际列信息选择该版本能执行的查询。
-            (hasMetadata, hasRevision) = ReadMetadataSchema();
+            openedSchema = ReadMetadataSchema();
             return;
         }
+        // SQLite 的 NOCASE 只折叠 ASCII。为路径查询注册 Windows 大小写比较，保留旧库原有索引。
+        db.CreateCollation("WINDOWS_PATH", StringComparer.OrdinalIgnoreCase.Compare);
         using var schema = Command("""
             PRAGMA foreign_keys=ON;
             PRAGMA journal_mode=WAL;
@@ -41,15 +64,16 @@ internal sealed class DictionaryStore : IDisposable
             CREATE TABLE IF NOT EXISTS dictionary_metadata(
                 id TEXT PRIMARY KEY REFERENCES dictionaries ON DELETE CASCADE,
                 source_path TEXT COLLATE NOCASE UNIQUE, enabled INTEGER NOT NULL DEFAULT 1,
-                parser_id TEXT, revision TEXT);
+                parser_id TEXT, revision TEXT, summary_stamp TEXT);
             CREATE TABLE IF NOT EXISTS app_settings(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
             """);
         schema.ExecuteNonQuery();
-        if (!ReadMetadataSchema().HasRevision)
+        if (!ReadMetadataSchema().IsCurrent)
         {
-            // 并发首次打开旧库时，取得写锁后重新检查，两列须一起生效。
+            // 在写锁内重新读取实际列，旧库可能已经由另一个进程升级。
             using var migration = db.BeginTransaction();
-            if (!ReadMetadataSchema(migration).HasRevision)
+            var previous = ReadMetadataSchema(migration);
+            if (!previous.HasRevision)
             {
                 using var upgrade = Command("""
                     ALTER TABLE dictionary_metadata ADD COLUMN parser_id TEXT;
@@ -57,13 +81,30 @@ internal sealed class DictionaryStore : IDisposable
                     """, migration);
                 upgrade.ExecuteNonQuery();
             }
+            if (!previous.HasSummaryStamp)
+            {
+                using var upgrade = Command("ALTER TABLE dictionary_metadata ADD COLUMN summary_stamp TEXT", migration);
+                upgrade.ExecuteNonQuery();
+            }
             migration.Commit();
         }
-        hasMetadata = hasRevision = true;
+        // 历史写入器重导时都会更新 source_path，最早的版本却不会更新 revision。
+        // 新版重导总会写入新的摘要标记。旧写入器留下原标记时，即使路径和文件都没变也要失效。
+        using var invalidate = Command("""
+            CREATE TRIGGER IF NOT EXISTS invalidate_oxford_summary
+            AFTER UPDATE OF source_path ON dictionary_metadata
+            WHEN NEW.summary_stamp IS NOT NULL AND NEW.summary_stamp = OLD.summary_stamp
+            BEGIN
+                UPDATE dictionary_metadata SET summary_stamp=NULL WHERE id=NEW.id;
+            END;
+            """);
+        invalidate.ExecuteNonQuery();
+        openedSchema = new(true, true, true);
     }
 
-    private readonly record struct MetadataSchema(bool HasMetadata, bool HasRevision)
+    private readonly record struct MetadataSchema(bool HasMetadata, bool HasRevision, bool HasSummaryStamp)
     {
+        public bool IsCurrent => HasRevision && HasSummaryStamp;
         public string Join => HasMetadata ? "LEFT JOIN dictionary_metadata m ON m.id=d.id" : "";
         // 旧库首次重导前由文件哈希标识；新版本号还能区分相同文件的不同列映射。
         public string Revision => HasRevision ? "COALESCE(m.revision,d.sha256)" : "d.sha256";
@@ -72,17 +113,17 @@ internal sealed class DictionaryStore : IDisposable
     private MetadataSchema ReadMetadataSchema(SqliteTransaction? tx = null)
     {
         using var check = Command("""
-            SELECT COUNT(*), COUNT(CASE WHEN name='revision' THEN 1 END)
+            SELECT COUNT(*), COUNT(CASE WHEN name='revision' THEN 1 END), COUNT(CASE WHEN name='summary_stamp' THEN 1 END)
             FROM pragma_table_info('dictionary_metadata')
             """, tx);
         using var columns = check.ExecuteReader();
         columns.Read();
-        return new(columns.GetInt32(0) > 0, columns.GetInt32(1) > 0);
+        return new(columns.GetInt32(0) > 0, columns.GetInt32(1) > 0, columns.GetInt32(2) > 0);
     }
 
     // 长时间打开的旧库连接可能遇到另一进程升级。列结构与读取的数据必须来自同一快照。
     private MetadataSchema SchemaIn(SqliteTransaction snapshot) =>
-        hasRevision ? new(true,true) : ReadMetadataSchema(snapshot);
+        openedSchema.IsCurrent ? openedSchema : ReadMetadataSchema(snapshot);
 
     private SqliteCommand Command(string sql, SqliteTransaction? tx = null)
     {
@@ -119,6 +160,14 @@ internal sealed class DictionaryStore : IDisposable
         path = Path.GetFullPath(path);
         string filename = Path.GetFileName(path);
         using var input = File.OpenRead(path);
+        if (mapping?.PreviewRows is { } preview)
+        {
+            // 在实际导入的只读文件句柄上复核映射，验证与写入之间不会因路径被替换而读到另一份词表。
+            var current = EntryParser.ReadTableRows(input, Delimiter(path)).Select(row => row.Fields);
+            if (!TableMapping.MatchesPreview(preview, current, mapping.HasHeader))
+                throw new InvalidDataException("词表的表头或样例已改变，请重新预览并确认列映射。");
+            input.Position = 0;
+        }
         var hash = Convert.ToHexString(SHA256.HashData(input));
         input.Position = 0;
         // 在写事务内确定身份及优先级，避免两次并发导入同一路径时创建两个词库。
@@ -127,13 +176,27 @@ internal sealed class DictionaryStore : IDisposable
             name.Equals(Path.GetFileName(s.RelativePath), StringComparison.OrdinalIgnoreCase));
         var known = cliSource ?? SourceForFilename(filename);
         var dictionaries = ReadCatalog(tx);
-        using var fromPath = Command("SELECT id FROM dictionary_metadata WHERE source_path=$path", tx);
+        using var fromPath = Command("""
+            SELECT id, source_path=$path COLLATE BINARY AS exact
+            FROM dictionary_metadata WHERE source_path=$path COLLATE WINDOWS_PATH
+            ORDER BY exact DESC LIMIT 2
+            """, tx);
         fromPath.Parameters.AddWithValue("$path", path);
-        var originalId = fromPath.ExecuteScalar() as string;
+        string? originalId = null;
+        using (var matches = fromPath.ExecuteReader())
+        {
+            if (matches.Read())
+            {
+                originalId = matches.GetString(0);
+                // 旧库可能已有多条只差大小写的路径，只有完全一致的历史拼写能区分它们。
+                if (!matches.GetBoolean(1) && matches.Read())
+                    throw new InvalidDataException("多本词典的来源路径仅大小写不同，请使用原路径的准确拼写重新导入。");
+            }
+        }
         // 旧库没有来源路径。仅当文件名和内容哈希都指向唯一旧记录时才自动认领。
         using var legacy = Command("""
             SELECT d.id FROM dictionaries d LEFT JOIN dictionary_metadata m ON m.id=d.id
-            WHERE d.filename=$filename COLLATE NOCASE AND d.sha256=$hash AND m.source_path IS NULL LIMIT 2
+            WHERE d.filename=$filename COLLATE WINDOWS_PATH AND d.sha256=$hash AND m.source_path IS NULL LIMIT 2
             """, tx);
         legacy.Parameters.AddWithValue("$filename", filename);
         legacy.Parameters.AddWithValue("$hash", hash);
@@ -187,14 +250,17 @@ internal sealed class DictionaryStore : IDisposable
         catalog.Parameters.AddWithValue("$hash", hash);
         catalog.ExecuteNonQuery();
         using var metadata = Command("""
-            INSERT INTO dictionary_metadata(id,source_path,parser_id,revision) VALUES($id,$path,$parser,$revision)
-            ON CONFLICT(id) DO UPDATE SET source_path=excluded.source_path,parser_id=excluded.parser_id,revision=excluded.revision
+            INSERT INTO dictionary_metadata(id,source_path,parser_id,revision,summary_stamp) VALUES($id,$path,$parser,$revision,$stamp)
+            ON CONFLICT(id) DO UPDATE SET source_path=excluded.source_path,parser_id=excluded.parser_id,
+                revision=excluded.revision,summary_stamp=excluded.summary_stamp
             """, tx);
         metadata.Parameters.AddWithValue("$id", id);
         metadata.Parameters.AddWithValue("$path", path);
         metadata.Parameters.AddWithValue("$parser", parserId);
         // 同一文件使用不同的列映射也可能产生不同正文，文件哈希不能单独标识一次成功导入。
-        metadata.Parameters.AddWithValue("$revision", Guid.NewGuid().ToString("N"));
+        string revision = Guid.NewGuid().ToString("N");
+        metadata.Parameters.AddWithValue("$revision", revision);
+        metadata.Parameters.AddWithValue("$stamp", parserId == "oxford" ? OxfordSummaryFormat + revision : DBNull.Value);
         metadata.ExecuteNonQuery();
         using var delete = Command("DELETE FROM entries WHERE dict=$id", tx);
         delete.Parameters.AddWithValue("$id", id);
@@ -301,7 +367,7 @@ internal sealed class DictionaryStore : IDisposable
 
     public string InstalledId(Source source)
     {
-        if (!source.Optional || !hasRevision) return source.Id;
+        if (!source.Optional || !openedSchema.HasRevision) return source.Id;
         // 首选标准 ID。只有唯一的已认领副本时，才用标准书名定位旧版设置页分配的 GUID。
         using var cmd = Command("""
             SELECT d.id FROM dictionaries d LEFT JOIN dictionary_metadata m ON m.id=d.id
@@ -317,8 +383,8 @@ internal sealed class DictionaryStore : IDisposable
     private List<DictionaryInfo> ReadCatalog(SqliteTransaction? tx)
     {
         using var cmd = Command($"""
-            SELECT d.id,d.filename,d.language,d.priority,d.records,d.sha256,{(hasMetadata ? "COALESCE(m.enabled,1)" : "1")}
-            FROM dictionaries d {(hasMetadata ? "LEFT JOIN dictionary_metadata m ON m.id=d.id" : "")}
+            SELECT d.id,d.filename,d.language,d.priority,d.records,d.sha256,{(openedSchema.HasMetadata ? "COALESCE(m.enabled,1)" : "1")}
+            FROM dictionaries d {openedSchema.Join}
             ORDER BY d.priority,d.id
             """, tx);
         var result = new List<DictionaryInfo>();
@@ -362,7 +428,7 @@ internal sealed class DictionaryStore : IDisposable
 
     public (uint Modifiers, uint Key) ReadHotkey()
     {
-        if (!hasMetadata) return (1, 32);
+        if (!openedSchema.HasMetadata) return (1, 32);
         using var cmd = Command("SELECT value FROM app_settings WHERE name='hotkey'");
         if (cmd.ExecuteScalar() is not long value) return (1, 32);
         return ((uint)(value >> 32), (uint)value);
@@ -408,6 +474,15 @@ internal sealed class DictionaryStore : IDisposable
         }
     }
 
+    // 查询键和 MDX 的递归链接均从同一索引取旧拼写。单连接符是几个精确点，多连接符是几个前缀区间。
+    private const string LatinVariants = "(SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3)";
+    private static string LegacyLatinTerms(string key, string source = "") => $"""
+        SELECT old.term FROM {source}{LatinVariants} v
+        CROSS JOIN terms old INDEXED BY terms_lookup
+        WHERE old.term BETWEEN latin_bound({key},v.n,0) AND latin_bound({key},v.n,1)
+            AND old.kind=0 AND old.term<>{key} AND term_key(old.term)=term_key({key})
+        """;
+
     private HashSet<string> ExistingTerms(IEnumerable<string> keys, bool reading, string language, string? only,
         SqliteTransaction snapshot, MetadataSchema schema, CancellationToken token)
     {
@@ -421,10 +496,16 @@ internal sealed class DictionaryStore : IDisposable
             var probes = kanaAliases
                 ? batch.Concat(batch.Select(Lookup.ToKatakana)).Distinct(StringComparer.Ordinal).ToArray() : batch;
             var names = Enumerable.Range(0, probes.Length).Select(i => "$k" + i).ToArray();
+            string prefix = "", candidates = string.Join(",", names);
+            if (!reading && language == "en" && probes.Any(Lookup.HasLatinJoiner))
+            {
+                prefix = "WITH requested(key) AS (VALUES " + string.Join(",", names.Select(n => $"({n})")) + ")";
+                candidates = "SELECT key FROM requested UNION ALL " + LegacyLatinTerms("q.key", "requested q CROSS JOIN ");
+            }
             const string linkedAlias = "OR (t.kind=0 AND EXISTS (SELECT 1 FROM entries e WHERE e.dict=t.dict AND e.ordinal=t.ordinal AND e.link IS NOT NULL))";
             using var cmd = Command($"""
-                SELECT DISTINCT t.term FROM terms t JOIN dictionaries d ON t.dict=d.id {schema.Join}
-                WHERE t.term IN ({string.Join(",", names)}) AND (t.kind=$kind {(kanaAliases ? linkedAlias : "")}) AND d.language=$lang
+                {prefix} SELECT DISTINCT t.term FROM terms t JOIN dictionaries d ON t.dict=d.id {schema.Join}
+                WHERE t.term IN ({candidates}) AND (t.kind=$kind {(kanaAliases ? linkedAlias : "")}) AND d.language=$lang
                     AND ($only IS NULL OR d.id=$only) {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
                 """, snapshot);
             cmd.Parameters.AddWithValue("$kind", reading ? 1 : 0);
@@ -435,7 +516,7 @@ internal sealed class DictionaryStore : IDisposable
             while (rows.Read())
             {
                 string term = rows.GetString(0);
-                found.Add(kanaAliases ? Lookup.NormalizeReading(term) : term);
+                found.Add(kanaAliases ? Lookup.NormalizeReading(term) : Lookup.Normalize(term));
             }
         }
         return found;
@@ -537,19 +618,22 @@ internal sealed class DictionaryStore : IDisposable
         // 假名重定向也是读音证据。旧库没有这些读音键时，从词头索引补查两种假名书写。
         // 非假名直接从 terms_lookup 出发，无需为了读音查询词典和正文。
         bool kana = Lookup.IsKana(key);
+        string currentSummary = schema.IsCurrent ? "COALESCE(m.summary_stamp = ($summaryFormat || m.revision),0)" : "0";
+        string physicalKeys = !reading && Lookup.HasLatinJoiner(key)
+            ? $"IN (SELECT $key UNION ALL {LegacyLatinTerms("$key")})" : "=$key";
         string seed = kana ? $"""
             SELECT t.dict,t.ordinal,CASE WHEN e.link IS NOT NULL AND d.language='ja' THEN COALESCE(e.reading,e.head) END
             FROM terms t JOIN entries e USING(dict,ordinal) JOIN dictionaries d ON d.id=t.dict
             WHERE ($only IS NULL OR t.dict=$only) AND ((t.term=$key AND t.kind=$kind)
                 {(reading ? "OR (t.kind=0 AND t.term IN ($key,$katakana) AND e.link IS NOT NULL AND d.language='ja')" : "")})
-            """ : "SELECT dict,ordinal,NULL FROM terms WHERE term=$key AND kind=$kind AND ($only IS NULL OR dict=$only)";
+            """ : $"SELECT dict,ordinal,NULL FROM terms WHERE term {physicalKeys} AND kind=$kind AND ($only IS NULL OR dict=$only)";
         using var cmd = Command($"""
             WITH RECURSIVE found(dict,ordinal,aliasReading) AS (
                 {seed}
                 UNION
                 SELECT t.dict,t.ordinal,f.aliasReading FROM found f
                 JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
-                JOIN terms t ON t.dict=f.dict AND t.term=e.link AND t.kind=0
+                JOIN terms t INDEXED BY terms_lookup ON t.dict=f.dict AND t.term IN (SELECT e.link UNION ALL {LegacyLatinTerms("e.link")}) AND t.kind=0
             )
             SELECT e.dict,e.ordinal,d.language,d.priority,e.head,COALESCE(f.aliasReading,e.reading),e.gloss,d.filename,{schema.Revision},
                 CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
@@ -559,15 +643,17 @@ internal sealed class DictionaryStore : IDisposable
                         OR substr(e.gloss,-1)='〕' OR e.gloss GLOB '〈*〉' OR e.gloss GLOB '《*》')
                     THEN substr(e.raw,1,4096) END,
                 CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
-                    CASE WHEN d.id='oxford' OR d.filename=$oxfordName THEN 'oxford' END)='oxford' THEN e.raw END,
+                    CASE WHEN d.id='oxford' OR d.filename=$oxfordName THEN 'oxford' END)='oxford'
+                    AND {(phrasalSenses ? "1" : $"NOT ({currentSummary})")} THEN e.raw END,
                 CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
                     CASE WHEN d.id='sanseido' OR d.filename=$sanseidoName THEN 'sanseido' END)='sanseido'
                     THEN substr(e.raw,1,2048) END
                 ,CASE WHEN {hanyingParser} AND (instr(e.head,' ')>0 OR instr(e.head,'　')>0 OR instr(e.head,char(123))>0)
-                    THEN e.raw END, f.legacyChinese
+                    THEN e.raw END, f.legacyChinese, {currentSummary}
             FROM (SELECT dict,ordinal,aliasReading,0 AS legacyChinese FROM found
                 {(legacyChinese ? legacyCandidates : "")}) f
-            JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
+            -- 先取得少量命中，再按词典和序号读取正文，避免优化器反过来扫描全部 entries。
+            CROSS JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
             JOIN dictionaries d ON d.id=e.dict {schema.Join} WHERE e.link IS NULL
             {(legacyChinese ? $"AND (f.legacyChinese=0 OR ({hanyingParser}))" : "")}
             {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
@@ -581,6 +667,7 @@ internal sealed class DictionaryStore : IDisposable
             cmd.Parameters.AddWithValue("$startTag", key + "{");
             cmd.Parameters.AddWithValue("$endTag", key + "|");
         }
+        if (schema.IsCurrent) cmd.Parameters.AddWithValue("$summaryFormat", OxfordSummaryFormat);
         cmd.Parameters.AddWithValue("$oxfordName", Path.GetFileName(Source.All.First(s => s.Id == "oxford").RelativePath));
         cmd.Parameters.AddWithValue("$sanseidoName", Path.GetFileName(Source.All.First(s => s.Id == "sanseido").RelativePath));
         cmd.Parameters.AddWithValue("$kind",reading ? 1 : 0);
@@ -612,7 +699,7 @@ internal sealed class DictionaryStore : IDisposable
             }
             if (!r.IsDBNull(9)) gloss = EntryParser.RefreshShogakukanGloss(gloss, r.GetString(9));
             if (!r.IsDBNull(11)) gloss = EntryParser.RefreshSanseidoGloss(gloss, r.GetString(11));
-            // 已安装的牛津索引只存了首义。仅对本次命中的牛津词条从原文生成新版摘要。
+            // 无版本或旧格式索引需要重算。新索引的普通释义直接来自 gloss 列。
             (string Headword, string? Form)? reference = null;
             if (!r.IsDBNull(10))
             {
@@ -620,6 +707,11 @@ internal sealed class DictionaryStore : IDisposable
                 gloss = EntryParser.OxfordGloss(body);
                 if (Lookup.Normalize(gloss) == Lookup.Normalize(r.GetString(4)))
                     reference = EntryParser.OxfordReferenceHeadword(body);
+            }
+            else if (r.GetBoolean(14) && Lookup.Normalize(gloss) == Lookup.Normalize(entry.Headword))
+            {
+                // 参见词条可能只存有词头。仅在这种情况下按主键读取正文中的目标和词形。
+                reference = EntryParser.OxfordReferenceHeadword(ReadDetail(entry.DictionaryId, entry.EntryId, snapshot).Raw);
             }
             yield return entry with { Gloss = gloss, Reference = reference };
         }
@@ -664,9 +756,11 @@ internal sealed class DictionaryStore : IDisposable
         return body;
     }
 
-    public (string? Evidence,string Raw) Detail(string id, long ordinal)
+    public (string? Evidence,string Raw) Detail(string id, long ordinal) => ReadDetail(id, ordinal, null);
+
+    private (string? Evidence,string Raw) ReadDetail(string id, long ordinal, SqliteTransaction? snapshot)
     {
-        using var cmd=Command("SELECT evidence,raw FROM entries WHERE dict=$id AND ordinal=$n");
+        using var cmd=Command("SELECT evidence,raw FROM entries WHERE dict=$id AND ordinal=$n", snapshot);
         cmd.Parameters.AddWithValue("$id",id);
         cmd.Parameters.AddWithValue("$n",ordinal);
         using var r=cmd.ExecuteReader();

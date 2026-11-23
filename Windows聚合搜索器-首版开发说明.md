@@ -3,7 +3,7 @@
 首版供个人在 Windows 上使用。按 `Alt + Space` 唤起一个搜索框，一次输入同时查询本地词典和 Everything。读译义只需看输入框右侧，打开文件只需按回车。词典与文件结果独立返回，任一侧等待期间，另一侧仍可使用。
 
 
-**当前构建。** 解压 `bin/release-delivery/E_Search-win-x64-latest.zip`，打开其中的 `E_Search-win-x64/E_Search.exe`。切换版本时，先从托盘退出当前运行的 E_Search，再打开新版本。新版本会继续使用已有词库。工程同时保留 .NET 10 命令行和 WPF 入口，解决方案为 `E_Search.slnx`。
+**当前构建。** 0.2.0 的 Windows x64 包位于 `bin/release-delivery/`，文件名含版本、基准提交和源码指纹。解压后打开 `E_Search-win-x64/E_Search.exe`。切换版本时，先从托盘退出当前运行的 E_Search，再打开新版本。新版本沿用个人词库。包内 `release.json` 列出支持的词典、实际随包的词典及逐项验收结果。在命令行运行 `E_Search.exe --version` 也可查看构建标识。
 
 搜索框支持词典、文件、算式及浏览器提问。粘贴英语或日语句子可查其中收录的短语；输入 `2^3` 可直接看计算结果；输入 `ai ` 加问题并按回车，会在默认浏览器打开 ChatGPT，由你在网页中发送。普通文件结果用回车打开、Shift+回车定位，回到搜索窗后可继续使用原来的列表和选中项。
 
@@ -16,10 +16,20 @@
 | 英辞郎 v86 英和辞典 | `eijiro` | `absquatulate`，查生僻英文词的日语释义 |
 | 小学馆 V2 中日辞典 | `shogakukan-zhja` | `预约`，从中文查日文「予約する」 |
 
-**复验。** 构建 Release 后运行 `.\regressions.ps1` 检查查询、导入和命令行。下面的 PowerShell 命令使用发布版、四本交付词库和实际桌面窗口，检查词义、搜索框、设置及资源管理器。桌面测试使用临时词库副本、专属实例和测试快捷键。文件样本目录需已被 Everything 索引，本机使用 Windows 临时目录。第 11 至 15 节保留此前各阶段的交付记录。
+**发布与复验。** 在 Windows PowerShell 7 中运行以下命令。打包使用指定的独立 SQLite 备份，生成自包含程序，解压最终 ZIP 并重新执行其中 EXE 的版本、清单与词条验收。只有通过的包才进入交付目录。可以用 `-VerifyReleaseZip` 独立复验。若源码含未提交改动，包内 reports 还会保存相对基准提交的构建输入差异。
 
 ```powershell
-.\regressions.ps1 -RealDatabase .data/stage5-delivery/dictionaries.db -Desktop -WindowDesktop -FileActionsDesktop -SettingsDesktop -FileFixtureRoot $env:TEMP -GuiExecutable .\bin\release-delivery\E_Search-win-x64-latest\E_Search-win-x64\E_Search.exe
+.\regressions.ps1 -PackageSeed .data/stage5-delivery/dictionaries.db
+$zip = Get-ChildItem .\bin\release-delivery\E_Search-0.2.0-*-win-x64*.zip | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+.\regressions.ps1 -VerifyReleaseZip $zip.FullName
+```
+
+构建 Release 后运行 `.\regressions.ps1` 可检查查询、导入和命令行。下面的桌面验收使用临时词库副本、专属实例和测试快捷键。文件样本目录需已被 Everything 索引。第 11 至 15 节保留此前各阶段的交付记录。
+
+```powershell
+$expanded = Join-Path $zip.DirectoryName $zip.BaseName
+if (!(Test-Path $expanded)) { Expand-Archive -LiteralPath $zip.FullName -DestinationPath $expanded }
+.\regressions.ps1 -RealDatabase .data/stage5-delivery/dictionaries.db -Desktop -WindowDesktop -FileActionsDesktop -SettingsDesktop -FileFixtureRoot $env:TEMP -GuiExecutable (Join-Path $expanded 'E_Search-win-x64/E_Search.exe')
 ```
 **第一个任务是交出一条真实词条的查询记录。** 先读第 1 节看四种输入，再读第 4 节看匹配顺序。基本术语可以用同一条记录理解：“词头”是词典收录的写法「食べる」，“读音”是「たべる」，“原形”是从「食べました」还原得到的「食べる」。“条目标识”用来判断四种输入是否真的找到了同一条记录。
 

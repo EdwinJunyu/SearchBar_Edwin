@@ -24,8 +24,35 @@ public sealed record LookupHit(LookupEntry Entry, string Method, string Term, st
 
 public static partial class Lookup
 {
-    public static string Normalize(string text) =>
-        text.Normalize(NormalizationForm.FormKC).Trim().ToLowerInvariant();
+    private const string LatinLetter = "[A-Za-zÀ-ÖØ-öø-ɏḀ-ỿＡ-Ｚａ-ｚ]";
+    private const string WordJoiner = "['‘’ʼ＇‐‑﹣－-]";
+
+    [GeneratedRegex("(?<=" + LatinLetter + ")" + WordJoiner + "(?=" + LatinLetter + ")")]
+    private static partial Regex LatinJoiner();
+
+    public static string Normalize(string text)
+    {
+        // 只折叠拉丁字母之间的连接符。日文标点、外围引号、词条原文和句中位置均保留。
+        var key = text.Normalize(NormalizationForm.FormKC).Trim().ToLowerInvariant();
+        if (key.AsSpan().IndexOfAny("\u2018\u2019\u02bc\u2010") < 0) return key;
+        return LatinJoiner().Replace(key, m => m.Value[0] is '\'' or '‘' or '’' or 'ʼ' ? "'" : "-");
+    }
+
+    internal static bool HasLatinJoiner(string key) => LatinJoiner().IsMatch(key);
+
+    internal static string? LegacyLatinBound(string? key, int variant, bool upper)
+    {
+        if (key == null) return null;
+        var first = LatinJoiner().Match(key);
+        if (!first.Success) return null;
+        // 旧键已经过 NFKC，非断行连字符曾保存为 U+2010。只枚举第一个连接符，
+        // 多连接符词组按下一处之前的固定前缀检索，再核对规范键，避免枚举字符组合。
+        string choices = first.Value[0] is '\'' or '‘' or '’' or 'ʼ' ? "'‘’ʼ" : "-‐";
+        if (variant >= choices.Length) return null;
+        var next = first.NextMatch();
+        string prefix = key[..first.Index] + choices[variant] + key[(first.Index + 1)..(next.Success ? next.Index : key.Length)];
+        return upper && next.Success ? prefix + "\uFFFF" : prefix;
+    }
 
     public static string NormalizeReading(string text)
     {
@@ -167,10 +194,10 @@ public static partial class Lookup
         var matches = new List<Phrase>();
         var entries = new Dictionary<string, List<LookupEntry>>(StringComparer.Ordinal);
         if (indexed.Count > 0 && !IsEnglish(indexed[0].Entry)) return indexed;
-        // 已有独立词组时，只查能覆盖更长原文的可分标题，例如 turn the traffic light off。
+        // 只读取有机会超过已有独立词头的牛津小节；等长时沿用独立词头的释义和详情。
         int indexedWords = indexed.Count == 0 ? 0 : EnglishWords.Matches(indexed[0].Term).Count;
-        var candidates = SeparableSpans(input, token).Where(p => p.Units > indexedWords);
-        if (indexed.Count == 0) candidates = candidates.Concat(EnglishSpans(input, token, phrasalVerbs: true));
+        var candidates = SeparableSpans(input, token).Concat(EnglishSpans(input, token, phrasalVerbs: true))
+            .Where(p => p.Units > indexedWords);
         foreach (var family in candidates.GroupBy(p => p.Key[..p.Key.IndexOf(' ')]))
         {
             token.ThrowIfCancellationRequested();
@@ -222,7 +249,7 @@ public static partial class Lookup
     }
 
     private static readonly System.Text.RegularExpressions.Regex EnglishWords = new(
-        @"(?<![\p{L}\p{N}_])[A-Za-zＡ-Ｚａ-ｚ]+(?:['’-][A-Za-zＡ-Ｚａ-ｚ]+)*(?![\p{L}\p{N}_])");
+        @"(?<![\p{L}\p{N}_])" + LatinLetter + "+(?:" + WordJoiner + LatinLetter + @"+)*(?![\p{L}\p{N}_])");
     private static readonly System.Text.RegularExpressions.Regex JapaneseRuns = new(@"[ぁ-ゖァ-ヺーｦ-ﾟ々一-鿿]+");
 
     private static IEnumerable<Phrase> EnglishSpans(string input, CancellationToken token, bool phrasalVerbs)
