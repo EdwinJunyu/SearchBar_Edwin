@@ -68,6 +68,37 @@ internal static partial class EntryParser
         return Fit(left, l, leftLimit) + separator + Fit(right, r, available - leftLimit);
     }
 
+    internal static (string Headword, string? Form)? OxfordReferenceHeadword(string body)
+    {
+        // 只识别紧邻参见或变形标记的词条链接。例句内的普通链接不能当作词典释义。
+        var boundary = OxfordReferenceBoundary().Match(body);
+        var match = OxfordReference().Match(body, 0, boundary.Success ? boundary.Index : body.Length);
+        (string Headword, string? Form)? target = null;
+        for (; match.Success; match = match.NextMatch())
+        {
+            var next = match.Groups["word"].Value;
+            // 仅在词典明确标注时显示语法关系；一般参见链接只显示目标词头。
+            string? form = match.Groups["form"].Value.ToLowerInvariant() switch
+            {
+                "pt" or "past tense" => "过去式",
+                "pp" or "past participle" => "过去分词",
+                _ => null
+            };
+            if (target is { } previous)
+            {
+                if (!previous.Headword.Equals(next, IgnoreCase)) return null;
+                if (previous.Form != form) form = null;
+            }
+            target = (next, form);
+        }
+        return target;
+    }
+
+    [GeneratedRegex(@"【(?:IDIOMS|PHR V|HELP|ORIGIN)】|♦", RegexOptions.IgnoreCase)]
+    private static partial Regex OxfordReferenceBoundary();
+    [GeneratedRegex(@"(?:^|>)\s*(?:=|(?:--›\s*)?see\b|(?<form>pt|pp|past tense|past participle)\s+of\b)\s*(?:<b\s*>\s*)?<a\s+href\s*=\s*[""']entry://(?<word>[a-z]+(?:[ '\-][a-z]+)*)[""']", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex OxfordReference();
+
     private static IEnumerable<(string Part, string Gloss)> OxfordSenses(string body)
     {
         int divDepth = 0, noteDepth = 0, fontDepth = 0, start = 0;
@@ -115,6 +146,53 @@ internal static partial class EntryParser
     private static partial Regex OxfordTokens();
     [GeneratedRegex(@"\scolor\s*=\s*[""']?#FF5000(?=[""'\s>])", RegexOptions.IgnoreCase)]
     private static partial Regex OxfordTranslationColor();
+
+    internal static IEnumerable<(string Headword, string Gloss)> OxfordPhrasalSenses(string body, string parent)
+    {
+        if (!body.Contains("【PHR V】", IgnoreCase)) yield break;
+        bool inPhrases = false;
+        var marker = OxfordPhraseMarker().Match(body);
+        while (marker.Success)
+        {
+            var next = marker.NextMatch();
+            int limit = next.Success ? next.Index : body.Length;
+            if (!marker.Groups["title"].Success)
+                inPhrases = marker.Groups["section"].Value.Equals("PHR V", IgnoreCase);
+            else if (inPhrases)
+            {
+                // 只读蓝色粗体「◘」小标题及其后第一个橙色译义。一个小标题不能借用邻项、例句或下一词性的正文。
+                int start = marker.Index + marker.Length;
+                int close = body.IndexOf("</span>", start, Math.Min(limit - start, 768), IgnoreCase);
+                if (close >= 0)
+                {
+                    string title = Plain(body[start..close]).Replace("7", "").Replace("'", "").Trim().ToLowerInvariant();
+                    var form = OxfordPhraseForm().Match(title);
+                    string key = form.Groups["key"].Value;
+                    if (form.Success && key.StartsWith(parent + " ", StringComparison.Ordinal)
+                        && !key.Split(' ').Any(w => w is "sb" or "sth"))
+                    {
+                        int from = close + "</span>".Length;
+                        int example = body.IndexOf("color:#04F", from, limit - from, IgnoreCase);
+                        var sense = OxfordSenses(body[from..(example >= 0 ? example : limit)]).FirstOrDefault().Gloss;
+                        if (!string.IsNullOrEmpty(sense))
+                        {
+                            yield return (key, sense);
+                            string particle = form.Groups["optional"].Value;
+                            if (particle.Length != 0) yield return (key + " " + particle, sense);
+                        }
+                    }
+                }
+            }
+            marker = next;
+        }
+    }
+
+    [GeneratedRegex(@"<div\b[^>]*>\s*<b>\s*【(?<section>PHR V|IDIOMS)】|<font\b[^>]*\scolor\s*=\s*[""']?darkred(?=[""'\s>])[^>]*>\s*<b>\s*<i>|(?<title><span\s+style\s*=\s*[""']color:\s*blue;\s*font-weight:\s*bold;?[""']>\s*<font\s+color\s*=\s*[""']?red[""']?>\s*◘\s*</font>)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex OxfordPhraseMarker();
+
+    // sb / sth 是宾语占位；(of sth) 允许匹配 “run out” 和 “run out of” 两种词形。
+    [GeneratedRegex(@"^(?<key>[a-z]+(?: [a-z]+)+?)(?: (?:sb|sth)(?:\s*/\s*(?:sb|sth))?| \((?<optional>[a-z]+) (?:sb|sth)\))?$", RegexOptions.CultureInvariant)]
+    private static partial Regex OxfordPhraseForm();
 
     // 预览和导入共用此流式解析器。记录起始行用于定位嵌套换行及转义引号。
     internal static IEnumerable<(int Line, string[] Fields)> ReadTableRows(Stream input, char delimiter)

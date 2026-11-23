@@ -4,17 +4,22 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 
 public sealed record LookupEntry(string DictionaryId, long EntryId, string Language, int Priority,
     string Headword, string? Reading, string Gloss)
 {
     public string? DictionaryName { get; init; }
     public string? DictionaryRevision { get; init; }
+    internal (string Headword, string? Form)? Reference { get; init; }
 }
 
-public sealed record LookupHit(LookupEntry Entry, string Method, string Term, string Display);
+public sealed record LookupHit(LookupEntry Entry, string Method, string Term, string Display)
+{
+    internal bool HasReferencePreview { get; init; }
+}
 
-public static class Lookup
+public static partial class Lookup
 {
     public static string Normalize(string text) =>
         text.Normalize(NormalizationForm.FormKC).Trim().ToLowerInvariant();
@@ -67,10 +72,209 @@ public static class Lookup
         }
         foreach (var lemma in EnglishLemmas(term).Distinct(StringComparer.Ordinal))
             Collect(lemma, false, "deinflection", 2, "en");
-        return hits.Values.OrderBy(x => x.Rank).ThenBy(x => x.Hit.Entry.Priority)
+        var ranked = hits.Values.OrderBy(x => x.Rank).ThenBy(x => x.Hit.Entry.Priority)
             .ThenBy(x => x.Hit.Entry.DictionaryId, StringComparer.Ordinal)
             .ThenBy(x => x.Hit.Entry.EntryId).Select(x => x.Hit).ToArray();
+        // 只替换无释义精确命中的预览。原记录及全部还原候选仍可单独打开。
+        for (int i = 0; i < ranked.Length; i++)
+        {
+            var hit = ranked[i];
+            if (hit.Method != "headword" || !IsEnglish(hit.Entry)) continue;
+            string? reference = ReferenceOf(hit.Entry);
+            IEnumerable<LookupEntry> donors;
+            if (reference != null)
+            {
+                // 原书的明确参见优先，即使另一个拼写也符合词尾规则。
+                if (reference == Normalize(hit.Entry.Headword)) continue;
+                donors = find(reference, false).Where(e => Normalize(e.Headword) == reference);
+            }
+            else
+            {
+                if (!string.IsNullOrWhiteSpace(hit.Entry.Gloss) && Normalize(hit.Entry.Gloss) != Normalize(hit.Entry.Headword)) continue;
+                donors = ranked.Where(h => h.Method == "deinflection" && h.Term == Normalize(h.Entry.Headword))
+                    .Select(h => h.Entry);
+            }
+
+            // 排除同形外语、其他词典和互相参见的词条。多个可行词头/释义无法消歧时保留原预览。
+            var targets = donors.Where(e => e.DictionaryId == hit.Entry.DictionaryId && IsEnglish(e))
+                .DistinctBy(e => (Normalize(e.Headword), e.Gloss)).Take(2).ToArray();
+            if (targets.Length != 1) continue;
+            var target = targets[0];
+            string gloss = Format(target, "headword");
+            if (gloss.Length == 0 || Normalize(gloss) == Normalize(target.Headword) || ReferenceOf(target) != null) continue;
+            var preview = hit.Entry.Reference?.Form is string form
+                ? $"{hit.Entry.Headword}（{target.Headword} 的{form}）· {gloss}"
+                : $"{hit.Entry.Headword} → {target.Headword} · {gloss}";
+            ranked[i] = hit with { Display = preview, HasReferencePreview = true };
+        }
+        return ranked;
     }
+
+    private sealed record Phrase(string Surface, string Key, string Language, bool Reading,
+        int Units, int Offset, bool Restored);
+
+    internal static IReadOnlyList<LookupHit> SearchPhrases(string input,
+        Func<IEnumerable<string>, bool, string, HashSet<string>> existing,
+        Func<string, bool, IEnumerable<LookupEntry>> find, CancellationToken token)
+    {
+        var possible = new List<Phrase>();
+        // 批量预筛的索引只含短键。查完最长候选后才加载正文、解析别名和生成释义。
+        foreach (var batch in SentenceSpans(input, token).Chunk(512))
+        {
+            token.ThrowIfCancellationRequested();
+            foreach (var group in batch.GroupBy(p => (p.Language, p.Reading)))
+            {
+                var keys = existing(group.Select(p => p.Key), group.Key.Reading, group.Key.Language);
+                possible.AddRange(group.Where(p => keys.Contains(p.Key)));
+            }
+        }
+        return LongestPhraseHits(possible, p => find(p.Key, p.Reading));
+    }
+
+    internal static IReadOnlyList<LookupHit> SearchOxfordPhrases(string input,
+        Func<string, IEnumerable<LookupEntry>> subentries, CancellationToken token)
+    {
+        // 只为后接小品词的动词（含其原形）读取父词条，每个词头在本轮至多查询一次。
+        var matches = new List<Phrase>();
+        var entries = new Dictionary<string, List<LookupEntry>>(StringComparer.Ordinal);
+        foreach (var family in EnglishSpans(input, token, phrasalVerbs: true)
+                     .GroupBy(p => p.Key[..p.Key.IndexOf(' ')]))
+        {
+            token.ThrowIfCancellationRequested();
+            var spans = family.ToLookup(p => p.Key);
+            foreach (var entry in subentries(family.Key))
+            {
+                if (!spans.Contains(entry.Headword)) continue;
+                if (!entries.TryGetValue(entry.Headword, out var senses))
+                {
+                    entries.Add(entry.Headword, senses = new());
+                    matches.AddRange(spans[entry.Headword]);
+                }
+                senses.Add(entry);
+            }
+        }
+        return LongestPhraseHits(matches, p => entries[p.Key]);
+    }
+
+    private static IReadOnlyList<LookupHit> LongestPhraseHits(IEnumerable<Phrase> possible,
+        Func<Phrase, IEnumerable<LookupEntry>> resolve)
+    {
+        foreach (var length in possible.GroupBy(p => p.Units).OrderByDescending(g => g.Key))
+        {
+            var hits = new Dictionary<(string,long,string), (Phrase Phrase, LookupHit Hit)>();
+            foreach (var phrase in length.OrderBy(p => p.Restored).ThenBy(p => p.Offset)
+                         .DistinctBy(p => (p.Key, p.Language, p.Reading)))
+            {
+                foreach (var entry in resolve(phrase))
+                {
+                    if (entry.Language != phrase.Language) continue;
+                    var label = phrase.Surface == entry.Headword ? phrase.Surface : $"{phrase.Surface} → {entry.Headword}";
+                    var hit = new LookupHit(entry, "phrase", phrase.Surface, $"{label} · {Format(entry, "headword")}");
+                    hits.TryAdd((entry.DictionaryId, entry.EntryId, entry.Headword), (phrase, hit));
+                }
+            }
+            if (hits.Count > 0)
+                return hits.Values.OrderBy(x => x.Phrase.Offset).ThenBy(x => x.Phrase.Restored)
+                    .ThenBy(x => x.Hit.Entry.Priority).ThenBy(x => x.Hit.Entry.DictionaryId, StringComparer.Ordinal)
+                    .ThenBy(x => x.Hit.Entry.EntryId).Select(x => x.Hit).ToArray();
+        }
+        return Array.Empty<LookupHit>();
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex EnglishWords = new(
+        @"(?<![\p{L}\p{N}_])[A-Za-zＡ-Ｚａ-ｚ]+(?:['’-][A-Za-zＡ-Ｚａ-ｚ]+)*(?![\p{L}\p{N}_])");
+    private static readonly System.Text.RegularExpressions.Regex JapaneseRuns = new(@"[ぁ-ゖァ-ヺーｦ-ﾟ々一-鿿]+");
+
+    private static IEnumerable<Phrase> EnglishSpans(string input, CancellationToken token, bool phrasalVerbs)
+    {
+        // 两端都必须是完整英文单词，只允许词间横向空白；原文保留大小写、空格和位置。
+        var words = EnglishWords.Matches(input);
+        for (int start = 0; start < words.Count; start++)
+        {
+            token.ThrowIfCancellationRequested();
+            var first = words[start];
+            var firstKey = Normalize(first.Value);
+            var key = firstKey;
+            for (int end = start + 1; end < words.Count && end < start + 12; end++)
+            {
+                var last = words[end];
+                var previous = words[end - 1];
+                var gap = input.AsSpan(previous.Index + previous.Length, last.Index - previous.Index - previous.Length);
+                if (gap.IsEmpty || gap.IndexOfAnyExcept(' ', '\t', '　') >= 0) break;
+                var lastKey = Normalize(last.Value);
+                if (phrasalVerbs && end == start + 1 && lastKey is not ("about" or "across" or "after"
+                    or "against" or "along" or "around" or "as" or "at" or "away" or "back" or "by"
+                    or "down" or "for" or "forward" or "from" or "in" or "into" or "of" or "off"
+                    or "on" or "onto" or "out" or "over" or "round" or "through" or "to" or "together"
+                    or "under" or "up" or "upon" or "with" or "without")) break;
+                key += " " + lastKey;
+                var surface = input[first.Index..(last.Index + last.Length)];
+                int units = end - start + 1;
+                yield return new(surface, key, "en", false, units, first.Index, false);
+                foreach (var lemma in EnglishLemmas(firstKey))
+                    yield return new(surface, lemma + key[firstKey.Length..], "en", false, units, first.Index, true);
+                if (phrasalVerbs) continue;
+                foreach (var lemma in EnglishLemmas(lastKey))
+                    yield return new(surface, key[..^lastKey.Length] + lemma, "en", false, units, first.Index, true);
+            }
+        }
+
+    }
+
+    private static IEnumerable<Phrase> SentenceSpans(string input, CancellationToken token)
+    {
+        foreach (var phrase in EnglishSpans(input, token, phrasalVerbs: false)) yield return phrase;
+        // 没有假名的汉语文本和短小的孤立词不做日语切片。窗口有上限，长句的候选数随字数线性增长。
+        if (!input.Any(c => c is >= 'ぁ' and <= 'ゖ' || IsKatakanaUnit(c))) yield break;
+        foreach (System.Text.RegularExpressions.Match run in JapaneseRuns.Matches(input))
+        {
+            if (run.Length == input.Length && Normalize(run.Value).Length <= 4) continue;
+            // 半角浊音可占两个原始字符。长度和排序按归一化后的字数，展示仍按原文位置取片段。
+            int maxSourceLength = run.ValueSpan.IndexOfAny('ﾞ', 'ﾟ') >= 0 ? 64 : 32;
+            for (int start = run.Index; start < run.Index + run.Length; start++)
+            {
+                token.ThrowIfCancellationRequested();
+                if (start > run.Index && SameCompound(input[start-1], input[start])) continue;
+                int stop = Math.Min(start + maxSourceLength, run.Index + run.Length);
+                for (int end = start + 3; end <= stop; end++)
+                {
+                    if (end < run.Index + run.Length && SameCompound(input[end-1], input[end])) continue;
+                    string surface = input[start..end];
+                    string key = Normalize(surface);
+                    if (key.Length < 3) continue;
+                    if (key.Length > 32) break;
+                    foreach (var candidate in new[] { key }.Concat(Lemmas(IsKana(key) ? NormalizeReading(key) : key)))
+                    {
+                        bool restored = candidate != key;
+                        yield return new(surface, candidate, "ja", false, key.Length, start, restored);
+                        if (IsKana(candidate))
+                            yield return new(surface, NormalizeReading(candidate), "ja", true, key.Length, start, restored);
+                    }
+                }
+            }
+        }
+
+    }
+
+    private static bool IsKatakanaUnit(char c) => c is >= 'ァ' and <= 'ヺ' or 'ー' or >= 'ｦ' and <= 'ﾟ';
+
+    private static bool SameCompound(char left, char right) =>
+        (left is >= '一' and <= '鿿' or '々') && (right is >= '一' and <= '鿿' or '々')
+        || IsKatakanaUnit(left) && IsKatakanaUnit(right);
+
+    private static bool IsEnglish(LookupEntry entry) => entry.Language.Equals("en", StringComparison.OrdinalIgnoreCase)
+        || entry.Language.StartsWith("en-", StringComparison.OrdinalIgnoreCase);
+
+    private static string? ReferenceOf(LookupEntry entry)
+    {
+        if (entry.Reference is { } reference) return Normalize(reference.Headword);
+        if (entry.Gloss.Length > 160) return null;
+        var match = PlainReference().Match(entry.Gloss.Trim());
+        return match.Success ? Normalize(match.Groups["word"].Value) : null;
+    }
+
+    [GeneratedRegex(@"^(?:see\s+(?!also\b)|参[见見]\s*[:：]?\s*|=\s*)(?<word>[a-z]+(?:[ '\-][a-z]+)*)[.。]?$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex PlainReference();
 
     public static string[] AdditionalPreviews(IReadOnlyList<LookupHit> matches)
     {
@@ -78,7 +282,7 @@ public static class Lookup
         return matches.DistinctBy(hit => (hit.Entry.Language, Normalize(hit.Entry.Headword),
                 NormalizeReading(hit.Entry.Reading ?? "")))
             .Skip(1).Take(2).Select(hit =>
-                hit.Method != "headword"
+                hit.Method != "headword" || hit.HasReferencePreview
                     ? hit.Display
                     : $"{hit.Entry.Headword} · {hit.Display}").ToArray();
     }
@@ -89,7 +293,7 @@ public static class Lookup
     private static bool IsKana(string text) => text.Length > 0 &&
         text.All(c => c is >= 'ぁ' and <= 'ゖ' or >= 'ァ' and <= 'ヶ' or 'ー' or 'ゝ' or 'ゞ' or 'ヽ' or 'ヾ');
 
-    private static string Format(LookupEntry entry, string method)
+    internal static string Format(LookupEntry entry, string method)
     {
         string gloss = entry.Gloss.Trim();
         int newline = gloss.AsSpan().IndexOfAny('\r', '\n');
@@ -164,6 +368,33 @@ public static class Lookup
     }
 
     private static bool IsVowel(char c) => c is 'a' or 'e' or 'i' or 'o' or 'u';
+
+    internal static IEnumerable<string> SpellingKeys(string word)
+    {
+        // 只为独立英文单词生成一步编辑；先尝试邻字换位，各类编辑内优先保留较长前缀。
+        if (word.Length is < 3 or > 40 || !word.All(c => c is >= 'a' and <= 'z')) yield break;
+        var letters = word.ToCharArray();
+        for (int i = letters.Length - 2; i >= 0; i--)
+        {
+            if (letters[i] == letters[i + 1]) continue;
+            (letters[i], letters[i + 1]) = (letters[i + 1], letters[i]);
+            yield return new string(letters);
+            (letters[i], letters[i + 1]) = (letters[i + 1], letters[i]);
+        }
+        for (int i = word.Length - 1; i >= 0; i--) yield return word.Remove(i, 1);
+        for (int i = word.Length; i >= 0; i--)
+            for (char c = 'a'; c <= 'z'; c++) yield return word.Insert(i, c.ToString());
+        for (int i = letters.Length - 1; i >= 0; i--)
+        {
+            for (char c = 'a'; c <= 'z'; c++)
+            {
+                if (c == word[i]) continue;
+                letters[i] = c;
+                yield return new string(letters);
+            }
+            letters[i] = word[i];
+        }
+    }
 
     private static readonly Dictionary<string, string> Syllables = BuildSyllables();
 
