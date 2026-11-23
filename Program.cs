@@ -61,15 +61,19 @@ static void RunDesktop(string? id)
     {
         SQLitePCL.raw.SetProvider(new SQLitePCL.SQLite3Provider_winsqlite3());
         string databasePath = FindDatabase();
-        void ValidateDictionary(string? requested)
+        string? ResolveDictionary(string? requested)
         {
-            if (requested == null || Source.All.Any(s => s.Id == requested)) return;
+            if (requested == null) return null;
+            var source = Source.All.FirstOrDefault(s => s.Id == requested);
+            if (source != null && (!source.Optional || !File.Exists(databasePath))) return requested;
             using var catalog = new DictionaryStore(databasePath, readOnly: File.Exists(databasePath));
+            if (source != null) return catalog.InstalledId(source);
             if (!catalog.ListDictionaries().Any(d => d.Id == requested))
                 throw new ArgumentException($"未知词典 {requested}");
+            return requested;
         }
 
-        ValidateDictionary(id);
+        id = ResolveDictionary(id);
         var app = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
         var window = new ESearch.SearchWindow(databasePath, id);
         window.StartResident();
@@ -77,8 +81,8 @@ static void RunDesktop(string? id)
         var listener = ReceiveLaunchesAsync(pipeName, requested =>
         {
             // 按常驻窗口实际使用的词库验证，再在它的 UI 线程切换筛选和焦点。
-            ValidateDictionary(requested);
-            window.Dispatcher.BeginInvoke(() => window.ActivateFromLaunch(requested));
+            var resolved = ResolveDictionary(requested);
+            window.Dispatcher.BeginInvoke(() => window.ActivateFromLaunch(resolved));
         }, closing.Token);
         try { app.Run(); }
         finally
@@ -198,12 +202,12 @@ if (args is [] or ["help"] or ["--help"])
 {
     Console.WriteLine("""
         发布版使用当前用户的 E_Search 词库；开发版使用项目 .data/dictionaries.db。可用 E_SEARCH_DB 指定。
-        import <辞书根目录>          导入四本指定词典
+        import <辞书根目录>          导入四本基础词典及目录中已有的扩展词典
         import <词典ID> <MDX路径>    单独导入或替换
         list                        查看词典标识、语言、条数、哈希与文件名
         query <输入> [词典ID]        查询全部词库或限定一本
         entry <词典ID> <序号>        查看读音依据与 MDX 原始正文
-        verify                      对已导入的四本真实词典执行第一阶段验收
+        verify                      核对四本基础词典和已启用的扩展词典样本
         """);
 #if WINDOWS
     Console.WriteLine("桌面验收可以用 E_SEARCH_TEST_INSTANCE（32 位十六进制 GUID）及独立的 E_SEARCH_DB 路径创建隔离实例。");
@@ -222,15 +226,28 @@ try
     }
     Source Resolve(string id) => Source.All.SingleOrDefault(s => s.Id == id)
         ?? throw new ArgumentException($"未知词典 {id}");
-    string LookupId(DictionaryStore store, string id) => Source.All.Any(s => s.Id == id) || store.ListDictionaries().Any(d => d.Id == id)
-        ? id : throw new ArgumentException($"未知词典 {id}");
+    string LookupId(DictionaryStore store, string id)
+    {
+        if (Source.All.FirstOrDefault(s => s.Id == id) is { } source) return store.InstalledId(source);
+        if (store.ListDictionaries().Any(d => d.Id == id)) return id;
+        throw new ArgumentException($"未知词典 {id}");
+    }
     switch (args)
     {
         case ["import",var root]:
         {
             using var store = new DictionaryStore(FindDatabase());
             foreach (var source in Source.All)
-                store.Import(source,Path.Combine(root,source.RelativePath));
+            {
+                var path = Path.Combine(root, source.RelativePath);
+                // 旧版辞书目录只有四本基础词典，也可继续使用同一导入命令。
+                if (source.Optional && !Path.Exists(path))
+                {
+                    Console.WriteLine($"跳过未找到的扩展词典：{source.RelativePath}");
+                    continue;
+                }
+                store.Import(source, path);
+            }
             break;
         }
         case ["import",var id,var path]:
@@ -282,6 +299,17 @@ try
                     throw new InvalidDataException($"{dict} 词条或首义与样本不符");
                 Console.WriteLine($"PASS\t{input}\t{dict}:{hit.Entry.EntryId}\t{hit.Display}");
             }
+            var enabled = store.ListDictionaries().Where(d => d.Enabled).Select(d => d.Id).ToHashSet();
+            foreach (var (dict, input, gloss) in new[] { ("shinseiki", "不動点定理", "不动点定理"),
+                ("sango", "等角写像", "保角映射"), ("eijiro", "absquatulate", "逃げる"),
+                ("shogakukan-zhja", "预约", "予約する") })
+            {
+                var installedId = store.InstalledId(Resolve(dict));
+                if (!enabled.Contains(installedId)) continue;
+                var hit = store.Search(input, installedId).FirstOrDefault(h => h.Method == "headword" && h.Display.Contains(gloss));
+                if (hit == null) throw new InvalidDataException($"{dict} 的「{input}」未显示预期译义「{gloss}」");
+                Console.WriteLine($"PASS\t{input}\t{installedId}:{hit.Entry.EntryId}\t{hit.Display}");
+            }
             break;
         }
         default: throw new ArgumentException("参数无效；运行 help 查看用法");
@@ -294,13 +322,17 @@ catch (Exception error)
     return 1;
 }
 
-internal sealed record Source(string Id,string Language,int Priority,string RelativePath)
+internal sealed record Source(string Id,string Language,int Priority,string RelativePath,bool Optional = false)
 {
     // 同级命中优先使用双语词典；三省堂还混有日语和英语释义。
     public static readonly Source[] All = [
         new("shogakukan","ja",1,"中日/[5《小学馆V2日汉辞典》.mdx"),
         new("sanseido","ja",4,"中日/[3三省堂超级大辞林第二版.mdx"),
         new("oxford","en",2,"英语/[英-汉] ◆【牛津高阶学习词典英汉双解第7版】【全新孤雷排版】【2011.7.31】.mdx"),
-        new("hanying","zh",3,"英语/现代汉英综合大辞典.mdx")
+        new("hanying","zh",3,"英语/现代汉英综合大辞典.mdx"),
+        new("shinseiki","ja",5,"中日/新世纪日汉双解/xsjrihanshuangjie.mdx", Optional: true),
+        new("sango","ja",6,"中日/[1其他语种] 三合一日語辭典《新日汉大辞典》、《实用汉日辞典》、 《详解日本外来语辞典》[172761](090126).mdx", Optional: true),
+        new("eijiro","en",7,"中日/《英辞郎v86英和辞典》[090412].mdx", Optional: true),
+        new("shogakukan-zhja","zh",8,"中日/[7《小学馆V2中日辞典》.mdx", Optional: true)
     ];
 }

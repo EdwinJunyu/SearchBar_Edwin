@@ -146,7 +146,9 @@ internal sealed class DictionaryStore : IDisposable
         }
         // 内置文件名可以识别排版，但不能证明两个目录中的文件属于同一词库。
         var newKnownId = known != null && !dictionaries.Any(d => d.Id == known.Id) ? known.Id : null;
-        var id = cliSource?.Id ?? replaceId ?? originalId ?? legacyId ?? newKnownId ?? Guid.NewGuid().ToString("N");
+        // 新增内置版式之前，设置页可能已给同一文件分配 GUID。升级导入仍沿用该书的顺序和启停设置。
+        var cliId = cliSource?.Optional == true && newKnownId != null && originalId != null ? originalId : cliSource?.Id;
+        var id = cliId ?? replaceId ?? originalId ?? legacyId ?? newKnownId ?? Guid.NewGuid().ToString("N");
         var existing = dictionaries.FirstOrDefault(item => item.Id == id);
         if (replaceId != null && existing == null) throw new ArgumentException("要替换的词典已不存在，请刷新列表");
         if (originalId != null && originalId != id) throw new InvalidDataException("此文件已属于另一词典，请选择对应词典重新导入");
@@ -166,7 +168,10 @@ internal sealed class DictionaryStore : IDisposable
         else
         {
             using var order = Command("SELECT 1 FROM app_settings WHERE name='order_saved'", tx);
-            priority = known != null && id == known.Id && order.ExecuteScalar() == null ? known.Priority
+            // 老库的自定义 MDX 可能已占用扩展词典的默认顺序，新增来源应排在这些词库之后。
+            bool appendExtension = known?.Optional == true && dictionaries.Any(d =>
+                d.Priority > 0 && !Source.All.Any(s => s.Id == d.Id));
+            priority = known != null && id == known.Id && !appendExtension && order.ExecuteScalar() == null ? known.Priority
                 : checked(dictionaries.Select(d => d.Priority).Append(Source.All.Max(s => s.Priority)).Max() + 1);
         }
 
@@ -293,6 +298,21 @@ internal sealed class DictionaryStore : IDisposable
     }
 
     public IReadOnlyList<DictionaryInfo> ListDictionaries() => ReadCatalog(null);
+
+    public string InstalledId(Source source)
+    {
+        if (!source.Optional || !hasRevision) return source.Id;
+        // 首选标准 ID。只有唯一的已认领副本时，才用标准书名定位旧版设置页分配的 GUID。
+        using var cmd = Command("""
+            SELECT d.id FROM dictionaries d LEFT JOIN dictionary_metadata m ON m.id=d.id
+            WHERE d.id=$id OR m.parser_id=$id ORDER BY (d.id=$id) DESC LIMIT 2
+            """);
+        cmd.Parameters.AddWithValue("$id", source.Id);
+        using var rows = cmd.ExecuteReader();
+        if (!rows.Read()) return source.Id;
+        string first = rows.GetString(0);
+        return first == source.Id || !rows.Read() ? first : source.Id;
+    }
 
     private List<DictionaryInfo> ReadCatalog(SqliteTransaction? tx)
     {

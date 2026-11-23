@@ -1,4 +1,4 @@
-# 先执行 dotnet build -c Release。指定 -RealDatabase 可额外复验四本实际使用的词典。
+# 先执行 dotnet build -c Release。指定 -RealDatabase 可额外复验基础四本及已启用的新增词典。
 param([string] $RealDatabase, [switch] $Desktop, [switch] $FileDesktop, [string] $ColdStartFile,
       [switch] $SettingsDesktop, [string] $MdxSample, [string] $GuiExecutable, [switch] $OutOfOrder, [switch] $RestartEngine,
       [ValidateSet('Files','Keyboard','ColdEdit','Tray')][string[]] $AcceptanceDesktop,
@@ -288,6 +288,40 @@ function Test-ImportIdentity([string]$Directory, [Reflection.Assembly]$Assembly)
         Assert-Equal $next.Id $b.Id '改名后的来源可独立更新'
         Assert-Equal $db.Search('見る', $b.Id, [Threading.CancellationToken]::None).Count 1 '重开后换版继续使用已保存的 MDX 解析器'
         Write-Output 'PASS 旧库元数据升级；改名替换及重启后换版仍保留专用解析'
+
+        # 旧版设置页不认识英辞郎，会给同一路径分配 GUID。用当时的来源信息复现升级。
+        $legacyPath = [IO.Path]::Combine($Directory,'uncatalogued.mdx')
+        $knownPath = [IO.Path]::Combine($Directory,'source-a','《英辞郎v86英和辞典》[090412].mdx')
+        Write-Mdx $legacyPath ([ordered]@{'original'='旧版词条'})
+        $legacy = $import.Invoke($db,@($legacyPath,'en',$null,$null))
+        Assert-Equal ($legacy.Id -match '^[0-9a-f]{32}$') $true '旧版设置导入使用 GUID'
+        $db.SaveDictionaryOrder([string[]]@($legacy.Id,$a.Id,$b.Id))
+        $db.SetDictionaryEnabled($legacy.Id,$false)
+        $connection = [Microsoft.Data.Sqlite.SqliteConnection]::new($connectionString.ToString())
+        try {
+            $connection.Open()
+            $cmd = $connection.CreateCommand()
+            $cmd.CommandText = 'UPDATE dictionary_metadata SET source_path=$path WHERE id=$id'
+            $null = $cmd.Parameters.AddWithValue('$path',$knownPath)
+            $null = $cmd.Parameters.AddWithValue('$id',$legacy.Id)
+            Assert-Equal ($cmd.ExecuteNonQuery()) 1 '还原旧版记录的正式来源路径'
+        } finally { $connection.Dispose() }
+        Write-Mdx $knownPath ([ordered]@{'apotropaic'='<br>{形} : 厄よけの'})
+        $previous = $env:E_SEARCH_DB
+        try {
+            $env:E_SEARCH_DB = $database
+            Invoke-Search @('import','eijiro',$knownPath) | Out-Null
+            $catalog = $db.ListDictionaries()
+            Assert-Equal $catalog.Count 3 '升级后保留旧目录且无重复书'
+            Assert-Equal $catalog[0].Id $legacy.Id '升级后保留原 GUID 与首选顺序'
+            Assert-Equal $catalog[0].Enabled $false '升级后保留停用状态'
+            Assert-Equal @(Invoke-Search @('query','apotropaic','eijiro')).Count 0 '停用时按内置 ID 查询无结果'
+            $db.SetDictionaryEnabled($legacy.Id,$true)
+            $hits = @(Invoke-Search @('query','apotropaic','eijiro'))
+            Assert-Equal $hits.Count 1 '重新启用后按内置 ID 查询只有一条结果'
+            Assert-Equal ($hits[0].Split([char]9)[0]) "$($legacy.Id):1" 'CLI 来源筛选命中既有 GUID 的新版正文'
+        } finally { $env:E_SEARCH_DB = $previous }
+        Write-Output 'PASS 旧设置来源升级为英辞郎后仍保留原 GUID、排序和启停'
     } finally { $db.Dispose() }
 }
 
@@ -1005,6 +1039,90 @@ UPDATE entries SET reading=NULL,evidence=NULL WHERE link IS NOT NULL;
         } finally { $connection.Dispose() }
     } finally { $env:E_SEARCH_DB = $previous }
     Write-Output 'PASS 牛津首义、日语假名链接、罗马字长音及英文精确优先；覆盖新导入和两种旧索引'
+}
+
+function Test-AdditionalDictionaries([string]$Scratch, [Reflection.Assembly]$Assembly) {
+    $head = 'た·べる【食べる】'
+    $sense = '<div class="ncdata-header"><h1><span class="word">た·べる</span><span>【<span>食べる</span>】 </span></h1></div>' +
+        '<div class="ncdata-body"><div class="ncdata-sense"><ul class="ncdata-sense-wrap"><li><span>食物を口に入れ，かんで腹に入れる。</span>' +
+        '<span class="divide-imgs"><img alt="" src="data:image/png;base64,AA=="/></span><span>吃。把食物放入口中，经过咀嚼咽到肚里。</span></li></ul></div></div>'
+    $english = '<br>直交周波数分割多重｛ちょっこう しゅうはすう ぶんかつ たじゅう｝◆デジタル変調方式の一つ◆【略】OFDM'
+    $samples = [ordered]@{
+        shinseiki = [ordered]@{
+            $head = $sense; '食べる' = "@@@LINK=$head"; 'たべる' = "@@@LINK=$head"
+            'た·つ【裁つ】<' = '<h1><span class="word">た·つ</span><span>【<span>裁つ</span>】 </span><</h1>'
+            # 原书「たつ」亦可直接命中读音；换成独立测试键才能单独验证原书的实体跳转。
+            '测试别名' = '@@@LINK=た·つ【裁つ】&lt;'
+        }
+        sango = [ordered]@{
+            '地絡方向継電器' = "<br><font color=black>地絡方向継電器`r`n<br><font color=red>ちらくほうこうけいでんき`r`n<br><font color=blue>接地方向继电器。"
+            '信号' = "<br><font color=black>信号`r`n<p><font color=red>xìnhào`r`n<br><font color=blue>信号(しんごう),合図(あいず)。"
+            'Hrn, Hr' = "<br><font color=black>Hrn, Hr`r`n<br><font color=red>〔电气〕高电阻。"
+        }
+        eijiro = [ordered]@{
+            'orthogonal frequency division multiplexing' = $english
+            'Afro Latin  ' = '<br>{形} : <→AFRO-LATIN>'
+        }
+        'shogakukan-zhja' = [ordered]@{
+            '苹果  ' = '<br>píngguǒ<font color=red>【苹果】</font><br><font color=green>〈植〉</font>リンゴ<font color=black>（の木）</font>．个;[塊状のもの]块;[薄片状のもの]片．<p><font color=green>例：</font><br>削xiāo～皮</font><br><font color=blue>リンゴの皮をむく</font>'
+            '预约  ' = '<br>yùyuē<font color=red>【预约】</font><br>予約する．申し込みをする．<p><font color=green>例：</font><br>门诊ménzhěn～挂号guàhào</font><br><font color=blue>外来診察の受付申し込み</font>'
+            '光合作用  ' = '<br>guānghé zuòyòng<font color=red>【光合作用】</font><br><font color=green>〈植〉</font>光合成</font>'
+        }
+        shogakukan = [ordered]@{'よやく'='よやく<br>【予約】<br>预约'}
+    }
+    $basenames = @{
+        shinseiki = 'xsjrihanshuangjie.mdx'
+        sango = '[1其他语种] 三合一日語辭典《新日汉大辞典》、《实用汉日辞典》、 《详解日本外来语辞典》[172761](090126).mdx'
+        eijiro = '《英辞郎v86英和辞典》[090412].mdx'
+        'shogakukan-zhja' = '[7《小学馆V2中日辞典》.mdx'
+        shogakukan = '[5《小学馆V2日汉辞典》.mdx'
+    }
+    $sources = $Assembly.GetType('Source',$true).GetField('All').GetValue($null)
+    $database = [IO.Path]::Combine($Scratch,'additional-dictionaries.db')
+    $store = $Assembly.GetType('DictionaryStore',$true).GetConstructor([type[]]@([string],[bool])).Invoke(@($database,$false))
+    try {
+        # 模拟设置页先按原始文件名选语言，再从文件导入，不向导入器指定内置 ID。
+        foreach ($id in $samples.Keys) {
+            $name = $basenames[$id]
+            $known = @($sources | Where-Object { [IO.Path]::GetFileName($_.RelativePath) -eq $name })
+            Assert-Equal $known.Count 1 "设置页可识别 $name"
+            $language = switch ($id) { 'eijiro' { 'en' } 'shogakukan-zhja' { 'zh' } default { 'ja' } }
+            Assert-Equal $known[0].Language $language "$id 的查询语言"
+            $path = Join-Path $Scratch $name
+            Write-Mdx $path $samples[$id]
+            $info = $store.GetType().GetMethod('ImportDictionary').Invoke($store,@([string]$path,$known[0].Language,$null,$null))
+            Assert-Equal $info.Id $id "按文件名导入 $id"
+            if ($id -eq 'shogakukan-zhja') { Assert-Equal $info.Priority 8 '小学馆中日排在既有七本之后' }
+        }
+        $token = [Threading.CancellationToken]::None
+        foreach ($query in '食べる','たべる','taberu',$head) {
+            $hits = $store.Search($query,'shinseiki',$token)
+            Assert-Equal $hits.Count 1 "新世纪同一正文的书写、读音和链接合并 $query"
+            Assert-Equal $hits[0].Entry.Headword '食べる' "新世纪标准词头 $query"
+            Assert-Equal $hits[0].Entry.Reading 'たべる' "新世纪假名读音 $query"
+            Assert-Equal ($hits[0].Entry.Gloss -like '吃。*' -or $hits[0].Entry.Gloss -ceq '吃') $true "新世纪的中文首义 $query"
+        }
+        Assert-Equal $store.Search('测试别名','shinseiki',$token)[0].Entry.Headword '裁つ' '新世纪 &lt; 跳转到末尾带 < 的原词头'
+        Assert-Equal $store.Search('Hrn, Hr','sango',$token)[0].Entry.Gloss '〔电气〕高电阻。' '三合一无蓝行时保留红行的专业译义'
+        $forward = $store.Search('ちらくほうこうけいでんき','sango',$token)[0].Entry
+        Assert-Equal $forward.Headword '地絡方向継電器' '三合一按日语读音查专业词'
+        Assert-Equal $forward.Gloss.TrimEnd('。') '接地方向继电器' '三合一日译中'
+        $reverse = $store.Search('信号','sango',$token)[0].Entry
+        Assert-Equal ($null -eq $reverse.Reading) $true '三合一中文拼音不进入假名索引'
+        Assert-Equal ($reverse.Gloss -like '*合図*') $true '三合一保留汉译日释义'
+        $term = $store.Search('orthogonal frequency division multiplexing','eijiro',$token)[0].Entry
+        Assert-Equal ($term.Gloss -like '直交周波数分割多重*' -and $term.Gloss -notlike '*ちょっこう*') $true '英辞郎专业短语的日语释义'
+        Assert-Equal ($store.CurrentBody($term)) $english '英辞郎详情保留注音及缩写'
+        Assert-Equal ($store.Search('Afro Latin','eijiro',$token)[0].Entry.Gloss -like '*AFRO-LATIN*') $true '英辞郎角括号内的参见词不得作为 HTML 标签丢失'
+        $apple = $store.Search('苹果','shogakukan-zhja',$token)[0].Entry
+        Assert-Equal $apple.Gloss 'リンゴ（の木）' '小学馆中日首义保留日文括注，排除量词和例句'
+        Assert-Equal ($null -eq $apple.Reading) $true '中文拼音不进入日语读音索引'
+        $booking = $store.Search('预约','shogakukan-zhja',$token)[0].Entry
+        Assert-Equal ($booking.Gloss -like '予約する*' -and $booking.Gloss -notlike '*外来診察*') $true '小学馆中日显示动词译义'
+        Assert-Equal $store.Search('光合作用','shogakukan-zhja',$token)[0].Entry.Gloss '光合成' '小学馆中日从领域标签之后取专业译义'
+        Assert-Equal $store.Search('予約','shogakukan',$token)[0].Entry.Gloss '预约' '同库使用小学馆日汉仍能从日文读音和标题取得中文译义'
+    } finally { $store.Dispose() }
+    Write-Output 'PASS 四本新增辞书的文件识别、日语读音、中日和日中译义、英文专业短语'
 }
 
 function Test-SanseidoSummary([string]$Scratch, [Reflection.Assembly]$Assembly) {
@@ -1817,7 +1935,7 @@ function Test-WindowInteractions {
     Wait-Desktop { (Control GlossText).Current.Name -ceq '= 20' } '浮窗未显示括号运算结果 20'
     $value.SetValue('sqrt(2^4)+sin(30)')
     Wait-Desktop { (Control GlossText).Current.Name -ceq '= 4.5' } '浮窗未显示科学运算结果 4.5'
-    # 交付的四部词库没有 MDX 重定向记录；从隔离库里实际导入的日语别名核对 WPF 显示。
+    # 从隔离库里实际导入的日语别名核对 WPF 显示。
     $value.SetValue('hashi')
     Wait-Desktop { (Control GlossText).Current.Name -ceq '橋（はし） · 桥' } '浮窗未从罗马字通过假名链接找到规范词头'
     $value.SetValue('')
@@ -2126,7 +2244,7 @@ public static class ESearchDesktop {
             if (![ESearchDesktop]::RegisterHotKey($form.Handle,0x1470,3,119)) { throw '专项快捷键 Ctrl+Alt+F8 已被占用' }
             [void][ESearchDesktop]::UnregisterHotKey($form.Handle,0x1470)
         }
-        # 第五阶段通过发布包的用户默认入口启动，同时启用四本词典。
+        # 第五阶段通过发布包的用户默认入口启动，保留验收库的词典启用状态。
         if ($Scenario -or $Settings) { $appProcess=Start-Process -FilePath $gui -PassThru }
         else { $appProcess=Start-Process -FilePath $gui -ArgumentList @('gui','shogakukan') -PassThru }
         [void][ESearchDesktop]::AllowSetForegroundWindow($appProcess.Id)
@@ -2655,6 +2773,7 @@ if ($BackendTestDirectory) {
     Assert-Equal $url ('https://chatgpt.com/?q=' + [Uri]::EscapeDataString($prompt)) '中文与 URL 特殊字符'
     Write-Output 'PASS AI 前缀、空提示词与 ChatGPT 链接编码'
     Test-ImportIdentity $BackendTestDirectory $assembly
+    Test-AdditionalDictionaries $BackendTestDirectory $assembly
     Test-EverythingRecovery $BackendTestDirectory $assembly
     Test-SanseidoSummary $BackendTestDirectory $assembly
     Test-OxfordSummary $BackendTestDirectory $assembly

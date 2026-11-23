@@ -18,14 +18,32 @@ internal static partial class EntryParser
         {
             // 日语词典显式给出的假名重定向键也是读音依据，保留在别名记录上。
             var aliasReading = language == "ja" ? Kana(Lookup.Normalize(key)) : null;
-            return new(key, aliasReading, aliasReading == null ? null : "MDX 假名重定向键", "", body[8..].Trim(), []);
+            var target = body[8..].Trim();
+            // 新世纪部分跳转目标用了 HTML 实体，而 MDX 目标键保存实际字符。
+            if (sourceId == "shinseiki") target = WebUtility.HtmlDecode(target);
+            return new(key, aliasReading, aliasReading == null ? null : "MDX 假名重定向键", "", target, []);
         }
 
         // 各辞书的 HTML 结构不同。只从已识别的字段建立读音索引，不从释义、例句猜读音。
         if (sourceId == "shogakukan")
             return Shogakukan(key, body);
+        if (sourceId == "shogakukan-zhja")
+        {
+            var lines = Lines(body, 4096);
+            int suffix = key.LastIndexOf(' ');
+            // 多音字以「行 1」等编号分条。只有正文标题也写明「行」时，才增加不带序号的查法。
+            var head = suffix > 0 && key[(suffix + 1)..].All(char.IsAsciiDigit)
+                && lines.Length > 0 && lines[0].StartsWith(key[..suffix], StringComparison.Ordinal) ? key[..suffix] : key;
+            return new(head, null, null, ShogakukanChineseGloss(lines), null, []);
+        }
         if (sourceId == "sanseido")
             return Sanseido(key, body);
+        if (sourceId == "shinseiki")
+            return Shinseiki(key, body);
+        if (sourceId == "sango")
+            return Sango(key, body);
+        if (sourceId == "eijiro")
+            return new(key, null, null, EijiroGloss(body), null, []);
 
         string? gloss = null;
         if (sourceId == "hanying")
@@ -329,6 +347,64 @@ internal static partial class EntryParser
         if (quoted) throw new InvalidDataException($"第 {start} 行，第 {fields.Count + 1} 列的引号未闭合");
     }
 
+    private static string ShogakukanChineseGloss(string[] lines)
+    {
+        if (lines.Length == 0) return "";
+        int start = 1;
+        if (lines[0].Contains('（') && lines[0].EndsWith('】'))
+        {
+            // 「克」等字的多种繁体和编号跨行排列，到右括号及拼音才真正结束标题。
+            int end = Array.FindIndex(lines, 1, Math.Min(lines.Length - 1, 16), ShogakukanChineseHeadingTail().IsMatch);
+            if (end >= 1) start = end + 1;
+        }
+        // 中日卷首行是拼音及中文词头；此处的假名即使存在，也属于日文译文。
+        for (int i = start; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            if (line.StartsWith("例：") || line.StartsWith("例:")) return "原书列有例句";
+            if (line is "【主見出し】" or "【関連】" && i + 1 < lines.Length)
+            {
+                var target = Between(lines[i + 1], "【", "】");
+                return Preview("参见 " + (target ?? Pinyin().Replace(lines[i + 1], "")), "");
+            }
+            if (line == "【熟語】" && i + 1 < lines.Length)
+            {
+                var words = Pinyin().Replace(lines[i + 1], "");
+                return Preview("原书组词 " + words, "");
+            }
+            // 单字条目常把反义词及其拼音拆成两行；同一行右括号之后才是日文义项。
+            if (line.Contains("【反義】") || line.Contains("【同義】"))
+            {
+                if (++i >= lines.Length) break;
+                int end = lines[i].IndexOf('）');
+                if (end < 0) continue;
+                line = lines[i][(end + 1)..].Trim();
+            }
+            if (line == "☆ポイントのまとめ" && i + 1 < lines.Length)
+            {
+                line = lines[++i].TrimStart('１');
+                int section = line.IndexOf('【');
+                if (section >= 0) line = line[..section];
+            }
+            if (line.StartsWith('【') && line.EndsWith('】')) continue;
+            var sense = ShogakukanChineseLabels().Replace(line, "").Trim();
+            // 生僻字有时只在特定复合词中使用，右引号后的括号被换行打断。
+            int quote = sense.IndexOf("”（", StringComparison.Ordinal);
+            if (sense.StartsWith('“') && quote > 0
+                && !sense.Contains('）') && i + 1 < lines.Length && lines[i + 1].StartsWith('１'))
+                sense = "「" + Pinyin().Replace(sense[1..quote], "") + "」" + lines[i + 1][1..];
+            int counter = sense.IndexOf('\uE11F'); // 原书的量词图标，例如「リンゴ（の木）．［量词］个」。
+            if (counter >= 0) sense = sense[..counter].TrimEnd('．', ' ');
+            if (sense.Length > 0) return Preview(sense, "");
+        }
+        return Preview("原书词头 " + lines[0], "");
+    }
+
+    [GeneratedRegex(@"^(?:[（(][0-9０-９]+[)）]\s*|〈[^〉]+〉\s*|〔[一-龯ァ-ヺ]{1,7}(?:詞|語)〕\s*)+")]
+    private static partial Regex ShogakukanChineseLabels();
+    [GeneratedRegex(@"）[A-Za-zÀ-žǍ-ǜ]+$")]
+    private static partial Regex ShogakukanChineseHeadingTail();
+
     private static ParsedEntry Shogakukan(string key, string body)
     {
         // 首行是假名。第二行可能含【词头】或直接给出首义。词头中的横杠代表省略部分。
@@ -451,6 +527,153 @@ internal static partial class EntryParser
         }
         return null;
     }
+
+    private static ParsedEntry Shinseiki(string key, string body)
+    {
+        var title = ShinseikiTitle().Match(body, 0, Math.Min(body.Length, 1536));
+        string display = key;
+        string? reading = Kana(key);
+        string? evidence = reading == null ? null : "MDX 假名词头";
+        string[] forms = [];
+        if (title.Success)
+        {
+            var printed = Plain(title.Groups["word"].Value);
+            var spelling = Plain(title.Groups["form"].Value);
+            // 单个短键有时合收多个同音词。只让匹配该键的标题或完整组合键提供规范写法与读音。
+            if (key == spelling || key.StartsWith(printed + "【", StringComparison.Ordinal))
+            {
+                forms = spelling.Split(['·', '・'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                    .Where(s => s.Any(c => c is >= 'ぁ' and <= 'ヿ' or >= '㐀' and <= '鿿')
+                        && s.IndexOfAny(['⇒', '?', '—', '…']) < 0).ToArray();
+                display = forms.Contains(key) ? key : forms.FirstOrDefault() ?? printed;
+                reading = Kana(printed.Replace("·", ""));
+                evidence = reading == null ? null : "MDX 新世纪标题假名";
+            }
+        }
+
+        // 日文、分隔图、中文同属一个 li。第一义缺中文时取其日文，不跨到别义或例句。
+        int wrap = body.IndexOf("class=\"ncdata-sense-wrap\"", IgnoreCase);
+        int item = wrap < 0 ? -1 : body.IndexOf("<li>", wrap, IgnoreCase);
+        int end = item < 0 ? -1 : body.IndexOf("</li>", item, IgnoreCase);
+        string? sense = null;
+        if (end >= 0)
+        {
+            int start = item + "<li>".Length;
+            int example = body.IndexOf("<div class=\"unit-example\"", start, end - start, IgnoreCase);
+            if (example >= 0) end = example;
+            int divider = body.IndexOf("<span class=\"divide-imgs\"", start, end - start, IgnoreCase);
+            if (divider >= 0)
+            {
+                int close = body.IndexOf("</span>", divider, end - divider, IgnoreCase);
+                if (close >= 0) sense = Plain(body[(close + "</span>".Length)..end]);
+            }
+            if (string.IsNullOrWhiteSpace(sense))
+                sense = Plain(body[start..(divider >= 0 ? divider : end)]);
+        }
+        // 少数原条目只给参见或标音，甚至留下空的义项标签；仍展示原书能确定的内容。
+        if (string.IsNullOrWhiteSpace(sense)) sense = Between(body, "<p class=\"cat-unit\">", "</p>");
+        if (string.IsNullOrWhiteSpace(sense) && reading != null) sense = "原书注音 " + reading;
+        return new(display, reading, evidence, Preview(sense, ""), null, forms.Where(f => f != display).ToArray());
+    }
+
+    [GeneratedRegex(@"<h1>\s*<span class=""word"">(?<word>[^<>]+)</span>(?:\s*<span>【<span>(?<form>[^<>]+)</span>】)?", RegexOptions.IgnoreCase)]
+    private static partial Regex ShinseikiTitle();
+
+    private static ParsedEntry Sango(string key, string body)
+    {
+        string? reading = Kana(key);
+        string? evidence = reading == null ? null : "MDX 假名词头";
+        string? sense = null;
+        string? fallback = null;
+        var line = SangoLine().Match(body);
+        if (!line.Success) return new(key, reading, evidence, Preview(null, body), null, []);
+        // 三合一的黑行是词头，第一蓝行也可能是写法或借词来源；随后才是正文。
+        while (line.Success && line.Groups["color"].Value == "black") line = line.NextMatch();
+        if (line.Success && line.Groups["color"].Value == "blue")
+        {
+            var next = line.NextMatch();
+            if (next.Success && next.Groups["color"].Value != "green")
+            {
+                var first = Plain(line.Groups["text"].Value);
+                if (first.Length > 0 && first != key) fallback = first;
+                line = next;
+            }
+        }
+        for (; line.Success; line = line.NextMatch())
+        {
+            var color = line.Groups["color"].Value;
+            var value = Plain(line.Groups["text"].Value);
+            if (color == "green") break; // 例句后面还会出现译文，不能取作首义。
+            if (color == "red")
+            {
+                // 红色 br 的纯假名是标音；红色 p 可表示中文词头的拼音或词性。
+                if (line.Groups["block"].Value == "br")
+                {
+                    var kana = Kana(value);
+                    if (reading == null && kana != null) (reading, evidence) = (kana, "MDX 三合一词头注音");
+                    // 有的外来语条目仅存一行「→A重油。」或括号损坏的原释，留作无蓝行时的摘要。
+                    if (kana == null && value.Length > 0 && value != key) fallback ??= value;
+                }
+                if (line.Groups["block"].Value == "p" && ToneMark().IsMatch(value) && !value.StartsWith('['))
+                    fallback ??= "原书拼音 " + value;
+                // 外来语分册有时直接在红行的学科标签后给中文定义。
+                int origin = value.IndexOf('】');
+                if (value.StartsWith('【') && origin >= 0)
+                    value = value[(origin + 1)..].Trim();
+                else if (!value.StartsWith('〔')) continue;
+                if (value.StartsWith('〔') && value.IndexOf('〕') == value.Length - 1) continue;
+            }
+            else if (color != "blue") continue;
+            if (value.StartsWith('[') && value.EndsWith(']'))
+            {
+                if (value.Length > 6) fallback = value; // 有的语法条目只有方括号中的用法说明。
+                continue;
+            }
+            if (value == key) fallback ??= value;
+            if (value.Length == 0 || value == key || value is "(代)" or "(名)" or "(动)" or "(副)" or "(形)") continue;
+            sense = value;
+            break;
+        }
+        if (sense == null && fallback == null && body.Contains("<OJ><![CDATA[", StringComparison.Ordinal)
+            && Between(body, "<OJ><![CDATA[", "]]></OJ>") is { Length: > 0 } spelling)
+            fallback = "原书写法 " + spelling;
+        if (sense == null && fallback == null && reading != null) fallback = "原书注音 " + reading;
+        return new(key, reading, evidence, Preview(sense ?? fallback, ""), null, []);
+    }
+
+    [GeneratedRegex(@"<(?<block>br|p)>\s*<font color=(?<color>black|blue|red|green)>(?<text>[^<\r\n]*)")]
+    private static partial Regex SangoLine();
+
+    private static string EijiroGloss(string body)
+    {
+        string? metadata = null;
+        // 英辞郎把参见写成 <→词头>，常规 HTML 去标签会把整条引用吞掉。详情始终保留原文。
+        for (int start = 0; start < body.Length;)
+        {
+            int end = body.IndexOf("<br>", start, IgnoreCase);
+            string line = body[start..(end < 0 ? body.Length : end)].Trim();
+            start = end < 0 ? body.Length : end + "<br>".Length;
+            if (line.Length == 0 || line.StartsWith("----", StringComparison.Ordinal)) continue;
+            if (line.StartsWith('{') && line.IndexOf('}') is > 0 and < 28)
+                line = line[(line.IndexOf('}') + 1)..].TrimStart(' ', ':', '：');
+            if (line.Contains("<→", StringComparison.Ordinal))
+                line = EijiroReference().Replace(line, "参见 $1");
+            line = Plain(EijiroRuby().Replace(line, ""));
+            if (line.Length == 0) continue;
+            if (line.StartsWith("【発音】") || line.StartsWith("【レベル】") || line.StartsWith("【変化】"))
+            {
+                metadata ??= line;
+                continue;
+            }
+            return Preview(line, "");
+        }
+        return metadata == null ? "" : Preview("原书注记 " + metadata, "");
+    }
+
+    [GeneratedRegex(@"[＝=]?<→([^<>\r\n]+)>")]
+    private static partial Regex EijiroReference();
+    [GeneratedRegex(@"｛[ぁ-ゖァ-ヺーゝゞヽヾ・　 （）()]+｝")]
+    private static partial Regex EijiroRuby();
 
     private static string? FirstSentence(string? gloss)
     {
