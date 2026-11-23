@@ -18,7 +18,29 @@
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0-windows'">
     <Using Remove="System.Windows.Forms;System.Drawing" />
     <Using Include="System.IO" />
+    <Content Include=".tools/everything/dll/Everything32.dll;.tools/everything/dll/Everything64.dll;.tools/everything/dll/EverythingARM64.dll"
+             Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include=".tools/everything/Everything-SDK-LICENSE.txt" Link="licenses/Everything-SDK-LICENSE.txt"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
+  <!-- 下载一次并校验官方 SDK；以后的桌面构建复用缓存，命令行目标不依赖 SDK。 -->
+  <Target Name="PrepareEverythingSdk" BeforeTargets="PrepareForBuild" Condition="'$(TargetFramework)' == 'net10.0-windows'">
+    <PropertyGroup>
+      <_SdkCache>$(MSBuildProjectDirectory)/.tools/everything</_SdkCache>
+      <_SdkZip>$(_SdkCache)/Everything-SDK.zip</_SdkZip>
+    </PropertyGroup>
+    <MakeDir Directories="$(_SdkCache)" />
+    <DownloadFile SourceUrl="https://www.voidtools.com/Everything-SDK.zip" DestinationFolder="$(_SdkCache)"
+                  DestinationFileName="Everything-SDK.zip" Condition="!Exists('$(_SdkZip)')" />
+    <VerifyFileHash File="$(_SdkZip)" Algorithm="SHA256" Hash="F5716D9513CCE6B462B5170A0A2E7E081E191D9BCAC6774F5DECC061497DF443" />
+    <Unzip SourceFiles="$(_SdkZip)" DestinationFolder="$(_SdkCache)" Include="dll/*.dll;src/Everything.c" SkipUnchangedFiles="true" />
+    <PropertyGroup>
+      <!-- 将上游实现自带的完整版权和许可声明随 DLL 一并发布。 -->
+      <_SdkSource>$([System.IO.File]::ReadAllText('$(_SdkCache)/src/Everything.c'))</_SdkSource>
+      <_SdkNotice>$(_SdkSource.Substring(0, $(_SdkSource.IndexOf('// Notes:'))))</_SdkNotice>
+    </PropertyGroup>
+    <WriteLinesToFile File="$(_SdkCache)/Everything-SDK-LICENSE.txt" Lines="$(_SdkNotice)" Overwrite="true" WriteOnlyWhenDifferent="true" Encoding="UTF-8" />
+  </Target>
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
     <Compile Remove="SearchWindow.xaml.cs" />
   </ItemGroup>

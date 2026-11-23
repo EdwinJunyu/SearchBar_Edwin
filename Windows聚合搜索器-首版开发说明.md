@@ -3,7 +3,7 @@
 首版供个人在 Windows 上使用。按 `Alt + Space` 唤起一个搜索框，一次输入同时查询本地词典和 Everything。读译义只需看输入框右侧，打开文件只需按回车。词典与文件结果独立返回，任一侧等待期间，另一侧仍可使用。
 
 
-**交接状态。** 工程提供 .NET 10 命令行和 Windows WPF 浮窗两个入口。解决方案为 `E_Search.slnx`，启动项目为 `E_Search.csproj`。四本真实 MDX 已在本机建立 SQLite 索引。文末第 11 节记录了复现命令和查询结果；浮窗见第 12 节；Everything 属于第三阶段。第 7 节仍为整体应用的拟实现契约。
+**交接状态。** 工程提供 .NET 10 命令行和 Windows WPF 浮窗两个入口。解决方案为 `E_Search.slnx`，启动项目为 `E_Search.csproj`。四本真实 MDX 已在本机建立 SQLite 索引。文末第 11 节记录了复现命令和查询结果；浮窗见第 12 节；Everything 文件查询与实机验收见第 13 节。第 7 节仍为整体应用的拟实现契约。
 **第一个任务是交出一条真实词条的查询记录。** 先读第 1 节看四种输入，再读第 4 节看匹配顺序。基本术语可以用同一条记录理解：“词头”是词典收录的写法「食べる」，“读音”是「たべる」，“原形”是从「食べました」还原得到的「食べる」。“条目标识”用来判断四种输入是否真的找到了同一条记录。
 
 | 何时准备 | 开发机上需要什么 | 准备好的标志 |
@@ -232,7 +232,7 @@ $dotnet = if (Test-Path .\.tools\dotnet\dotnet.exe) { (Resolve-Path .\.tools\dot
 | Alt + Space 或点击托盘图标 | 清空输入，显示浮窗并聚焦搜索框。热键冲突时浮窗显示提示，托盘仍可唤起。 |
 | 输入已确认的文字 | 右侧显示当前输入的第一条译义。无匹配时留白。 |
 | Tab 或点击箭头 | 展开或收起词条；展开后可在候选框中选择来源，阅读该词条的释义和例句。 |
-| 输入法正在组词时按回车 | 交给当前输入法处理确认。文件打开功能属于第三阶段。 |
+| 输入法正在组词时按回车 | 交给当前输入法处理确认。已确认文字且当前查询有选中文件时，再按一次回车可打开文件。 |
 | Esc | 已展开时先收起；单行状态下隐藏浮窗，恢复唤起前的窗口。 |
 
 查询在后台使用独立的只读连接。每次编辑、清空和隐藏都会使先前的查询失效，过期的译义和词条正文不再更新界面。
@@ -257,3 +257,47 @@ pwsh -NoProfile -File .\regressions.ps1 -Desktop -RealDatabase .data/dictionarie
 ```
 
 本机运行日志保存在 `.data/stage2-desktop-verification.txt`。系统已注册托盘图标；本次桌面自动化未能定位其可点击项，实际鼠标点击托盘唤起仍待核验。
+
+## 13. 第三阶段 · Everything 文件搜索
+
+从第 12 节的 WPF 发布目录启动 E_Search。输入普通文件名或 Everything 表达式时，右侧仍显示本地词典释义，下方独立列出文件名和父目录。普通名称按含扩展名的完整叶文件名匹配，忽略大小写，将全部命中的同名文件优先纳入前 100 项。其余文件维持引擎顺序。输入 `ext:pdf 报告` 等原生表达式时，直接向 Everything 查询原文，按 SDK 的返回顺序显示文件。
+
+- 文件返回后默认选中第一项。在搜索框里按 ↑、↓ 切换文件，Enter 通过 Windows 的默认关联程序打开当前路径。同一输入下展开或收起词条会保留文件选择。
+- 编辑输入时立即撤销上一次的文件选择。等待新的文件结果、列表为空、输入法正在选词或浮窗已隐藏时，回车无法打开上一项。
+- 本机需要能响应 Unicode SDK 的 Everything 普通版。已安装但未运行时，浮窗会尝试在后台启动并接续当前输入。缺少程序时，文件区提供官方下载入口。便携版放在非标准位置时，可将 `E_SEARCH_EVERYTHING_EXE` 设为其 EXE 的绝对路径。词典查询独立使用 SQLite。
+- 第一次构建 Windows 目标会从 voidtools 下载 SDK，按 SHA-256 校验并缓存到 `.tools/everything`。已缓存时可以离线重新构建。发布目录随附 x86、x64、ARM64 原生 DLL 和上游许可。命令行词典目标继续独立运行。[voidtools 官方 SDK 说明](https://www.voidtools.com/support/everything/sdk/)
+
+```powershell
+$dotnet = if (Test-Path .\.tools\dotnet\dotnet.exe) { (Resolve-Path .\.tools\dotnet\dotnet.exe).Path } else { 'dotnet' }
+& $dotnet build .\E_Search.slnx -c Release
+& $dotnet publish .\E_Search.csproj -c Release -f net10.0-windows --no-restore
+& .\bin\Release\net10.0-windows\publish\E_Search.exe
+```
+
+### 真实引擎与桌面验收记录
+
+本机使用已安装的 voidtools Everything 1.4.1.1024 x64 的独立副本、项目内的目录索引和真实文件。个人安装启用了管理员运行；验收副本以普通权限运行，索引范围为项目测试目录。没有切换个人卷索引或安装服务。下表中的“甲”和“乙”是两个不同的父目录。
+
+| 场景 | 观察到的结果 |
+|---|---|
+| 冷启动并行返回 | 引擎未启动时，在浮窗仅输入一次 `taberu`。本次桌面观察在 132 ms 读到小学馆译义，348 ms 读到文件。两次观察是同一轮实测时间。 |
+| 普通完整文件名 | 查询 `ESearchQAd6b87cbe32.html`。Everything 自身窗口和独立 SDK 的原序依次为甲/000 前缀、乙/001 前缀、乙/同名、甲/同名。浮窗依次为乙/同名、甲/同名、甲/000 前缀、乙/001 前缀。 |
+| 原生筛选 | 查询 `ext:html ESearchQAd6b87cbe32`，浮窗、Everything 窗口和独立 SDK 的四条路径及顺序一致，排除了同批 TXT 文件。 |
+| 截断边界 | 用 110 个前缀匹配和两个同名文件复验。显示 100 项时两个同名文件仍在最前；相应原生筛选保留前缀匹配在前的原序。 |
+| 键盘打开 | ↓ 选中第二项，↑ 回到第一项，再按 ↓ 和 Enter。Edge 显示甲目录文件独有的标题 `ESearchQAd6b87cbe32-document-1`。 |
+| 快速编辑 | 从有效选择连续输入三个新词并立即回车，浮窗仍在前台且无旧选择。快速切换到另一个有效文件名后，唯一选中项属于新输入。 |
+| 两区互不干扰 | 查到文件与译义后展开、收起词条，文件选择保持。中日文输入法确认文字、两级 Esc 和原窗口后续输入也通过桌面回归。 |
+
+桌面日志保存在 `.data/stage3-desktop-verification.txt`。Everything 自身窗口的普通查询和原生筛选截图分别保存在 `.data/stage3-everything-plain.png` 与 `.data/stage3-everything-filter.png`。
+
+在交互式 PowerShell 7 中可用以下命令复验。使用已索引的项目测试目录；测试会在 `.data/regressions` 创建本轮文件，用系统默认浏览器打开所选测试文档。
+
+```powershell
+pwsh -NoProfile -File .\regressions.ps1 -FileDesktop -Desktop -RealDatabase .data/dictionaries.db
+```
+
+如需单独复验冷启动，将 `-ColdStartFile` 指向已被测试实例索引且文件名含 `taberu` 的真实文件。该项要求实例起初未运行；脚本检查首次查询是否在没有再次编辑的情况下返回指定的完整路径。
+
+本机焦点复验中发现了第三方程序的影响。首次完整验收时，Esc 成功返回原文本框，后续桌面回归中有道词典有时会在 E_Search 已正确归还前台后取焦。单独关闭 E_Search 做对照，空闲文本框保持前台；按一次 Esc 或快速按两次 Esc 后，约 640 ms 时前台也变为有道词典。验收没有修改第三方快捷键配置。第三阶段专项可仅加 `-FileDesktop` 运行；`-Desktop` 会额外检查系统输入法及回焦。
+
+最终发布版本的第三阶段专项再次通过。冷启动只输入一次，158 ms 观察到译义，420 ms 观察到预先索引的指定文件；本轮实际打开的文件标题为 `ESearchQAbe8f4fafc1-document-1`。完整记录见 `.data/stage3-final-verification.txt`，Esc 独立对照见 `.data/stage3-double-esc-control.txt`。

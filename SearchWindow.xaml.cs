@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Runtime.InteropServices;
@@ -19,6 +20,7 @@ public partial class SearchWindow : Window
     private readonly string databasePath;
     private readonly string? dictionaryId;
     private readonly DispatcherTimer debounce;
+    private readonly EverythingSearch everything = new();
     private readonly double preferredWidth;
     private readonly ForegroundCallback observeForeground;
     private nint hwnd, previousWindow, foregroundHook;
@@ -27,6 +29,7 @@ public partial class SearchWindow : Window
     private bool registered, exiting, composing;
     private string hotkeyWarning = "";
     private long revision, detailRevision;
+    private long fileRevision = -1;
     private CancellationTokenSource? pending;
 
     public SearchWindow(string databasePath, string? dictionaryId = null)
@@ -45,7 +48,20 @@ public partial class SearchWindow : Window
         QueryBox.TextChanged += (_, _) => RefreshInput();
         ClearButton.Click += (_, _) => { QueryBox.Clear(); QueryBox.Focus(); };
         DetailsButton.Click += (_, _) => ToggleDetails();
+        FileList.PreviewMouseLeftButtonUp += (_, e) =>
+        {
+            // 鼠标选中一行后仍可继续键入新的搜索词。
+            if (e.OriginalSource is DependencyObject target &&
+                System.Windows.Controls.ItemsControl.ContainerFromElement(FileList, target) is System.Windows.Controls.ListBoxItem)
+                QueryBox.Focus();
+        };
+        InstallEverythingButton.Click += (_, _) => OpenWithShell("https://www.voidtools.com/downloads/", false);
         CandidatePicker.SelectionChanged += (_, _) => { if (DetailsPanel.IsVisible) _ = ShowEntryAsync(); };
+        SizeChanged += (_, e) =>
+        {
+            if (IsVisible && e.HeightChanged && e.NewSize.Height > e.PreviousSize.Height)
+                Dispatcher.BeginInvoke(DispatcherPriority.Loaded, FitExpandedWindow);
+        };
         PreviewKeyDown += HandleKey;
         // WPF 组合事件覆盖 TSF 输入法。只在组合结束、TextBox 已收到最终文字后检索。
         QueryBox.AddHandler(TextCompositionManager.PreviewTextInputStartEvent,
@@ -141,6 +157,9 @@ public partial class SearchWindow : Window
         SetWindowPos(hwnd, 0, work.Left + work.Width / 3, work.Top + work.Height / 3, 0, 0, moveOnly);
         var dpi = System.Windows.Media.VisualTreeHelper.GetDpi(this);
         Width = Math.Min(preferredWidth, Math.Max(1, work.Width / dpi.DpiScaleX - 12));
+        var availableHeight = work.Height / dpi.DpiScaleY;
+        FileList.MaxHeight = Math.Clamp(availableHeight * .30, 60, 280);
+        DetailScroll.MaxHeight = Math.Clamp(availableHeight * .19, 48, 215);
         UpdateLayout();
         var x = work.Left + (work.Width - (int)Math.Round(ActualWidth * dpi.DpiScaleX)) / 2;
         var y = work.Top + Math.Max(0, (work.Height - (int)Math.Round(ActualHeight * dpi.DpiScaleY)) / 3);
@@ -148,17 +167,33 @@ public partial class SearchWindow : Window
     }
     private void Dismiss()
     {
+        var target = previousWindow;
         composing = false;
         QueryBox.Clear();
         RefreshInput();
         // 在仍拥有前台资格时归还窗口，再隐藏浮窗，避免操作系统另选其他应用。
-        if (previousWindow != 0 && IsWindowVisible(previousWindow)) SetForegroundWindow(previousWindow);
+        if (target != 0 && IsWindowVisible(target)) SetForegroundWindow(target);
         Hide();
+        // Hide 可触发 Windows 重选前台；此处只校正同步切换，不在用户接下来操作时抢焦点。
+        if (target != 0 && IsWindowVisible(target) && GetForegroundWindow() != target)
+            SetForegroundWindow(target);
+    }
+
+    private void FitExpandedWindow()
+    {
+        if (!IsVisible || hwnd == 0) return;
+        var work = Forms.Screen.FromHandle(hwnd).WorkingArea;
+        var origin = PointToScreen(new Point(0, 0));
+        var height = ActualHeight * System.Windows.Media.VisualTreeHelper.GetDpi(this).DpiScaleY;
+        if (origin.Y + height <= work.Bottom) return;
+        // 正文展开或文件区增高时仅上移溢出的部分，保留底部结果的可见性。
+        int y = Math.Max(work.Top, work.Bottom - (int)Math.Ceiling(height));
+        SetWindowPos(hwnd, 0, (int)Math.Round(origin.X), y, 0, 0, 0x0015);
     }
 
     private void HandleKey(object sender, System.Windows.Input.KeyEventArgs e)
     {
-        // 让 IME 消费确认、翻页和取消键；第二阶段没有可打开的文件，普通 Enter 保持原位。
+        // IME 自己消费确认、翻页和取消键。文件打开只接受当前查询的独立一次按键。
         if (composing || e.Key == Key.ImeProcessed) return;
         if (CandidatePicker.IsDropDownOpen) return;
         if (e.Key == Key.Escape)
@@ -168,7 +203,7 @@ public partial class SearchWindow : Window
             e.Handled = true;
         }
         else if (e.Key == Key.Tab && Keyboard.Modifiers == ModifierKeys.None && DetailsButton.IsVisible
-            && (QueryBox.IsKeyboardFocused || CandidatePicker.IsKeyboardFocusWithin))
+            && (QueryBox.IsKeyboardFocused || CandidatePicker.IsKeyboardFocusWithin || FileList.IsKeyboardFocusWithin))
         {
             ToggleDetails();
             e.Handled = true;
@@ -178,6 +213,43 @@ public partial class SearchWindow : Window
             CandidatePicker.Focus();
             CandidatePicker.IsDropDownOpen = true;
             e.Handled = true;
+        }
+        else if (Keyboard.Modifiers == ModifierKeys.None && (QueryBox.IsKeyboardFocused || FileList.IsKeyboardFocusWithin))
+        {
+            if (e.Key == Key.Enter)
+            {
+                e.Handled = true;
+                if (!e.IsRepeat && fileRevision == revision && IsVisible && FileList.SelectedItem is FileHit file)
+                    OpenWithShell(file.FullPath, true);
+            }
+            else if (e.Key is Key.Up or Key.Down && fileRevision == revision && FileList.Items.Count > 0)
+            {
+                int delta = e.Key == Key.Down ? 1 : -1;
+                FileList.SelectedIndex = Math.Clamp(FileList.SelectedIndex + delta, 0, FileList.Items.Count - 1);
+                FileList.ScrollIntoView(FileList.SelectedItem);
+                e.Handled = true;
+            }
+        }
+    }
+
+    private void OpenWithShell(string target, bool isFile)
+    {
+        try
+        {
+            if (isFile && !File.Exists(target))
+                throw new FileNotFoundException("文件已移动、已删除或无法访问。");
+            using var process = Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+            if (isFile)
+            {
+                // Shell 已经把文件交给关联程序；此处隐藏即可，让新打开的窗口保有焦点。
+                Hide();
+                QueryBox.Clear();
+                RefreshInput();
+            }
+        }
+        catch (Exception ex) when (ex is Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            SetFileStatus("无法打开：" + ex.Message);
         }
     }
 
@@ -194,6 +266,14 @@ public partial class SearchWindow : Window
         revision++;
         debounce.Stop();
         pending?.Cancel();
+        // 同步撤销旧选择；即使用户在 debounce 或原生查询期间按回车，也不会打开上一项。
+        fileRevision = -1;
+        FileList.SelectedIndex = -1;
+        FileList.ItemsSource = null;
+        FileList.Visibility = Visibility.Collapsed;
+        FilePanel.Visibility = Visibility.Collapsed;
+        InstallEverythingButton.Visibility = Visibility.Collapsed;
+        SetFileStatus("");
         CloseDetails();
         CandidatePicker.ItemsSource = null;
         ClearButton.Visibility = QueryBox.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -210,6 +290,19 @@ public partial class SearchWindow : Window
         using var cancellation = new CancellationTokenSource();
         pending = cancellation;
         var token = cancellation.Token;
+        try
+        {
+            // 两个任务在各自完成时提交到 UI。WhenAll 仅管理本轮令牌的生命周期。
+            await Task.WhenAll(SearchDictionaryAsync(text, request, token), SearchFilesAsync(text, request, token));
+        }
+        finally
+        {
+            if (ReferenceEquals(pending, cancellation)) pending = null;
+        }
+    }
+
+    private async Task SearchDictionaryAsync(string text, long request, CancellationToken token)
+    {
         try
         {
             // 连接归后台任务独占。失效查询在候选之间退出，正在执行的结果经版本检查后丢弃。
@@ -234,10 +327,50 @@ public partial class SearchWindow : Window
         {
             if (IsVisible && request == revision) SetStatus("词库读取失败：" + ex.Message);
         }
-        finally
+    }
+
+    private async Task SearchFilesAsync(string text, long request, CancellationToken token)
+    {
+        FilePanel.Visibility = Visibility.Visible;
+        SetFileStatus("正在搜索文件…");
+        bool finished = false;
+        try
         {
-            if (ReferenceEquals(pending, cancellation)) pending = null;
+            var files = await everything.SearchAsync(text, message => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (!finished && request == revision && IsVisible) SetFileStatus(message);
+            })), token);
+            if (request != revision || !IsVisible) return;
+            fileRevision = request;
+            FileList.ItemsSource = files;
+            if (files.Count > 0)
+            {
+                FileList.Visibility = Visibility.Visible;
+                FileList.SelectedIndex = 0;
+                FileList.ScrollIntoView(FileList.SelectedItem);
+            }
+            SetFileStatus(files.Count switch
+            {
+                0 => "没有匹配的文件",
+                EverythingSearch.ResultLimit => $"当前显示前 {EverythingSearch.ResultLimit} 个文件",
+                _ => ""
+            });
         }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception
+            or InvalidOperationException or DllNotFoundException or BadImageFormatException or EntryPointNotFoundException)
+        {
+            if (request != revision || !IsVisible) return;
+            SetFileStatus(ex.Message);
+            if (ex is FileNotFoundException) InstallEverythingButton.Visibility = Visibility.Visible;
+        }
+        finally { finished = true; }
+    }
+
+    private void SetFileStatus(string text)
+    {
+        FileStatusText.Text = text;
+        FileStatusText.Visibility = text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private void ToggleDetails()
@@ -350,4 +483,171 @@ public partial class SearchWindow : Window
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(nint hwnd);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(nint hwnd, out uint pid);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(nint hwnd, StringBuilder name, int capacity);
+}
+
+internal sealed record FileHit(string Name, string Parent, string FullPath);
+
+internal sealed class EverythingSearch
+{
+    internal const int ResultLimit = 100;
+    private const uint PageSize = 256;
+    // SDK 的搜索串、偏移和返回指针均为进程共享状态，直到路径复制完毕才允许下一次查询。
+    private static readonly SemaphoreSlim SdkGate = new(1);
+    private static long lastStartupTick = -60_000;
+
+    internal async Task<IReadOnlyList<FileHit>> SearchAsync(string input, Action<string> status, CancellationToken token)
+    {
+        await SdkGate.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            return await Task.Run(async () =>
+            {
+                try
+                {
+                    await EnsureReadyAsync(status, token).ConfigureAwait(false);
+                    token.ThrowIfCancellationRequested();
+                    return Search(input, token);
+                }
+                catch (Exception ex) when (ex is DllNotFoundException or BadImageFormatException or EntryPointNotFoundException)
+                {
+                    throw new IOException("无法加载与当前进程匹配的 Everything SDK。请检查程序目录中的官方 DLL。", ex);
+                }
+            }, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            SdkGate.Release();
+        }
+    }
+
+    private static async Task EnsureReadyAsync(Action<string> status, CancellationToken token)
+    {
+        if (Native.Everything_IsDBLoaded()) return;
+        if (Native.Everything_GetMajorVersion() == 0)
+        {
+            var executable = LocateEverything() ?? throw new FileNotFoundException("尚未找到 Everything。");
+            // 连续输入可能数次取消等待；启动冷却由所有查询共用，避免重复启动或弹出权限提示。
+            if (Environment.TickCount64 - lastStartupTick >= 60_000)
+            {
+                lastStartupTick = Environment.TickCount64;
+                var start = new System.Diagnostics.ProcessStartInfo(executable, "-startup") {
+                    UseShellExecute = false, CreateNoWindow = true, WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
+                };
+                try { using var process = System.Diagnostics.Process.Start(start); }
+                catch (System.ComponentModel.Win32Exception ex)
+                {
+                    throw new IOException("无法在后台启动 Everything。请先手动启动普通版后重试。" + ex.Message, ex);
+                }
+            }
+        }
+        status("正在等待 Everything 索引就绪…");
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        while (!Native.Everything_IsDBLoaded())
+        {
+            // 大型个人索引可能加载数分钟。能连接到引擎时继续等待，输入变化仍可取消。
+            if (watch.Elapsed >= TimeSpan.FromSeconds(35) && Native.Everything_GetMajorVersion() == 0)
+                throw new IOException("Everything 尚未就绪。请确认普通版已运行且索引可用，然后重新查询。");
+            await Task.Delay(200, token).ConfigureAwait(false);
+        }
+    }
+
+    private static string? LocateEverything()
+    {
+        var configured = Environment.GetEnvironmentVariable("E_SEARCH_EVERYTHING_EXE");
+        if (!string.IsNullOrWhiteSpace(configured))
+            return Path.IsPathFullyQualified(configured) && File.Exists(configured) ? configured : null;
+        const string appPaths = @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Everything.exe";
+        foreach (var hive in new[] { Microsoft.Win32.Registry.CurrentUser, Microsoft.Win32.Registry.LocalMachine })
+        {
+            using var key = hive.OpenSubKey(appPaths);
+            if (key?.GetValue(null) is string exe && Path.IsPathFullyQualified(exe) && File.Exists(exe)) return exe;
+        }
+        foreach (var folder in new[] { Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86,
+                     Environment.SpecialFolder.LocalApplicationData })
+        {
+            var exe = Path.Combine(Environment.GetFolderPath(folder), "Everything", "Everything.exe");
+            if (File.Exists(exe)) return exe;
+        }
+        return null;
+    }
+
+    private static IReadOnlyList<FileHit> Search(string input, CancellationToken token)
+    {
+        // 额外的精确查询覆盖整个索引，避免普通查询先截断时，漏掉排在后面的同名文件。
+        // 原查询始终原样发送；原生表达式只走原查询。两批内部均保留 SDK 的原始顺序。
+        bool plain = input.IndexOfAny(Path.GetInvalidFileNameChars()) < 0 &&
+            !input.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Any(word => word.StartsWith('!'));
+        var output = new List<FileHit>(ResultLimit);
+        try
+        {
+            if (plain) AppendFiles($"file:wfn:\"{input}\"", input, true, output, token);
+            AppendFiles(input, plain ? input : null, false, output, token);
+            return output;
+        }
+        finally
+        {
+            Native.Everything_Reset();
+        }
+    }
+
+    private static void AppendFiles(string query, string? exactName, bool exactPass, List<FileHit> output, CancellationToken token)
+    {
+        Native.Everything_SetSearchW(query);
+        Native.Everything_SetRequestFlags(3); // EVERYTHING_REQUEST_FILE_NAME | EVERYTHING_REQUEST_PATH
+        Native.Everything_SetMax(PageSize);
+        for (uint offset = 0; ; offset += PageSize)
+        {
+            token.ThrowIfCancellationRequested();
+            Native.Everything_SetOffset(offset);
+            if (!Native.Everything_QueryW(true))
+                throw new IOException($"Everything 查询失败（SDK 错误 {Native.Everything_GetLastError()}）。");
+            uint count = Native.Everything_GetNumResults();
+            for (uint i = 0; i < count && output.Count < ResultLimit; i++)
+            {
+                if (!Native.Everything_IsFileResult(i)) continue;
+                var name = Marshal.PtrToStringUni(Native.Everything_GetResultFileNameW(i));
+                if (string.IsNullOrEmpty(name)) continue;
+                if (exactName != null && string.Equals(name, exactName, StringComparison.OrdinalIgnoreCase) != exactPass) continue;
+                var parent = Marshal.PtrToStringUni(Native.Everything_GetResultPathW(i));
+                if (string.IsNullOrEmpty(parent)) continue;
+                // SDK 对卷根目录可能返回 "C:"；只向 Shell 交付可独立解析的绝对路径。
+                if (parent.Length == 2 && char.IsAsciiLetter(parent[0]) && parent[1] == ':') parent += "\\";
+                if (Path.IsPathFullyQualified(parent))
+                    output.Add(new FileHit(name, parent, Path.Combine(parent, name)));
+            }
+            if (output.Count >= ResultLimit || count < PageSize || offset > uint.MaxValue - PageSize) break;
+        }
+    }
+
+    private static class Native
+    {
+        private const string Library = "ESearch.EverythingSDK";
+
+        static Native()
+        {
+            NativeLibrary.SetDllImportResolver(typeof(Native).Assembly, (name, assembly, searchPath) =>
+            {
+                if (name != Library) return IntPtr.Zero;
+                var file = RuntimeInformation.ProcessArchitecture switch {
+                    Architecture.X64 => "Everything64.dll", Architecture.X86 => "Everything32.dll",
+                    Architecture.Arm64 => "EverythingARM64.dll", _ => throw new BadImageFormatException("不支持的进程架构")
+                };
+                return NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, file));
+            });
+        }
+
+        [DllImport(Library)] internal static extern bool Everything_IsDBLoaded();
+        [DllImport(Library)] internal static extern uint Everything_GetMajorVersion();
+        [DllImport(Library, CharSet=CharSet.Unicode, ExactSpelling=true)] internal static extern void Everything_SetSearchW(string search);
+        [DllImport(Library)] internal static extern void Everything_SetRequestFlags(uint flags);
+        [DllImport(Library)] internal static extern void Everything_SetMax(uint max);
+        [DllImport(Library)] internal static extern void Everything_SetOffset(uint offset);
+        [DllImport(Library, ExactSpelling=true)] internal static extern bool Everything_QueryW(bool wait);
+        [DllImport(Library)] internal static extern uint Everything_GetNumResults();
+        [DllImport(Library)] internal static extern uint Everything_GetLastError();
+        [DllImport(Library)] internal static extern bool Everything_IsFileResult(uint index);
+        [DllImport(Library, ExactSpelling=true)] internal static extern IntPtr Everything_GetResultFileNameW(uint index);
+        [DllImport(Library, ExactSpelling=true)] internal static extern IntPtr Everything_GetResultPathW(uint index);
+        [DllImport(Library)] internal static extern void Everything_Reset();
+    }
 }

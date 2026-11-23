@@ -60,11 +60,11 @@
                       Data="M 15,8.5 A 6.5,6.5 0 1 1 2,8.5 A 6.5,6.5 0 1 1 15,8.5 M 13.4,13.4 L 19,19"/>
                 <Grid Grid.Column="1" Margin="13,0,0,0">
                     <TextBox x:Name="QueryBox" AutomationProperties.AutomationId="QueryBox"
-                             AutomationProperties.Name="搜索词典" VerticalContentAlignment="Center"
+                             AutomationProperties.Name="搜索词典和文件" VerticalContentAlignment="Center"
                              Foreground="{StaticResource Ink}" CaretBrush="{StaticResource Accent}"
                              FontSize="21" Padding="1,0" BorderThickness="0" Background="Transparent"
                              VerticalScrollBarVisibility="Hidden" HorizontalScrollBarVisibility="Hidden"/>
-                    <TextBlock Text="输入词语" Margin="2,0,0,0" IsHitTestVisible="False"
+                    <TextBlock Text="输入词语或文件名" Margin="2,0,0,0" IsHitTestVisible="False"
                                Foreground="#607780" FontSize="20" VerticalAlignment="Center">
                         <TextBlock.Style>
                             <Style TargetType="TextBlock">
@@ -114,7 +114,7 @@
                               AutomationProperties.Name="选择词条和词典来源" DisplayMemberPath="Label"
                               HorizontalAlignment="Stretch" VerticalContentAlignment="Center"
                               Padding="8,3" MinHeight="30" MaxDropDownHeight="215" FontSize="13"/>
-                    <ScrollViewer Margin="2,12,0,0" MaxHeight="248" VerticalScrollBarVisibility="Auto"
+                    <ScrollViewer x:Name="DetailScroll" Margin="2,12,0,0" MaxHeight="215" VerticalScrollBarVisibility="Auto"
                                   HorizontalScrollBarVisibility="Disabled">
                         <TextBlock x:Name="EntryText" AutomationProperties.AutomationId="EntryText"
                                    TextWrapping="Wrap" FontSize="15" LineHeight="24" Padding="0,0,6,0"/>
@@ -123,6 +123,62 @@
             </Border>
             <TextBlock x:Name="StatusText" AutomationProperties.AutomationId="StatusText"
                        Margin="20,0,20,12" TextWrapping="Wrap" Foreground="#844C18" Visibility="Collapsed"/>
+            <!-- 文件名与路径分列，即使多个结果同名，用户也可以按目录区分。 -->
+            <Border x:Name="FilePanel" BorderBrush="{StaticResource Divider}" BorderThickness="0,1,0,0" Visibility="Collapsed">
+                <StackPanel Margin="8,5,8,7">
+                    <TextBlock x:Name="FileStatusText" AutomationProperties.AutomationId="FileStatusText"
+                               Margin="12,8" Foreground="#506770" TextWrapping="Wrap" Visibility="Collapsed"/>
+                    <Button x:Name="InstallEverythingButton" AutomationProperties.AutomationId="InstallEverythingButton"
+                            Content="下载 Everything" ToolTip="打开 Everything 官方下载页" HorizontalAlignment="Left"
+                            Margin="12,0,12,6" Padding="9,3" Visibility="Collapsed"/>
+                    <ListBox x:Name="FileList" AutomationProperties.AutomationId="FileList"
+                             AutomationProperties.Name="文件结果" MaxHeight="280" Visibility="Collapsed"
+                             BorderThickness="0" Background="Transparent" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                             VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                             ScrollViewer.CanContentScroll="True">
+                        <ListBox.ItemContainerStyle>
+                            <Style TargetType="ListBoxItem">
+                                <Setter Property="AutomationProperties.Name" Value="{Binding FullPath}"/>
+                                <Setter Property="ToolTip" Value="{Binding FullPath}"/>
+                                <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="ListBoxItem">
+                                            <Border x:Name="Row" Padding="10,6" Background="Transparent" BorderThickness="2,0,0,0"
+                                                    BorderBrush="Transparent" CornerRadius="3">
+                                                <ContentPresenter/>
+                                            </Border>
+                                            <ControlTemplate.Triggers>
+                                                <Trigger Property="IsMouseOver" Value="True">
+                                                    <Setter TargetName="Row" Property="Background" Value="#F0F5F5"/>
+                                                </Trigger>
+                                                <Trigger Property="IsSelected" Value="True">
+                                                    <Setter TargetName="Row" Property="Background" Value="#E0EFF0"/>
+                                                    <Setter TargetName="Row" Property="BorderBrush" Value="{StaticResource Accent}"/>
+                                                </Trigger>
+                                            </ControlTemplate.Triggers>
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
+                            </Style>
+                        </ListBox.ItemContainerStyle>
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="5*"/>
+                                        <ColumnDefinition Width="6*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="{StaticResource Ink}"
+                                               TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                                    <TextBlock Grid.Column="1" Text="{Binding Parent}" FontSize="12" Foreground="#506770"
+                                               FlowDirection="LeftToRight" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                                </Grid>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </StackPanel>
+            </Border>
         </StackPanel>
     </Border>
 </Window>
