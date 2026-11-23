@@ -72,7 +72,8 @@
                 </Label>
                 <Grid Grid.Column="1" Margin="13,0,0,0">
                     <TextBox x:Name="QueryBox" AutomationProperties.AutomationId="QueryBox"
-                             AutomationProperties.Name="搜索词典和文件" VerticalContentAlignment="Center"
+                             AutomationProperties.Name="搜索词典和文件，或输入算式" VerticalContentAlignment="Center"
+                             ToolTip="例如 2^3、sqrt(16)、sin(30)。三角函数使用角度，log 为常用对数，ln 为自然对数。"
                              Foreground="{StaticResource Ink}" CaretBrush="{StaticResource Accent}"
                              FontSize="21" Padding="1,0" BorderThickness="0" Background="Transparent"
                              VerticalScrollBarVisibility="Hidden" HorizontalScrollBarVisibility="Hidden"/>

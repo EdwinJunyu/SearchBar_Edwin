@@ -67,6 +67,54 @@ function Assert-Equal($Actual, $Expected, $Scenario) {
     if ($Actual -cne $Expected) { throw "$Scenario 预期「$Expected」，实际「$Actual」" }
 }
 
+function Test-Calculation([Reflection.Assembly]$Assembly) {
+    $calculator = $Assembly.GetType('ESearch.SearchWindow', $true).GetMethod('TryCalculate', [Reflection.BindingFlags]'Static,NonPublic')
+    foreach ($case in ([ordered]@{
+        '2+3*4' = '14'
+        '(2+3)*4' = '20'
+        ' -(2 + (3 - 1)) * 4' = '-16'
+        '18 ÷ 3 × 2' = '12'
+        '-0.5' = '-0.5'
+        '1.2 / -0.4' = '-3'
+        '0.1+0.2' = '0.3'
+        '9007199254740993+1' = '9007199254740994'
+        '18/3/2' = '3'
+        '10-3-2' = '5'
+        '2^3^2' = '512'
+        '-2^2' = '-4'
+        '(-2)^2' = '4'
+        '2^-3' = '0.125'
+        'sqrt(2^4)+abs(-3)' = '7'
+        'sin(30)' = '0.5'
+        'cos(180)' = '-1'
+        'cos(90)' = '0'
+        'tan(45)' = '1'
+        'exp(ln(e)-1)' = '1'
+        'log(1000)' = '3'
+        'LOG10(100)' = '2'
+        '10^-40' = '1E-40'
+        'π/pi' = '1'
+        '1e3+1' = '1001'
+        '1E-3*2' = '0.002'
+    }).GetEnumerator()) {
+        $arguments = [object[]]@($case.Key, '')
+        $recognized = $calculator -and $calculator.Invoke($null, $arguments)
+        Assert-Equal $recognized $true "应识别算式 $($case.Key)"
+        Assert-Equal $arguments[1] $case.Value "算式 $($case.Key)"
+    }
+    foreach ($term in '2026','2.5','pi','π','e','report(2).pdf','2+3.txt','(2+3','2+3)','1/0','2(3)',
+        'sqrt(16).pdf','unknown(16)','sqrt(-1)','ln(0)','tan(90)','(-2)^0.5','exp(10000)',
+        '1/(1e308*1e308)','sqrt(-1)^0','2^','1e+','1e-3') {
+        $arguments = [object[]]@($term, '')
+        Assert-Equal ($calculator.Invoke($null, $arguments)) $false "保留普通搜索 $term"
+    }
+    foreach ($deep in (('2^' * 1000) + '1'), (('sqrt(' * 1000) + '1' + (')' * 1000))) {
+        $arguments = [object[]]@($deep, '')
+        Assert-Equal ($calculator.Invoke($null, $arguments)) $false '过深的幂链或函数嵌套'
+    }
+    Write-Output 'PASS 四则运算、幂与科学函数、角度制及普通搜索识别'
+}
+
 function Test-EverythingRecovery([string]$Scratch, [Reflection.Assembly]$Assembly) {
     # 使用独立管道对端模拟「收到请求但不返回」。不连接或停止用户的 Everything。
     $marker = Join-Path $Scratch 'sdk-worker-accepted.txt'
@@ -1095,6 +1143,10 @@ function Test-LaunchReadiness {
 # 桌面专项使用自己的数据库和快捷键，可与用户日常使用的旧版同时运行。
 function Test-WindowInteractions {
     $searchWindow=$window
+    $value.SetValue('(2+3)*4')
+    Wait-Desktop { (Control GlossText).Current.Name -ceq '= 20' } '浮窗未显示括号运算结果 20'
+    $value.SetValue('sqrt(2^4)+sin(30)')
+    Wait-Desktop { (Control GlossText).Current.Name -ceq '= 4.5' } '浮窗未显示科学运算结果 4.5'
     # 交付的四部词库没有 MDX 重定向记录；从隔离库里实际导入的日语别名核对 WPF 显示。
     $value.SetValue('hashi')
     Wait-Desktop { (Control GlossText).Current.Name -ceq '橋（はし） · 桥' } '浮窗未从罗马字通过假名链接找到规范词头'
@@ -1894,6 +1946,7 @@ if ($BackendTestDirectory) {
         $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $uiDir "$lib.dll"))
     }
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+    Test-Calculation $assembly
     Test-ImportIdentity $BackendTestDirectory $assembly
     Test-EverythingRecovery $BackendTestDirectory $assembly
     Test-LookupAudit $BackendTestDirectory $assembly
