@@ -707,6 +707,20 @@ public static class ESearchDesktop {
         [ESearchDesktop]::SelectLanguage($handle,$Language)
         Wait-Desktop { ([ESearchDesktop]::Profile($handle).ToInt64() -band 65535) -eq $Language } "无法切换浮窗输入语言 $Language"
     }
+    function Get-ImeLabel([string]$Language) {
+        # LANGID 不能标识厂商。只在该语言恰好启用一个 TIP 时按注册信息报告供应商。
+        $languages=Get-WinUserLanguageList
+        $tips=@(foreach ($row in $languages) {
+            foreach ($tip in $row.InputMethodTips) {
+                if ($tip.StartsWith($Language + ':')) { $tip }
+            }
+        })
+        if ($tips.Count -ne 1 -or $tips[0] -notmatch '(\{[^}]+\})(\{[^}]+\})$') { return "LANGID $Language（供应商未确定）" }
+        $profileKey="HKLM:\SOFTWARE\Microsoft\CTF\TIP\$($Matches[1])\LanguageProfile\0x0000$Language\$($Matches[2])"
+        $name=(Get-ItemProperty -LiteralPath $profileKey -Name Description -ErrorAction SilentlyContinue).Description
+        if (!$name) { return $tips[0] }
+        return "$name [$($tips[0])]"
+    }
     function Type-Latin([string]$Letters) {
         foreach ($letter in $Letters.ToUpperInvariant().ToCharArray()) {
             [ESearchDesktop]::Press($handle, [int]$letter)
@@ -755,6 +769,19 @@ public static class ESearchDesktop {
         if ((Control StatusText).Current.Name -match '占用') { Write-Warning 'Alt+Space 已占用，重新唤起验收可能需要关闭冲突程序' }
         if ($Settings) { Test-SettingsPage -Restarted:$Restarted; return }
         if ($Files) { Test-FileSearch; return }
+        if ($Scenario -eq 'RestartEngine') {
+            foreach ($round in 1..2) {
+                $value.SetValue('')
+                $value.SetValue('taberu')
+                Wait-Desktop { (SelectedPath) -like '*taberu*' } "第 $round 次冷启动未返回文件" 40000
+                $owned = @(Get-Process -Name Everything -ErrorAction Stop | Where-Object Path -eq $fixture)
+                if ($owned.Count -ne 1) { throw '无法确认唯一的验收引擎' }
+                Write-Output "PASS WPF PID $($appProcess.Id)，第 $round 次冷启动 Everything PID $($owned[0].Id)，浮窗收到 $(@(FileRows).Count) 个文件"
+                $owned[0].Kill()
+                $owned[0].WaitForExit()
+            }
+            return
+        }
         if ($Scenario -eq 'ColdEdit') {
             $null=Get-EnginePaths '冷启动'
             if ([ESearchEngineProbe]::Everything_GetMajorVersion() -ne 0) { throw 'Everything 已启动，不能验证冷启动期间编辑' }
@@ -833,6 +860,8 @@ public static class ESearchDesktop {
             Summon-Fixture
         }
         $value.SetValue('')
+        $jpIme=Get-ImeLabel '0411'; $cnIme=Get-ImeLabel '0804'
+        Write-Output "当前 Windows 用户启用的输入法：日语 $jpIme；中文 $cnIme"
         Set-Language 0x0411
         [ESearchDesktop]::Press($handle,0xf2) # VK_DBE_HIRAGANA
         Type-Latin 'taberu'
@@ -856,10 +885,10 @@ public static class ESearchDesktop {
             $phonetic=QueryValue
             [ESearchDesktop]::Press($handle,32)
             Start-Sleep -Milliseconds 200
-            Write-Output "微软拼音第 $attempt 次：按键后「$phonetic」，空格后「$(QueryValue)」"
+            Write-Output "中文拼音第 $attempt 次：按键后「$phonetic」，空格后「$(QueryValue)」"
             if ((QueryValue) -eq '你好') { break }
         }
-        if ((QueryValue) -ne '你好') { throw "微软拼音未产生实际中文候选，实际「$(QueryValue)」" }
+        if ((QueryValue) -ne '你好') { throw "中文拼音未产生实际中文候选，实际「$(QueryValue)」" }
         if ($Scenario -eq 'Keyboard') {
             Open-ImeResult '你好'
             Set-Language 0x0804
@@ -870,7 +899,7 @@ public static class ESearchDesktop {
         Type-Latin 'nihao'
         [ESearchDesktop]::Press($handle,13)
         Wait-Desktop { (QueryValue) -in @('你好','nihao') -and [ESearchDesktop]::GetForegroundWindow() -eq $handle } '中文回车未保留文本和浮窗'
-        Write-Output "PASS 微软拼音 nihao → Space 你好，重新组词 Enter 提交「$(QueryValue)」，浮窗保持打开"
+        Write-Output "PASS 中文拼音 nihao → Space 你好，重新组词 Enter 提交「$(QueryValue)」，浮窗保持打开"
         if ($Scenario -eq 'Keyboard') {
             Open-ImeResult (QueryValue)
             Set-Language 0x0804
@@ -882,7 +911,7 @@ public static class ESearchDesktop {
             [ESearchDesktop]::Press($handle,13)
             Wait-Desktop { (QueryValue) -and [ESearchDesktop]::GetForegroundWindow() -eq $handle } '中文候选导航后 Enter 未保留浮窗'
             $navigated=QueryValue
-            Write-Output "微软拼音 nihao → ↓ 候选导航 → Enter，浮窗提交「$navigated」"
+            Write-Output "中文拼音 nihao → ↓ 候选导航 → Enter，浮窗提交「$navigated」"
             if ($imeFiles.ContainsKey($navigated)) { Open-ImeResult $navigated }
             [ESearchDesktop]::ActivateFixture($form.Handle)
             [void]$box.Focus()
@@ -901,7 +930,7 @@ public static class ESearchDesktop {
                     if ($navigate) { [ESearchDesktop]::Press($form.Handle,40); [Windows.Forms.Application]::DoEvents() }
                     [ESearchDesktop]::Press($form.Handle,13)
                     Wait-Desktop { $box.Text.Length -gt 0 } '原生输入框未提交文字'
-                    Write-Output "原生 Win32 文本框微软拼音 nihao，↓=$navigate，Enter 提交「$($box.Text)」"
+                    Write-Output "原生 Win32 文本框中文拼音 nihao，↓=$navigate，Enter 提交「$($box.Text)」"
                 }
             } finally {
                 [ESearchDesktop]::SelectLanguage($form.Handle,$previousLayout)
@@ -1129,29 +1158,12 @@ if ($RestartEngine) {
     $fixture = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '.tools/everything/fixture/Everything.exe')).Path
     if (Get-Process -Name Everything -ErrorAction SilentlyContinue) { throw '已有 Everything 实例，跳过双冷启动测试' }
     if (!$GuiExecutable) { throw '双冷启动测试需要 -GuiExecutable' }
-    $assemblyDir = Split-Path (Resolve-Path -LiteralPath $GuiExecutable).Path
-    $oldBase = [AppContext]::BaseDirectory
     $oldEngine = $env:E_SEARCH_EVERYTHING_EXE
     try {
-        [AppContext]::SetData('APP_CONTEXT_BASE_DIRECTORY', $assemblyDir)
         $env:E_SEARCH_EVERYTHING_EXE = $fixture
-        $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $assemblyDir 'E_Search.dll'))
-        $engineType = $assembly.GetType('ESearch.EverythingSearch', $true)
-        $engine = [Activator]::CreateInstance($engineType, $true)
-        $search = $engineType.GetMethod('SearchAsync', [Reflection.BindingFlags]'Instance,NonPublic')
-        $parameters = @('taberu', [Action[string]][Console]::WriteLine, [Threading.CancellationToken]::None)
-        foreach ($round in 1..2) {
-            $task = $search.Invoke($engine, $parameters)
-            $hits = $task.GetAwaiter().GetResult()
-            if (!($hits | Where-Object Name -like '*taberu*')) { throw '独立 Everything 索引未返回预置的 taberu 文件' }
-            $owned = @(Get-Process -Name Everything -ErrorAction Stop | Where-Object Path -eq $fixture)
-            if ($owned.Count -ne 1) { throw '无法区分项目验收实例' }
-            Write-Output "PASS 第 $round 次冷启动，真实 Everything PID $($owned[0].Id) 返回 $($hits.Count) 个匹配文件"
-            $owned[0].Kill()
-            $owned[0].WaitForExit()
-        }
+        $database = if ($RealDatabase) { $RealDatabase } else { Join-Path $scratch 'test.db' }
+        Test-Desktop $database -Scenario RestartEngine
     } finally {
         $env:E_SEARCH_EVERYTHING_EXE = $oldEngine
-        [AppContext]::SetData('APP_CONTEXT_BASE_DIRECTORY', $oldBase)
     }
 }
