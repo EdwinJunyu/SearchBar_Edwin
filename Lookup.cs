@@ -103,10 +103,16 @@ public static partial class Lookup
         }
         var direct = Lemmas(inflected).Distinct(StringComparer.Ordinal).ToArray();
         foreach (var lemma in direct) CollectJapanese(lemma, 2);
-        // エ段＋る也可能本来就是一段动词（食べる）。已有常规命中时不按此弱证据另猜五段原形。
-        bool guessPotential = !hits.Values.Any(x => IsJapanese(x.Hit.Entry));
-        foreach (var lemma in AuxiliaryLemmas(inflected, direct, guessPotential).Except(direct, StringComparer.Ordinal))
-            CollectJapanese(lemma, 3);
+        // エ段＋る也可能本来就是一段动词。食べちゃった还原到已收录的食べる时，无须再猜食ぶ。
+        var tried = direct.ToHashSet(StringComparer.Ordinal);
+        void CollectAuxiliaries(bool guessPotential)
+        {
+            foreach (var lemma in AuxiliaryLemmas(inflected, direct, guessPotential))
+                if (tried.Add(lemma)) CollectJapanese(lemma, 3);
+        }
+        CollectAuxiliaries(false);
+        if (inflected.Any(c => c is >= 'ぁ' and <= 'ゖ') && !hits.Values.Any(x => IsJapanese(x.Hit.Entry)))
+            CollectAuxiliaries(true);
         // 有些可能动词也独立收录，如「読める＝能念」。只有外层活用、词典释义和同书原形三者
         // 同时支持时才添加更深一层，避免把日常的「食べました」解释为古语「食ぶ」。
         if (direct.Length > 0 && inflected.Any(c => c is >= '一' and <= '鿿')
@@ -697,18 +703,29 @@ public static partial class Lookup
                 || form.EndsWith("ことが出来る", StringComparison.Ordinal))
                 && "うくぐすつぬぶむる".Contains(form[^(constructionLength + 1)]))
                 yield return form[..^constructionLength];
-            int auxiliaryLength = form.EndsWith("いる", StringComparison.Ordinal) ? 2 :
-                form.EndsWith("しまう", StringComparison.Ordinal) ? 3 :
-                form.EndsWith("おく", StringComparison.Ordinal) ? 2 : 0;
-            if (auxiliaryLength == 0 || form.Length <= auxiliaryLength + 1) continue;
-            int end = form.Length - auxiliaryLength;
-            if (form[end - 1] is not ('て' or 'で')) continue;
-            foreach (var plain in Lemmas(form[..end]))
+            if (AuxiliaryTeForm(form) is not { } teForm) continue;
+            foreach (var plain in Lemmas(teForm))
             {
                 yield return plain;
                 foreach (var root in VoiceRoots(plain, guessPotential)) yield return root;
             }
         }
+    }
+
+    private static string? AuxiliaryTeForm(string form)
+    {
+        // 外层时态已还原：読んじゃった → 読んじゃう → 読んで，書いといた → 書いとく → 書いて。
+        // 清浊音保留给原有的て形规则，区分「書いて」与「泳いで」。
+        if (form.Length > 3 && form.EndsWith("ちゃう", StringComparison.Ordinal)) return form[..^3] + "て";
+        if (form.Length > 3 && form.EndsWith("じゃう", StringComparison.Ordinal)) return form[..^3] + "で";
+        if (form.Length > 2 && form.EndsWith("とく", StringComparison.Ordinal)) return form[..^2] + "て";
+        if (form.Length > 2 && form.EndsWith("どく", StringComparison.Ordinal)) return form[..^2] + "で";
+
+        int auxiliaryLength = form.EndsWith("いる", StringComparison.Ordinal) ? 2 :
+            form.EndsWith("しまう", StringComparison.Ordinal) ? 3 :
+            form.EndsWith("おく", StringComparison.Ordinal) ? 2 : 0;
+        int end = form.Length - auxiliaryLength;
+        return auxiliaryLength != 0 && end > 1 && form[end - 1] is ('て' or 'で') ? form[..end] : null;
     }
 
     private static IEnumerable<string> VoiceRoots(string form, bool guessPotential)

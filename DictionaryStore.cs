@@ -276,10 +276,12 @@ internal sealed class DictionaryStore : IDisposable
         index.Parameters.Add("$ord", SqliteType.Integer);
         index.Parameters.Add("$kind", SqliteType.Integer);
         index.Parameters.Add("$term", SqliteType.Text);
+        // 一条记录的原始词头、展示词头与别名共用词头索引，读音单独写入另一种索引。
+        var headwordKeys = new HashSet<string>(StringComparer.Ordinal);
         void AddTerm(string term, bool reading)
         {
             var key = reading ? Lookup.NormalizeReading(term) : Lookup.Normalize(term);
-            if (key.Length == 0) return;
+            if (key.Length == 0 || (!reading && !headwordKeys.Add(key))) return;
             index.Parameters["$kind"].Value = reading ? 1 : 0;
             index.Parameters["$term"].Value = key;
             index.ExecuteNonQuery();
@@ -300,6 +302,7 @@ internal sealed class DictionaryStore : IDisposable
             entry.Parameters["$link"].Value = p.LinkTarget is null ? DBNull.Value : Lookup.Normalize(p.LinkTarget);
             entry.ExecuteNonQuery();
             index.Parameters["$ord"].Value = ord;
+            headwordKeys.Clear();
             AddTerm(key, false);
             AddTerm(p.Headword, false);
             foreach (var alias in p.Aliases) AddTerm(alias, false);

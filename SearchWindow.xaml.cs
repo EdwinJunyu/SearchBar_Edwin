@@ -2,9 +2,11 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.IO.Pipes;
 using System.Net;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -42,7 +44,9 @@ public partial class SearchWindow : Window
     private long revision, detailRevision;
     private long fileRevision = -1;
     private long fileActionRevision;
+    private bool navigatingFiles;
     private CancellationTokenSource? pending;
+    private CancellationTokenSource? pendingPreview;
 
     public SearchWindow(string databasePath, string? dictionaryId = null)
     {
@@ -58,6 +62,8 @@ public partial class SearchWindow : Window
         };
 
         QueryBox.TextChanged += (_, _) => RefreshInput();
+        QueryBox.PreviewMouseDown += (_, _) => navigatingFiles = false;
+        QueryBox.GotKeyboardFocus += (_, _) => navigatingFiles = false;
         SettingsButton.Click += (_, _) => OpenSettings();
         ClearButton.Click += (_, _) => { QueryBox.Clear(); QueryBox.Focus(); };
         DetailsButton.Click += (_, _) => ToggleDetails();
@@ -65,6 +71,7 @@ public partial class SearchWindow : Window
         SetReadingPreferenceButton.Click += async (_, _) => await ChangeReadingPreferenceAsync(clear: false);
         ClearReadingPreferenceButton.Click += async (_, _) => await ChangeReadingPreferenceAsync(clear: true);
         CandidatePicker.SelectionChanged += (_, _) => { if (DetailsPanel.IsVisible) _ = ShowEntryAsync(); };
+        FileList.SelectionChanged += (_, _) => pendingPreview?.Cancel();
         SizeChanged += (_, e) =>
         {
             if (IsVisible && e.HeightChanged && e.NewSize.Height > e.PreviousSize.Height)
@@ -394,6 +401,9 @@ public partial class SearchWindow : Window
 
     private void HandleKey(object sender, System.Windows.Input.KeyEventArgs e)
     {
+        // ↑/↓ 选文件时焦点留在输入框。开始编辑或移动光标后，空格重新交给输入框。
+        if (QueryBox.IsKeyboardFocused && e.Key is not (Key.Space or Key.Up or Key.Down))
+            navigatingFiles = false;
         // IME 自己消费确认、翻页和取消键。文件打开只接受当前查询的独立一次按键。
         if (composing || e.Key == Key.ImeProcessed) return;
         if (CandidatePicker.IsDropDownOpen) return;
@@ -439,6 +449,14 @@ public partial class SearchWindow : Window
                     ActivateFile(focused?.DataContext as FileHit ?? FileList.SelectedItem as FileHit,
                         Keyboard.Modifiers == ModifierKeys.Shift ? FileAction.Reveal : FileAction.Open);
             }
+            else if (e.Key == Key.Space && Keyboard.Modifiers == ModifierKeys.None
+                && (navigatingFiles || FileList.IsKeyboardFocusWithin)
+                && Keyboard.FocusedElement is not System.Windows.Controls.Button
+                && fileRevision == revision && FileList.SelectedItem is FileHit selected)
+            {
+                e.Handled = true;
+                if (!e.IsRepeat) ActivateFile(selected, FileAction.Preview);
+            }
             else if (Keyboard.Modifiers == ModifierKeys.None && e.Key is Key.Up or Key.Down
                 && fileRevision == revision && FileList.Items.Count > 0)
             {
@@ -446,12 +464,13 @@ public partial class SearchWindow : Window
                 FileList.SelectedIndex = Math.Clamp(FileList.SelectedIndex + delta, 0, FileList.Items.Count - 1);
                 FileList.ScrollIntoView(FileList.SelectedItem);
                 QueryBox.Focus();
+                navigatingFiles = true;
                 e.Handled = true;
             }
         }
     }
 
-    private enum FileAction { Open, Reveal }
+    private enum FileAction { Open, Reveal, Preview }
 
     private void OpenFileClicked(object sender, RoutedEventArgs e) =>
         ActivateFile(((FrameworkElement)sender).DataContext as FileHit, FileAction.Open);
@@ -459,16 +478,77 @@ public partial class SearchWindow : Window
     private void RevealFileClicked(object sender, RoutedEventArgs e) =>
         ActivateFile(((FrameworkElement)sender).DataContext as FileHit, FileAction.Reveal);
 
+    private void PreviewFileClicked(object sender, RoutedEventArgs e) =>
+        ActivateFile(((FrameworkElement)sender).DataContext as FileHit, FileAction.Preview);
+
     private void ActivateFile(FileHit? file, FileAction action)
     {
         // 鼠标按钮携带被点击行的数据。输入改变或窗口隐藏后，旧行不能再启动 Shell。
         if (file == null || !IsVisible || composing || fileRevision != revision || !FileList.Items.Contains(file)) return;
         FileList.SelectedItem = file;
-        OpenWithShell(file.FullPath, action);
+        if (action == FileAction.Preview) _ = PreviewFileAsync(file.FullPath);
+        else OpenWithShell(file.FullPath, action);
+    }
+
+    private async Task PreviewFileAsync(string path)
+    {
+        pendingPreview?.Cancel();
+        using var request = new CancellationTokenSource();
+        pendingPreview = request;
+        fileActionRevision++;
+        QueryBox.Focus();
+        navigatingFiles = true;
+        try
+        {
+            // Everything 的路径也可能在网络盘；检查文件和等待管道均不能阻塞输入。
+            if (!await Task.Run(() => File.Exists(path), request.Token)) throw new FileNotFoundException("文件已移动、已删除或无法访问。");
+            request.Token.ThrowIfCancellationRequested();
+            using var identity = WindowsIdentity.GetCurrent();
+            string pipeName = "QuickLook.App.Pipe." + identity.User!.Value;
+            await SendQuickLookPreviewAsync(pipeName, path, request.Token);
+            if (request.IsCancellationRequested) return;
+            Topmost = false;
+            ShowFileCount(FileList.Items.Count);
+        }
+        catch (OperationCanceledException) when (request.IsCancellationRequested) { }
+        catch (TimeoutException)
+        {
+            if (!request.IsCancellationRequested)
+                SetFileStatus("未能连接 QuickLook。请确认已安装并启动 QuickLook，再点击“预览”或用 ↑/↓ 选中文件后按空格。");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            if (!request.IsCancellationRequested) SetFileStatus($"无法预览「{path}」：{ex.Message}");
+        }
+        finally
+        {
+            if (ReferenceEquals(pendingPreview, request)) pendingPreview = null;
+        }
+    }
+
+    internal static async Task SendQuickLookPreviewAsync(string pipeName, string path, CancellationToken token)
+    {
+        // QuickLook 按用户 SID 监听；两段 UTF-8 文本加换行，同时兼容旧版和带可选第三段的新版。
+        using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.Out, PipeOptions.Asynchronous,
+            TokenImpersonationLevel.Identification);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(1));
+        try
+        {
+            await pipe.ConnectAsync(timeout.Token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            byte[] message = Encoding.UTF8.GetBytes($"QuickLook.App.PipeMessages.Toggle|{path}\n");
+            await pipe.WriteAsync(message, timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            throw new TimeoutException("QuickLook 未在时限内响应。");
+        }
     }
 
     private void OpenWithShell(string target, FileAction? fileAction = null, bool openChatGpt = false)
     {
+        pendingPreview?.Cancel();
         long request = ++fileActionRevision;
         try
         {
@@ -590,8 +670,10 @@ public partial class SearchWindow : Window
 
     private void RefreshInput()
     {
+        navigatingFiles = false;
         revision++;
         fileActionRevision++; // 编辑或收起搜索后，旧的 Explorer 定位不再补选。
+        pendingPreview?.Cancel();
         debounce.Stop();
         pending?.Cancel();
         // 同步撤销旧选择；即使用户在 debounce 或原生查询期间按回车，也不会打开上一项。
@@ -1083,6 +1165,7 @@ public partial class SearchWindow : Window
         ReleasePendingHotkey();
         revision++;
         detailRevision++;
+        pendingPreview?.Cancel();
         debounce.Stop();
         pending?.Cancel();
         if (registered) UnregisterHotKey(hwnd, hotkeyId);

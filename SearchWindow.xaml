@@ -216,8 +216,9 @@
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
-                                    <!-- 两个按钮各自接收点击，按此行绑定的完整路径操作，避免同名项互相干扰。 -->
+                                    <!-- 各操作使用本行的完整路径，避免同名文件互相干扰。 -->
                                     <Button AutomationProperties.AutomationId="OpenFileButton"
                                             AutomationProperties.Name="{Binding FullPath, StringFormat='打开 {0}'}"
                                             ToolTip="{Binding FullPath}" Click="OpenFileClicked" Cursor="Hand">
@@ -245,7 +246,11 @@
                                                        FlowDirection="LeftToRight" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
                                         </Grid>
                                     </Button>
-                                    <Button Grid.Column="1" AutomationProperties.AutomationId="RevealFileButton"
+                                    <Button Grid.Column="1" AutomationProperties.AutomationId="PreviewFileButton"
+                                            AutomationProperties.Name="{Binding FullPath, StringFormat='用 QuickLook 预览 {0}'}"
+                                            Style="{StaticResource IconButton}" Content="预览" Width="48" Height="32" Margin="0,1,4,1"
+                                            ToolTip="用 QuickLook 预览（↑/↓ 选中文件后按空格）" Click="PreviewFileClicked" Cursor="Hand"/>
+                                    <Button Grid.Column="2" AutomationProperties.AutomationId="RevealFileButton"
                                             AutomationProperties.Name="{Binding FullPath, StringFormat='在资源管理器中定位 {0}'}"
                                             Style="{StaticResource IconButton}" Content="定位" Width="48" Height="32" Margin="0,1,4,1"
                                             ToolTip="在资源管理器中选中文件 (Shift+Enter)" Click="RevealFileClicked" Cursor="Hand"/>

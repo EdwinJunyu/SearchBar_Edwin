@@ -158,7 +158,8 @@ if ($PackageSeed -or $VerifyReleaseZip) {
                 $member = [IO.Path]::GetRelativePath($stage,$file).Replace('\','/')
                 [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,$member,[IO.Compression.CompressionLevel]::Fastest)
             }
-            $entry = $zip.CreateEntry('E_Search-win-x64/Data/dictionaries.db',[IO.Compression.CompressionLevel]::Fastest)
+            # 词库占包体的大部分，对这一项使用 Optimal 以减小下载体积。
+            $entry = $zip.CreateEntry('E_Search-win-x64/Data/dictionaries.db',[IO.Compression.CompressionLevel]::Optimal)
             $stream = $entry.Open()
             try { $source.CopyTo($stream) } finally { $stream.Dispose() }
         } finally { $zip.Dispose() }
@@ -727,7 +728,7 @@ function Test-FileResultActions([int]$Hotkey = 130) {
     }
     Confirm-SearchSession
     Write-Output 'PASS 从资源管理器按热键回到同一搜索，Shift+Enter 再次定位，关闭测试视图后保留查询、列表和选中行'
-    # 文件移到本轮暂存目录，保留搜索时的旧行，验证两个失败操作都不会隐藏浮窗。
+    # 文件移到本轮暂存目录，保留搜索时的旧行，验证各个失败操作都不会隐藏浮窗。
     $moved=[IO.Directory]::CreateDirectory((Join-Path $fixtureRoot '已移走'))
     [IO.File]::Move($target,(Join-Path $moved.FullName $name))
     function Confirm-MissingAction([string]$InputAction,[string]$Expected) {
@@ -754,6 +755,27 @@ function Test-FileResultActions([int]$Hotkey = 130) {
     [ESearchDesktop]::Press($handle,16,13)
     Confirm-MissingAction 'Shift+Enter' '无法定位'
     Write-Output 'PASS 文件移走后，点击、Enter 和 Shift+Enter 均保留浮窗并提示对应操作和完整路径'
+    # 选回已经移走的样本：能检查真实预览入口与所选路径，又不会打开本机的 QuickLook。
+    [ESearchDesktop]::Press($handle,38)
+    Wait-Desktop { (SelectedPath) -cne $target -and (SelectedPath) } '上键未选中第一项'
+    [ESearchDesktop]::Press($handle,40)
+    Wait-Desktop { (SelectedPath) -ceq $target } '下键未选回预览样本'
+    [ESearchDesktop]::Press($handle,32)
+    Confirm-MissingAction '选中文件后按空格' '无法预览'
+    Assert-Equal (QueryValue) $name '预览空格保留原查询'
+
+    $value.SetValue($tag)
+    Wait-Desktop { $null -ne (SelectedPath) } '编辑后等待本次文件自动选中'
+    [ESearchDesktop]::Press($handle,32)
+    Wait-Desktop {
+        $text=QueryValue
+        $text.Length -eq $tag.Length + 1 -and $text.Replace(' ','') -ceq $tag
+    } '重新编辑后，默认选中文件时仍可输入空格'
+    $value.SetValue('ai')
+    [ESearchDesktop]::Press($handle,35) # End 将光标移到前缀末尾。
+    [ESearchDesktop]::Press($handle,32)
+    Wait-Desktop { (QueryValue) -ceq 'ai ' -and (Control StatusText).Current.Name -like '*ChatGPT*' } '空格未进入 AI 输入模式'
+    Write-Output 'PASS 方向键选文件后空格预览，编辑查询后空格输入文本，ai 加空格进入提问模式'
 }
 function Test-FileSearch {
     $tag = 'ESearchQA' + [Guid]::NewGuid().ToString('N').Substring(0,10)
@@ -1357,7 +1379,16 @@ function Test-AdditionalDictionaries([string]$Scratch, [Reflection.Assembly]$Ass
     $sources = $Assembly.GetType('Source',$true).GetField('All').GetValue($null)
     $database = [IO.Path]::Combine($Scratch,'additional-dictionaries.db')
     $store = $Assembly.GetType('DictionaryStore',$true).GetConstructor([type[]]@([string],[bool])).Invoke(@($database,$false))
+    $connection = $store.GetType().GetField('db',[Reflection.BindingFlags]'Instance,NonPublic').GetValue($store)
+    $probe = $connection.CreateCommand()
     try {
+        # BEFORE INSERT 能区分导入层已去重与 INSERT OR IGNORE 在数据库里吞掉重复写入。
+        $probe.CommandText = @'
+CREATE TEMP TRIGGER IF NOT EXISTS reject_duplicate_term BEFORE INSERT ON main.terms
+WHEN EXISTS (SELECT 1 FROM terms WHERE dict=NEW.dict AND ordinal=NEW.ordinal AND kind=NEW.kind AND term=NEW.term)
+BEGIN SELECT RAISE(ABORT,'重复写入同一条记录的检索键'); END
+'@
+        [void]$probe.ExecuteNonQuery()
         # 模拟设置页先按原始文件名选语言，再从文件导入，不向导入器指定内置 ID。
         foreach ($id in $samples.Keys) {
             $name = $basenames[$id]
@@ -1398,7 +1429,9 @@ function Test-AdditionalDictionaries([string]$Scratch, [Reflection.Assembly]$Ass
         Assert-Equal ($booking.Gloss -like '予約する*' -and $booking.Gloss -notlike '*外来診察*') $true '小学馆中日显示动词译义'
         Assert-Equal $store.Search('光合作用','shogakukan-zhja',$token)[0].Entry.Gloss '光合成' '小学馆中日从领域标签之后取专业译义'
         Assert-Equal $store.Search('予約','shogakukan',$token)[0].Entry.Gloss '预约' '同库使用小学馆日汉仍能从日文读音和标题取得中文译义'
-    } finally { $store.Dispose() }
+        $probe.CommandText = "SELECT COUNT(*) FROM terms WHERE dict='shogakukan' AND ordinal=1 AND term='よやく'"
+        Assert-Equal $probe.ExecuteScalar() 2 '相同文本仍分别建立词头和读音索引'
+    } finally { $probe.Dispose(); $store.Dispose() }
     Write-Output 'PASS 四本新增辞书的文件识别、日语读音、中日和日中译义、英文专业短语'
 }
 
@@ -2020,12 +2053,17 @@ function Test-JapaneseAuxiliaries([string]$Scratch) {
             '読める' = 'よめる<br>【読める】<br>能读'; '食ぶ' = 'たぶ<br>【食ぶ】<br>古语'
             '話す' = 'はなす<br>【話す】<br>说'; '話される' = 'はなされる<br>【話される】<br>被说'
             '話されました' = 'はなされました<br>【話されました】<br>原词记录'
+            '話しといた' = 'はなしといた<br>【話しといた】<br>口语原词记录'
         })
         Invoke-Search @('import','shogakukan',$mdx) | Out-Null
         foreach ($pair in @(@('食べられませんでした','食べる'), @('読んでいます','読む'), @('読んでいなかった','読む'),
                              @('書かれました','書く'), @('書かせた','書く'),
                              @('読ませられていました','読む'), @('勉強させなかった','勉強する'), @('来られました','来る'),
-                             @('ヨンデイマス','読む'), @('読んでしまった','読む'), @('勉強することができません','勉強する'), @('読むことが出来ました','読む'))) {
+                             @('ヨンデイマス','読む'), @('読んでしまった','読む'), @('書いておいた','書く'),
+                             @('読んじゃった','読む'), @('食べちゃわない','食べる'), @('ヨンジャイマシタ','読む'),
+                             @('書いといた','書く'), @('読んどく','読む'), @('読んどいて','読む'),
+                             @('書けちゃった','書く'),
+                             @('勉強することができません','勉強する'), @('読むことが出来ました','読む'))) {
             $lines = @(Invoke-Search @('query',$pair[0],'shogakukan'))
             Assert-Equal $lines.Count 1 "多步还原只列出词典收录的原形 $($pair[0])"
             $parts = $lines[0] -split "`t"
@@ -2039,10 +2077,15 @@ function Test-JapaneseAuxiliaries([string]$Scratch) {
         }
         $ranked = @(Invoke-Search @('query','話されました','shogakukan') | ForEach-Object { ($_ -split "`t")[2] })
         Assert-Equal ($ranked -join '|') '話されました|話される|話す' '精确词头、一步还原、多步还原顺序稳定'
+        $contracted = @(Invoke-Search @('query','話しといた','shogakukan') | ForEach-Object { ($_ -split "`t")[1] })
+        Assert-Equal ($contracted -join '|') 'headword|deinflection' '已收录的口语写法优先于还原结果'
+        Assert-Equal @(Invoke-Search @('query','書いじゃった','shogakukan')).Count 0 '清浊音不符时不还原成書く'
         $ambiguous = @(Invoke-Search @('query','きられません','shogakukan'))
         Assert-Equal $ambiguous.Count 2 '相同读音的两个已收录原形均保留'
         $sentence = @(Invoke-Search @('query','本を読んでいませんでした。','shogakukan'))
         Assert-Equal (($sentence[0] -split "`t")[2]) '読んでいませんでした' '句中完整活用片段优先于较短的て形'
+        $spoken = @(Invoke-Search @('query','本を読んじゃった。','shogakukan'))
+        Assert-Equal ($spoken[0].Contains('読んじゃった → 読む')) $true '句中还原完整口语片段并保留原文'
         $plainSentence = @(Invoke-Search @('query','ご飯を食べました。','shogakukan'))
         Assert-Equal $plainSentence.Count 1 '句内已有普通一段动词时不追加弱推测的古语'
         Assert-Equal ($plainSentence[0].Contains('食べる')) $true '句内保持正常的一步还原'
@@ -3125,6 +3168,34 @@ INSERT INTO terms SELECT dict,ordinal,0,head FROM entries;
     Write-Output 'PASS 执行中取消词典查询，同一连接可继续检索'
 }
 
+function Test-QuickLookPipe([Reflection.Assembly]$Assembly) {
+    $send = $Assembly.GetType('ESearch.SearchWindow',$true).GetMethod(
+        'SendQuickLookPreviewAsync',[Reflection.BindingFlags]'Static,NonPublic')
+    # 在专用管道接收与 QuickLook 相同的消息，不干扰桌面用户正在查看的文件。
+    $pipeName = 'ESearch-QuickLook-' + [guid]::NewGuid().ToString('N')
+    $server = [IO.Pipes.NamedPipeServerStream]::new($pipeName,'In',1,'Byte','Asynchronous')
+    $path = [IO.Path]::Combine($PSScriptRoot,'預覽 样本,かな.txt')
+    $token = [Threading.CancellationToken]::None
+    try {
+        $connected = $server.WaitForConnectionAsync()
+        $task = $send.Invoke($null,@($pipeName,$path,$token))
+        [void]$connected.WaitAsync([TimeSpan]::FromSeconds(4)).GetAwaiter().GetResult()
+        $bytes = [IO.MemoryStream]::new()
+        try {
+            $read = $server.CopyToAsync($bytes)
+            [void]$task.GetAwaiter().GetResult()
+            [void]$read.WaitAsync([TimeSpan]::FromSeconds(4)).GetAwaiter().GetResult()
+            Assert-Equal ([Text.Encoding]::UTF8.GetString($bytes.ToArray())) ("QuickLook.App.PipeMessages.Toggle|$path" + [char]10) 'QuickLook 完整路径、编码和消息换行'
+        } finally { $bytes.Dispose() }
+    } finally { $server.Dispose() }
+    # 关闭接收端后再次请求，验证未安装或未运行时，界面能收到可处理的超时。
+    $task = $send.Invoke($null,@($pipeName,$path,$token))
+    try { $task.WaitAsync([TimeSpan]::FromSeconds(4)).GetAwaiter().GetResult() }
+    catch { if (!$task.IsFaulted -or $task.Exception.GetBaseException() -isnot [TimeoutException]) { throw } }
+    Assert-Equal $task.IsFaulted $true 'QuickLook 离线时在限时内返回'
+    Write-Output 'PASS QuickLook UTF-8 预览协议和离线超时'
+}
+
 function Test-EngineProbeBinding {
     # 为三个目标生成实际探针并检查编译后的导入表；当前架构另外执行一次本地 SDK 调用。
     foreach ($arch in 'X86','X64','Arm64') {
@@ -3200,6 +3271,7 @@ if ($BackendTestDirectory) {
     Test-CliAccess $BackendTestDirectory
     Test-ReleaseDataLocation
     Test-RunningCancellation $assembly
+    Test-QuickLookPipe $assembly
     Test-EngineProbeBinding
     if ($PrepareDesktop) { Initialize-DesktopDatabases $BackendTestDirectory $assembly $RealDatabase }
     return
