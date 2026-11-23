@@ -1373,7 +1373,7 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
     $env:E_SEARCH_DB = Join-Path $Scratch 'spelling.db'
     try {
         $en = Join-Path $Scratch 'spelling.mdx'
-        Write-Mdx $en ([ordered]@{receive='收到'; study='学习'; book='书'; boot='靴'; boom='繁荣'; boon='益处'})
+        Write-Mdx $en ([ordered]@{receive='收到'; study='学习'; book='书'; boot='靴'; boom='繁荣'; boon='益处'; 'ai study'='同名词条'; '6*7'='同名算式'})
         Invoke-Search @('import','oxford',$en) | Out-Null
         foreach ($typo in 'recieve','receiv','receivee','receivx') {
             Assert-Equal (Invoke-Search @('query',$typo)) "oxford:1`tspelling`treceive`treceive · 收到" "拼写建议 $typo"
@@ -1384,6 +1384,80 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
         Assert-Equal (Invoke-Search @('query','receive')) "oxford:1`theadword`treceive`t收到" '正确拼写继续正常查词'
         Assert-Equal (Invoke-Search @('query','studies')) "oxford:2`tdeinflection`tstudy`tstudy · 学习" '词形还原优先'
         Assert-Equal @(Invoke-Search @('query','recieve','shogakukan')).Count 0 '限定其他词典不会泄漏英语建议'
+        # 让特殊输入在词库中也能精确命中，这样误发的设置刷新会在窗口中留下可检验的释义。
+        foreach ($sentinel in 'ai study','6*7') {
+            Assert-Equal ((Invoke-Search @('query',$sentinel,'oxford')).Split([char]9)[1]) 'headword' "设置刷新探针 $sentinel"
+        }
+        $window = [ESearch.SearchWindow]::new($env:E_SEARCH_DB,'oxford')
+        $oldContext = [Threading.SynchronizationContext]::Current
+        $flags = [Reflection.BindingFlags]'Instance,NonPublic'
+        $type = $window.GetType()
+        $timer = $type.GetField('debounce',$flags).GetValue($window)
+        $refresh = $type.GetMethod('RefreshDictionary',$flags)
+        $query = $window.FindName('QueryBox')
+        $gloss = $window.FindName('GlossText')
+        $choices = $window.FindName('SpellingChoices')
+        $status = $window.FindName('StatusText')
+        function Wait-ModeUi([scriptblock]$Ready) {
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            do {
+                $frame = [Windows.Threading.DispatcherFrame]::new()
+                [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background,[Action]{ $frame.Continue=$false })
+                [Windows.Threading.Dispatcher]::PushFrame($frame)
+                if (& $Ready) { return }
+                Start-Sleep -Milliseconds 10
+            } while ($watch.Elapsed.TotalSeconds -lt 6)
+            throw "等待窗口状态超时：$Ready，当前释义「$($gloss.Text)」，状态「$($status.Text)」"
+        }
+        try {
+            $window.ShowActivated = $false
+            $window.ShowInTaskbar = $false
+            $window.WindowStartupLocation = 'Manual'
+            $window.Left = $window.Top = -32000
+            $window.Topmost = $false
+            $window.Opacity = 0
+            $window.Show()
+            [Threading.SynchronizationContext]::SetSynchronizationContext([Windows.Threading.DispatcherSynchronizationContext]::new($window.Dispatcher))
+            foreach ($inputWord in 'receive','recieve') {
+                $query.Text = $inputWord
+                Assert-Equal $timer.IsEnabled $true "普通输入触发搜索 $inputWord"
+                $timer.Stop() # 只触发真实词典刷新，隔离文件搜索工作进程。
+                $refresh.Invoke($window,$null)
+                $expected = if ($inputWord -eq 'receive') { '收到' } else { '你可能要查' }
+                Wait-ModeUi { $gloss.Text -ceq $expected }
+            }
+            Assert-Equal $choices.Items[0].Entry.Headword 'receive' '离屏窗口给出可选的正确拼写'
+            foreach ($special in '6*7','ai study') {
+                $query.Text = $special
+                if ($special -eq '6*7') {
+                    Wait-ModeUi { $gloss.Text -ceq '= 42' }
+                } else {
+                    Assert-Equal ($status.Text.Contains('ChatGPT')) $true '输入 AI 前缀后立即显示提示'
+                    Assert-Equal $timer.IsEnabled $false 'AI 界面停止本地搜索'
+                }
+                $refresh.Invoke($window,$null)
+                $settle = [Diagnostics.Stopwatch]::StartNew()
+                Wait-ModeUi { $settle.ElapsedMilliseconds -ge 350 }
+                $expected = if ($special -eq '6*7') { '= 42' } else { '' }
+                Assert-Equal $gloss.Text $expected "设置刷新保留当前模式 $special"
+                Assert-Equal $choices.Items.Count 0 "已清除拼写候选 $special"
+                Assert-Equal $window.FindName('DetailsButton').IsVisible $false "无词条详情按钮 $special"
+                Assert-Equal $window.FindName('FilePanel').IsVisible $false "未显示文件面板 $special"
+            }
+            Assert-Equal ($status.Text.Contains('ChatGPT')) $true '设置刷新后保留 AI 提示'
+            $query.Text = 'study'
+            Assert-Equal $timer.IsEnabled $true '退出 AI 后恢复普通搜索'
+            $timer.Stop()
+            $refresh.Invoke($window,$null)
+            Wait-ModeUi { $gloss.Text -ceq '学习' }
+            Assert-Equal $status.Text '' '退出 AI 后清除提示'
+            Assert-Equal $window.FindName('DetailsButton').IsVisible $true '退出 AI 后恢复词条详情'
+            Write-Output 'PASS 同一离屏窗口依次查词、拼写、计算、AI、查词，两种特殊模式均通过设置刷新'
+        } finally {
+            $type.GetField('exiting',$flags).SetValue($window,$true)
+            $window.Close()
+            [Threading.SynchronizationContext]::SetSynchronizationContext($oldContext)
+        }
         $ctor = $Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool]))
         $writer = $ctor.Invoke([object[]]@($env:E_SEARCH_DB,$false))
         try { $writer.SetDictionaryEnabled('oxford',$false) } finally { $writer.Dispose() }
@@ -2565,6 +2639,21 @@ if ($BackendTestDirectory) {
     )
     Assert-Equal (([Lookup]::AdditionalPreviews($hits)) -join '|') '箸（はし） · 筷子|端（はし） · 边缘' '同读音候选合并来源并最多预览三个词头'
     Assert-Equal ([Lookup]::AdditionalPreviews([LookupHit[]]$hits[0..1])).Count 0 '单词头多来源保留单行'
+    # 通过桌面程序集验证真实的命令识别和编码，不在常规回归中启动浏览器。
+    $windowType = $assembly.GetType('ESearch.SearchWindow', $true)
+    $flags = [Reflection.BindingFlags]'Static,NonPublic'
+    $isCommand = $windowType.GetMethod('IsChatGptInput', $flags)
+    $target = $windowType.GetMethod('GetChatGptUrl', $flags)
+    if (!$isCommand -or !$target) { throw '缺少 ai 前缀跳转逻辑' }
+    foreach ($ordinary in 'ai','airport',' ai question') {
+        Assert-Equal ($isCommand.Invoke($null,@($ordinary))) $false "普通查询 $ordinary"
+    }
+    Assert-Equal ($isCommand.Invoke($null,@('ai '))) $true '空提示词仍处于 AI 模式'
+    Assert-Equal ($null -eq $target.Invoke($null,@('ai   '))) $true '空提示词不跳转'
+    $prompt = '解释 C++、a&b、#、%20 和 😊'
+    $url = $target.Invoke($null,@("ai $prompt"))
+    Assert-Equal $url ('https://chatgpt.com/?q=' + [Uri]::EscapeDataString($prompt)) '中文与 URL 特殊字符'
+    Write-Output 'PASS AI 前缀、空提示词与 ChatGPT 链接编码'
     Test-ImportIdentity $BackendTestDirectory $assembly
     Test-EverythingRecovery $BackendTestDirectory $assembly
     Test-SanseidoSummary $BackendTestDirectory $assembly

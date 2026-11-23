@@ -211,7 +211,8 @@ public partial class SearchWindow : Window
         // 设置变动只使词典结果失效；文件选择属于当前输入，可继续使用。
         catalogRevision++;
         ClearDictionaryResults();
-        if (IsVisible && !composing && !string.IsNullOrWhiteSpace(QueryBox.Text) && !ShowCalculation(QueryBox.Text))
+        if (IsVisible && !composing && !string.IsNullOrWhiteSpace(QueryBox.Text)
+            && !IsChatGptInput(QueryBox.Text) && !ShowCalculation(QueryBox.Text))
             _ = SearchDictionaryAsync(QueryBox.Text, revision, CancellationToken.None);
     }
 
@@ -361,6 +362,19 @@ public partial class SearchWindow : Window
         SetWindowPos(hwnd, 0, (int)Math.Round(origin.X), y, 0, 0, 0x0015);
     }
 
+    private const string ChatGptPrefix = "ai ";
+
+    private static bool IsChatGptInput(string text) =>
+        text.StartsWith(ChatGptPrefix, StringComparison.Ordinal);
+
+    private static string? GetChatGptUrl(string text)
+    {
+        if (!IsChatGptInput(text)) return null;
+        string prompt = text[ChatGptPrefix.Length..];
+        // 只编码参数值，保留提示词中的空格、换行和 URL 特殊字符。
+        return string.IsNullOrWhiteSpace(prompt) ? null : "https://chatgpt.com/?q=" + Uri.EscapeDataString(prompt);
+    }
+
     private void HandleKey(object sender, System.Windows.Input.KeyEventArgs e)
     {
         // IME 自己消费确认、翻页和取消键。文件打开只接受当前查询的独立一次按键。
@@ -392,6 +406,14 @@ public partial class SearchWindow : Window
                 var message = ComponentDispatcher.CurrentKeyboardMessage;
                 bool repeated = message.message == 0x0100 && message.wParam == 0x0D
                     ? (message.lParam.ToInt64() & (1L << 30)) != 0 : e.IsRepeat;
+                // AI 提问与打开文件共用回车的长按判定。空问题仍由输入框消费。
+                if (Keyboard.Modifiers == ModifierKeys.None && QueryBox.IsKeyboardFocused && IsChatGptInput(QueryBox.Text))
+                {
+                    e.Handled = true;
+                    if (!repeated && IsVisible && GetChatGptUrl(QueryBox.Text) is string url)
+                        OpenWithShell(url, openChatGpt: true);
+                    return;
+                }
                 var focused = Keyboard.FocusedElement as System.Windows.Controls.Button;
                 // 原生按钮自行响应 Enter 和空格；在定位按钮上按 Enter 也应执行定位。
                 if (!repeated && Keyboard.Modifiers == ModifierKeys.None && focused != null) return;
@@ -428,7 +450,7 @@ public partial class SearchWindow : Window
         OpenWithShell(file.FullPath, action);
     }
 
-    private void OpenWithShell(string target, FileAction? fileAction = null)
+    private void OpenWithShell(string target, FileAction? fileAction = null, bool openChatGpt = false)
     {
         long request = ++fileActionRevision;
         try
@@ -461,10 +483,21 @@ public partial class SearchWindow : Window
                 ShowFileCount(FileList.Items.Count);
                 if (fileAction == FileAction.Reveal) _ = CompleteExplorerSelectionAsync(target, request);
             }
+            else if (openChatGpt)
+            {
+                // 浏览器接手后才清除问题；打开或定位本地文件时保留当前结果与选择。
+                Hide();
+                QueryBox.Clear();
+            }
         }
         catch (Exception ex) when (ex is Win32Exception or IOException or UnauthorizedAccessException
             or InvalidOperationException or COMException or ArgumentException)
         {
+            if (openChatGpt)
+            {
+                SetStatus("无法打开 ChatGPT：" + ex.Message);
+                return;
+            }
             var action = fileAction == FileAction.Reveal ? "定位" : "打开";
             SetFileStatus($"无法{action}「{target}」：{ex.Message}");
             if (fileAction != null && IsActive)
@@ -554,6 +587,12 @@ public partial class SearchWindow : Window
         SetFileStatus("");
         ClearDictionaryResults();
         ClearButton.Visibility = QueryBox.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        // 已取消上一轮文件与词典查询，此模式仅在用户主动按回车时打开浏览器。
+        if (IsChatGptInput(QueryBox.Text))
+        {
+            SetStatus("输入问题，按回车带到 ChatGPT，在网页中发送。");
+            return;
+        }
         SetStatus("");
         if (!composing && IsVisible && !string.IsNullOrWhiteSpace(QueryBox.Text)) debounce.Start();
     }
@@ -562,7 +601,7 @@ public partial class SearchWindow : Window
     {
         long request = revision;
         string text = QueryBox.Text;
-        if (ShowCalculation(text)) return;
+        if (IsChatGptInput(text) || ShowCalculation(text)) return;
         using var cancellation = new CancellationTokenSource();
         pending = cancellation;
         var token = cancellation.Token;
