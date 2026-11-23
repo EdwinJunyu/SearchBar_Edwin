@@ -682,6 +682,42 @@ function Test-OxfordSummary([string]$Scratch, [Reflection.Assembly]$Assembly) {
     } finally { $env:E_SEARCH_DB = $previous }
 }
 
+function Test-EnglishLookup([string]$Scratch, [Reflection.Assembly]$Assembly) {
+    $previous = $env:E_SEARCH_DB
+    $env:E_SEARCH_DB = Join-Path $Scratch 'english-forms.db'
+    try {
+        $en = Join-Path $Scratch 'english-forms.mdx'
+        Write-Mdx $en ([ordered]@{study='学习'; run='跑'; running='跑步'; go='去'; watch='观察'; make='做';
+            the='冠词'; die='死亡'; di='干扰项'; lie='躺'; tie='系'; be='是'; bee='蜜蜂'; buy='买'; use='使用'; us='我们';
+            stop='停止'; walk='走'; hope='希望'; hop='跳'; call='呼叫'; sing='唱'; singe='烧焦'; clas='测试'})
+        Invoke-Search @('import','oxford',$en) | Out-Null
+        $ja = Join-Path $Scratch 'only-japanese.mdx'
+        Write-Mdx $ja ([ordered]@{dance='日语来源'})
+        Invoke-Search @('import','shogakukan',$ja) | Out-Null
+        $ctor = $Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool]))
+        $store = $ctor.Invoke([object[]]@($env:E_SEARCH_DB,$true))
+        try {
+            $all = [System.Management.Automation.Language.NullString]::Value
+            $token = [Threading.CancellationToken]::None
+            foreach ($row in @(@('studies','study'), @('studied','study'), @('went','go'), @('watches','watch'),
+                                @('making','make'), @('stopped','stop'), @('walked','walk'), @('hoping','hope'),
+                                @('hopping','hop'), @('calling','call'), @('singing','sing'), @('died','die'),
+                                @('tied','tie'), @('lied','lie'), @('being','be'), @('bought','buy'), @('uses','use'))) {
+                $hits = $store.Search($row[0],$all,$token)
+                Assert-Equal (($hits | ForEach-Object Term) -join '|') $row[1] "英文词形 $($row[0])"
+                Assert-Equal $hits[0].Method 'deinflection' '命中方式保留词形还原标识'
+            }
+            $hits = $store.Search('RUNNING',$all,$token)
+            Assert-Equal (($hits | ForEach-Object Display) -join '|') '跑步|run · 跑' '精确词头优先，后列还原词头'
+            Assert-Equal (([Lookup]::AdditionalPreviews($hits)) -join '|') 'run · 跑' '还原候选只展示一次词头'
+            foreach ($query in 'dancing','class','ghosting','thing') {
+                Assert-Equal $store.Search($query,$all,$token).Count 0 "无可用英文原形 $query"
+            }
+        } finally { $store.Dispose() }
+        Write-Output 'PASS 英文规则和不规则词形、精确词头优先、语言过滤与原形预览'
+    } finally { $env:E_SEARCH_DB = $previous }
+}
+
 function Test-JapaneseLookup([string]$Scratch, [Reflection.Assembly]$Assembly) {
     $previous = $env:E_SEARCH_DB
     $env:E_SEARCH_DB = Join-Path $Scratch 'japanese-lookup.db'
@@ -1360,6 +1396,7 @@ if ($BackendTestDirectory) {
     Test-EverythingRecovery $BackendTestDirectory $assembly
     Test-OxfordSummary $BackendTestDirectory $assembly
     Test-JapaneseLookup $BackendTestDirectory $assembly
+    Test-EnglishLookup $BackendTestDirectory $assembly
     Test-EntryRevision $BackendTestDirectory $assembly
     Test-ReleaseDataLocation
     Test-RunningCancellation $assembly
