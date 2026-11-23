@@ -16,7 +16,11 @@ namespace ESearch;
 
 public partial class SearchWindow : Window
 {
-    private const int HotkeyId = 1;
+    private int hotkeyId = 1;
+    private const uint NoRepeat = 0x4000;
+    private (uint Modifiers, uint Key) hotkey = (1, 0x20);
+    private SettingsWindow? settings;
+    private long catalogRevision;
     private readonly string databasePath;
     private readonly string? dictionaryId;
     private readonly DispatcherTimer debounce;
@@ -46,6 +50,7 @@ public partial class SearchWindow : Window
         };
 
         QueryBox.TextChanged += (_, _) => RefreshInput();
+        SettingsButton.Click += (_, _) => OpenSettings();
         ClearButton.Click += (_, _) => { QueryBox.Clear(); QueryBox.Focus(); };
         DetailsButton.Click += (_, _) => ToggleDetails();
         FileList.PreviewMouseLeftButtonUp += (_, e) =>
@@ -81,10 +86,22 @@ public partial class SearchWindow : Window
         source.AddHook(WindowMessage);
         // 托盘菜单会临时取得前台。仅记住普通应用窗口，以便托盘唤起也能还焦。
         foregroundHook = SetWinEventHook(3, 3, 0, observeForeground, 0, 0, 2);
-        registered = RegisterHotKey(hwnd, HotkeyId, 0x4001, 0x20); // MOD_NOREPEAT | MOD_ALT + VK_SPACE
-        if (!registered) hotkeyWarning = "Alt + Space 已被占用。可从托盘打开搜索。";
+        try
+        {
+            // 已有库只读加载配置；首次启动才创建空库，以便随后从设置页导入。
+            using var store = new DictionaryStore(databasePath, readOnly: File.Exists(databasePath));
+            hotkey = store.ReadHotkey();
+        }
+        catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException)
+        {
+            hotkeyWarning = "无法读取已保存的快捷键：" + ex.Message;
+        }
+        registered = RegisterHotKey(hwnd, hotkeyId, hotkey.Modifiers | NoRepeat, hotkey.Key);
+        if (!registered)
+            hotkeyWarning = $"{FormatHotkey(hotkey.Modifiers, hotkey.Key)} 未能注册，可能已被占用。可从托盘进入设置。";
         var menu = new Forms.ContextMenuStrip();
         menu.Items.Add("打开搜索", null, (_, _) => Dispatcher.BeginInvoke(Summon));
+        menu.Items.Add("设置…", null, (_, _) => Dispatcher.BeginInvoke(OpenSettings));
         menu.Items.Add("退出", null, (_, _) =>
         {
             exiting = true;
@@ -100,6 +117,89 @@ public partial class SearchWindow : Window
             if (e.Button == Forms.MouseButtons.Left) Dispatcher.BeginInvoke(Summon);
         };
         Summon();
+    }
+
+    internal static string FormatHotkey(uint modifiers, uint key)
+    {
+        var parts = new List<string>(5);
+        if ((modifiers & 2) != 0) parts.Add("Ctrl");
+        if ((modifiers & 1) != 0) parts.Add("Alt");
+        if ((modifiers & 4) != 0) parts.Add("Shift");
+        if ((modifiers & 8) != 0) parts.Add("Win");
+        parts.Add(key is >= 0x30 and <= 0x39 ? ((char)key).ToString() : KeyInterop.KeyFromVirtualKey((int)key).ToString());
+        return string.Join(" + ", parts);
+    }
+
+    private string? ApplyHotkey(uint modifiers, uint key)
+    {
+        if (key is 0 or > 0xfe or 0x10 or 0x11 or 0x12 or 0x5b or 0x5c or (>= 0xa0 and <= 0xa5)
+            || (modifiers & ~15u) != 0 || (modifiers == 0 && !(key is >= 0x70 and <= 0x87)))
+            return "请选择带修饰键的组合，或单独使用功能键。";
+        if (registered && hotkey == (modifiers, key)) return null;
+        // 先用另一编号试注册。注册和持久化均成功后才释放旧键，失败时旧注册持续有效。
+        int nextId = hotkeyId == 1 ? 2 : 1;
+        if (!RegisterHotKey(hwnd, nextId, modifiers | NoRepeat, key))
+        {
+            string reason = Marshal.GetLastWin32Error() == 1409 ? "已被占用" : "无法注册，可能是系统保留键";
+            return $"{FormatHotkey(modifiers, key)} {reason}。";
+        }
+        try
+        {
+            using var store = new DictionaryStore(databasePath);
+            store.SaveHotkey(modifiers, key);
+        }
+        catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException)
+        {
+            UnregisterHotKey(hwnd, nextId);
+            return "快捷键保存失败：" + ex.Message;
+        }
+        if (registered) UnregisterHotKey(hwnd, hotkeyId);
+        hotkeyId = nextId;
+        registered = true;
+        hotkey = (modifiers, key);
+        hotkeyWarning = "";
+        SetStatus("");
+        return null;
+    }
+
+    private void OpenSettings()
+    {
+        bool fromSearch = IsVisible;
+        if (settings == null)
+        {
+            settings = new SettingsWindow(databasePath, ApplyHotkey, RefreshDictionary);
+            settings.Closed += (_, _) =>
+            {
+                settings = null;
+                if (fromSearch && !exiting && !IsVisible)
+                {
+                    Show();
+                    Activate();
+                    QueryBox.Focus();
+                    RefreshInput();
+                }
+            };
+        }
+        if (IsVisible)
+        {
+            Hide();
+            RefreshInput();
+        }
+        settings.Show();
+        if (settings.WindowState == WindowState.Minimized) settings.WindowState = WindowState.Normal;
+        settings.Activate();
+    }
+
+    private void RefreshDictionary()
+    {
+        // 设置变动只使词典结果失效；文件选择属于当前输入，可继续使用。
+        catalogRevision++;
+        CloseDetails();
+        CandidatePicker.ItemsSource = null;
+        DetailsButton.Visibility = Visibility.Collapsed;
+        GlossText.Text = "";
+        if (IsVisible && !composing && !string.IsNullOrWhiteSpace(QueryBox.Text))
+            _ = SearchDictionaryAsync(QueryBox.Text, revision, CancellationToken.None);
     }
 
     private void RememberForeground(nint window)
@@ -118,7 +218,7 @@ public partial class SearchWindow : Window
     {
         switch (message)
         {
-            case 0x0312 when wParam == HotkeyId: // WM_HOTKEY
+            case 0x0312 when registered && wParam == hotkeyId: // 忽略切换注册前排队的 WM_HOTKEY。
                 Summon();
                 handled = true;
                 break;
@@ -135,8 +235,12 @@ public partial class SearchWindow : Window
 
     private void Summon()
     {
+        var foreground = GetForegroundWindow();
         // 浮窗仍显示时，用户也可能先切到另一应用，再从那里重新唤起。
-        if (!IsVisible || !composing) RememberForeground(GetForegroundWindow());
+        if (settings is { IsVisible: true } && foreground == new WindowInteropHelper(settings).Handle)
+            previousWindow = foreground;
+        else if (!IsVisible || !composing)
+            RememberForeground(foreground);
         composing = false;
         QueryBox.Clear();
         RefreshInput();
@@ -303,19 +407,16 @@ public partial class SearchWindow : Window
 
     private async Task SearchDictionaryAsync(string text, long request, CancellationToken token)
     {
+        long catalog = catalogRevision;
         try
         {
-            // 连接归后台任务独占。失效查询在候选之间退出，正在执行的结果经版本检查后丢弃。
+            // 所有候选共享一次读取快照；导入或调整优先级时不会把两版词库混入一个结果。
             var matches = await Task.Run(() =>
             {
                 using var store = new DictionaryStore(databasePath, readOnly: true);
-                return Lookup.Search(text, (term, reading) =>
-                {
-                    token.ThrowIfCancellationRequested();
-                    return store.Find(term, reading, dictionaryId);
-                });
+                return store.Search(text, dictionaryId, token);
             }, token);
-            if (request != revision || !IsVisible || matches.Count == 0) return;
+            if (request != revision || catalog != catalogRevision || !IsVisible || matches.Count == 0) return;
             GlossText.Text = matches[0].Display;
             var items = matches.Select(hit => new Candidate(hit)).ToArray();
             CandidatePicker.ItemsSource = items;
@@ -325,7 +426,7 @@ public partial class SearchWindow : Window
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException)
         {
-            if (IsVisible && request == revision) SetStatus("词库读取失败：" + ex.Message);
+            if (IsVisible && request == revision && catalog == catalogRevision) SetStatus("词库读取失败：" + ex.Message);
         }
     }
 
@@ -450,7 +551,7 @@ public partial class SearchWindow : Window
         detailRevision++;
         debounce.Stop();
         pending?.Cancel();
-        if (registered) UnregisterHotKey(hwnd, HotkeyId);
+        if (registered) UnregisterHotKey(hwnd, hotkeyId);
         if (foregroundHook != 0) UnhookWinEvent(foregroundHook);
         source?.RemoveHook(WindowMessage);
         if (tray != null)
@@ -464,18 +565,13 @@ public partial class SearchWindow : Window
 
     private sealed record Candidate(LookupHit Hit)
     {
-        public string Label => $"{Hit.Entry.Headword} · {BookName(Hit.Entry.DictionaryId)} · {Hit.Entry.Gloss}";
-        private static string BookName(string id) => id switch
-        {
-            "shogakukan" => "小学馆日汉", "sanseido" => "三省堂大辞林",
-            "oxford" => "牛津高阶英汉双解", "hanying" => "现代汉英综合大辞典", _ => id
-        };
+        public string Label => $"{Hit.Entry.Headword} · {Hit.Entry.DictionaryName ?? Hit.Entry.DictionaryId} · {Hit.Entry.Gloss}";
     }
 
     private delegate void ForegroundCallback(nint hook, uint evt, nint window, int objectId, int child, uint thread, uint time);
     [DllImport("user32.dll")] private static extern nint SetWinEventHook(uint min, uint max, nint module, ForegroundCallback callback, uint pid, uint tid, uint flags);
     [DllImport("user32.dll")] private static extern bool UnhookWinEvent(nint hook);
-    [DllImport("user32.dll")] private static extern bool RegisterHotKey(nint hwnd, int id, uint modifiers, uint key);
+    [DllImport("user32.dll", SetLastError=true)] private static extern bool RegisterHotKey(nint hwnd, int id, uint modifiers, uint key);
     [DllImport("user32.dll")] private static extern bool UnregisterHotKey(nint hwnd, int id);
     [DllImport("user32.dll")] private static extern nint GetForegroundWindow();
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(nint hwnd);

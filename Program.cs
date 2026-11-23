@@ -10,11 +10,18 @@ if (args.Length == 0 || args[0] == "gui")
         try
         {
             string? id = args.Length > 1 ? args[1] : null;
-            if (args.Length > 2 || (id != null && !Source.All.Any(s => s.Id == id)))
+            if (args.Length > 2)
                 throw new ArgumentException("用法：gui [词典ID]");
             SQLitePCL.raw.SetProvider(new SQLitePCL.SQLite3Provider_winsqlite3());
+            string databasePath = FindDatabase();
+            if (id != null && !Source.All.Any(s => s.Id == id))
+            {
+                using var catalog = new DictionaryStore(databasePath);
+                if (!catalog.ListDictionaries().Any(d => d.Id == id))
+                    throw new ArgumentException($"未知词典 {id}");
+            }
             var app = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
-            var window = new ESearch.SearchWindow(FindDatabase(), id);
+            var window = new ESearch.SearchWindow(databasePath, id);
             window.StartResident();
             app.Run();
         }
@@ -62,8 +69,9 @@ try
     using var store = new DictionaryStore(Environment.GetEnvironmentVariable("E_SEARCH_DB") ?? ".data/dictionaries.db");
     Source Resolve(string id) => Source.All.SingleOrDefault(s => s.Id == id)
         ?? throw new ArgumentException($"未知词典 {id}");
-    IReadOnlyList<LookupHit> Search(string input,string? id) =>
-        Lookup.Search(input,(key,reading) => store.Find(key,reading,id));
+    string LookupId(string id) => Source.All.Any(s => s.Id == id) || store.ListDictionaries().Any(d => d.Id == id)
+        ? id : throw new ArgumentException($"未知词典 {id}");
+    IReadOnlyList<LookupHit> Search(string input,string? id) => store.Search(input,id);
     switch (args)
     {
         case ["import",var root]:
@@ -77,12 +85,12 @@ try
             store.List();
             break;
         case ["query",_] or ["query",_,_]:
-            var only=args.Length==3 ? Resolve(args[2]).Id : null;
+            var only=args.Length==3 ? LookupId(args[2]) : null;
             foreach(var hit in Search(args[1],only))
                 Console.WriteLine($"{hit.Entry.DictionaryId}:{hit.Entry.EntryId}\t{hit.Method}\t{hit.Term}\t{hit.Display}");
             break;
         case ["entry",var dict,var n] when long.TryParse(n,out var ord):
-            var detail=store.Detail(Resolve(dict).Id,ord);
+            var detail=store.Detail(LookupId(dict),ord);
             Console.WriteLine(detail.Evidence);
             Console.WriteLine(detail.Raw);
             break;

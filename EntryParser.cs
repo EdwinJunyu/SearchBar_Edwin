@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text;
 using System.Text.RegularExpressions;
 
 internal sealed record ParsedEntry(string Headword, string? Reading, string? ReadingSource,
@@ -8,7 +9,7 @@ internal static partial class EntryParser
 {
     private static readonly StringComparison IgnoreCase = StringComparison.OrdinalIgnoreCase;
 
-    public static ParsedEntry Parse(string sourceId, string key, string raw)
+    public static ParsedEntry Parse(string sourceId, string key, string raw, string? language = null)
     {
         key = key.Trim();
         var body = raw.Trim('\0', ' ', '\r', '\n', '\t');
@@ -32,7 +33,60 @@ internal static partial class EntryParser
             if (start >= 0 && (phrases < 0 || start < phrases))
                 gloss = Between(body, "<span class=\"entryDot\">■</span>", "</span>", start);
         }
-        return new(key, null, null, Preview(gloss, body), null, []);
+        // 未知排版保留原文，以词头查询；仅在日语词头本身为假名时建立读音索引。
+        var reading = language == "ja" ? Kana(key) : null;
+        return new(key, reading, reading == null ? null : "MDX 假名词头", Preview(gloss, body), null, []);
+    }
+
+    // 预览和导入共用此流式解析器。记录起始行用于定位嵌套换行及转义引号。
+    internal static IEnumerable<(int Line, string[] Fields)> ReadTableRows(Stream input, char delimiter)
+    {
+        using var reader = new StreamReader(input, new UTF8Encoding(true, true), false, 4096, leaveOpen: true);
+        var fields = new List<string>();
+        var field = new StringBuilder();
+        int lineNumber = 0, start = 1;
+        bool quoted = false, closed = false;
+        while (true)
+        {
+            string? line;
+            try { line = reader.ReadLine(); }
+            catch (DecoderFallbackException ex) { throw new InvalidDataException("词表必须使用有效的 UTF-8 编码", ex); }
+            if (line == null) break;
+            lineNumber++;
+            if (!quoted)
+            {
+                if (line.Length == 0) continue;
+                start = lineNumber;
+            }
+            else field.Append('\n');
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+                if (quoted)
+                {
+                    if (c != '"') field.Append(c);
+                    else if (i + 1 < line.Length && line[i + 1] == '"') { field.Append('"'); i++; }
+                    else { quoted = false; closed = true; }
+                }
+                else if (c == delimiter)
+                {
+                    fields.Add(field.ToString());
+                    field.Clear();
+                    closed = false;
+                }
+                else if (closed || (c == '"' && field.Length > 0))
+                    throw new InvalidDataException($"第 {lineNumber} 行，第 {fields.Count + 1} 列的引号格式无效");
+                else if (c == '"') quoted = true;
+                else field.Append(c);
+            }
+            if (quoted) continue;
+            fields.Add(field.ToString());
+            yield return (start, fields.ToArray());
+            field.Clear();
+            fields.Clear();
+            closed = false;
+        }
+        if (quoted) throw new InvalidDataException($"第 {start} 行，第 {fields.Count + 1} 列的引号未闭合");
     }
 
     private static ParsedEntry Shogakukan(string key, string body)

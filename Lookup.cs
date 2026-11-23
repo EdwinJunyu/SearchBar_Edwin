@@ -6,7 +6,10 @@ using System.Linq;
 using System.Text;
 
 public sealed record LookupEntry(string DictionaryId, long EntryId, string Language, int Priority,
-    string Headword, string? Reading, string Gloss);
+    string Headword, string? Reading, string Gloss)
+{
+    public string? DictionaryName { get; init; }
+}
 
 public sealed record LookupHit(LookupEntry Entry, string Method, string Term, string Display);
 

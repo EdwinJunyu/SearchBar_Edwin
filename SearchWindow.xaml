@@ -53,6 +53,7 @@
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="5*"/>
                     <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <Path Width="20" Height="20" Stretch="Uniform" VerticalAlignment="Center"
                       Stroke="{StaticResource Accent}" StrokeThickness="1.8"
@@ -104,6 +105,11 @@
                             </Style>
                         </Path.Style>
                     </Path>
+                </Button>
+                <Button x:Name="SettingsButton" Grid.Column="5" Margin="4,0,0,0"
+                        Style="{StaticResource IconButton}" ToolTip="设置"
+                        AutomationProperties.AutomationId="SettingsButton" AutomationProperties.Name="设置">
+                    <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="16" Text="&#xE713;"/>
                 </Button>
             </Grid>
 

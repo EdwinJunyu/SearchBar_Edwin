@@ -1,5 +1,5 @@
 # 先执行 dotnet build -c Release。指定 -RealDatabase 可额外复验四本实际使用的词典。
-param([string] $RealDatabase, [switch] $Desktop, [switch] $FileDesktop, [string] $ColdStartFile)
+param([string] $RealDatabase, [switch] $Desktop, [switch] $FileDesktop, [string] $ColdStartFile, [switch] $SettingsDesktop, [string] $MdxSample)
 $ErrorActionPreference = 'Stop'
 # 失败重导本身也是验收项，命令退出码由 Invoke-Search 明确检查。
 $PSNativeCommandUseErrorActionPreference = $false
@@ -225,8 +225,198 @@ function Test-FileSearch {
     if ((ForegroundTitle) -like "*$wantedTitle*") { [ESearchDesktop]::Press($browser,17,87) }
 }
 
+# 在测试专属的 WPF 进程和数据库中操作设置；保留临时文件，便于复查失败现场。
+function Test-SettingsPage([switch]$Restarted) {
+    $searchWindow=$window
+    $searchBox=$value
+    $rankWord='排序验收词'
+    $csv=Join-Path $scratch '优先级甲.csv'
+    $tsv=Join-Path $scratch '优先级乙.tsv'
+    $invokePattern=[Windows.Automation.InvokePattern]::Pattern
+    $valuePattern=[Windows.Automation.ValuePattern]::Pattern
+    $itemPattern=[Windows.Automation.SelectionItemPattern]::Pattern
+    $tree=[Windows.Automation.TreeScope]::Descendants
+
+    function Click([string]$id) {
+        $element=Control $id
+        if (!$element -or !$element.Current.IsEnabled) { throw "控件不可用：$id" }
+        $element.GetCurrentPattern($invokePattern).Invoke()
+    }
+    function Edit([string]$id,[string]$text) { (Control $id).GetCurrentPattern($valuePattern).SetValue($text) }
+    function Tab([string]$id) { (Control $id).GetCurrentPattern($itemPattern).Select() }
+    function Options($element) {
+        $c=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::ListItem)
+        $element.FindAll($tree,$c) | ForEach-Object { $_ }
+    }
+    function Choose([string]$id,[int]$index) {
+        $combo=Control $id
+        $expand=$combo.GetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern)
+        $expand.Expand()
+        try {
+            $rows=@(Options $combo)
+            if ($index -ge $rows.Count) { throw "$id 不存在第 $($index+1) 个选项（共 $($rows.Count) 项）" }
+            $rows[$index].GetCurrentPattern($itemPattern).Select()
+        } finally {
+            if ($expand.Current.ExpandCollapseState -ne 'Collapsed') { $expand.Collapse() }
+        }
+    }
+    function Wait-Gloss([string]$word,[string]$expected) {
+        $searchBox.SetValue($word)
+        $filter=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::AutomationIdProperty,'GlossText')
+        Wait-Desktop { $searchWindow.FindFirst($tree,$filter).Current.Name -like "*$expected*" } "浮窗首义没有显示 $expected"
+    }
+    function Pick-Book([string]$name) {
+        $row=@(Options (Control DictionaryList) | Where-Object { $_.Current.Name -like "*$name*" })[0]
+        if (!$row) { throw "列表中未找到 $name" }
+        $row.GetCurrentPattern($itemPattern).Select()
+        Wait-Desktop { (Control ToggleEnabledButton).Current.IsEnabled } '词库管理按钮未就绪'
+    }
+    function Stage-File([string]$path) {
+        Tab ImportTab
+        Edit ImportPath $path
+        Click PreviewButton
+        Wait-Desktop { (Control ImportButton).Current.IsEnabled } "文件未能预览：$path；$((Control ImportStatus).Current.Name)"
+    }
+    function Check-Preview([int]$columns) {
+        $grid=(Control PreviewGrid).GetCurrentPattern([Windows.Automation.GridPattern]::Pattern)
+        Assert-Equal $grid.Current.ColumnCount $columns "设置页原始列预览"
+        if ($grid.Current.RowCount -lt 1) { throw "预览没有显示样例记录" }
+    }
+    function Import-File([string]$name) {
+        Click ImportButton
+        Wait-Desktop { @(Invoke-Search @('list') | Where-Object { $_.EndsWith(("`t"+$name),[StringComparison]::OrdinalIgnoreCase) }).Count -eq 1 } "词典未入库：$name" 120000
+        Wait-Desktop { (Control ImportButton).Current.IsEnabled -or (Control ImportStatus).Current.Name -match '成功|完成|已导入' } '导入结果没有返回设置页'
+    }
+    function Prove-Hotkey {
+        # 从受控原文本框发送真实组合键；查询框清空和获得前台共同证明热键已生效。
+        if ([ESearchDesktop]::FindSearch($appProcess.Id) -ne 0) { $searchBox.SetValue('重启快捷键验收标记') }
+        Wait-Desktop {
+            $form.Activate(); [void]$box.Focus()
+            [ESearchDesktop]::ActivateFixture($form.Handle)
+            [ESearchDesktop]::GetForegroundWindow() -eq $form.Handle
+        } '验收原窗口未获得焦点'
+        [ESearchDesktop]::Press($form.Handle,17,18,119) # Ctrl+Alt+F8
+        Wait-Desktop {
+            [ESearchDesktop]::GetForegroundWindow() -eq $handle -and $searchBox.Current.Value -eq ''
+        } '已保存的 Ctrl+Alt+F8 没有唤起浮窗'
+    }
+    if ($Restarted) {
+        Prove-Hotkey
+        Wait-Gloss $rankWord '甲,引号"释义"'
+        Write-Output 'PASS 新进程在未打开设置页前，Ctrl+Alt+F8 真实唤起浮窗，词典顺序和首义已恢复'
+    }
+    Click SettingsButton
+    $root=[Windows.Automation.AutomationElement]::RootElement
+    $windows=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty,$appProcess.Id)
+    Wait-Desktop { @($root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object {$_.Current.Name -eq 'E_Search 设置'}).Count -gt 0 } '未显示设置页'
+    $window=@($root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object {$_.Current.Name -eq 'E_Search 设置'})[0]
+    if ($Restarted) {
+        Tab CatalogTab
+        Pick-Book '优先级乙'
+        Assert-Equal (Control ToggleEnabledButton).Current.Name '启用词典' '重启保留 TSV 停用状态'
+        Assert-Equal @(Invoke-Search @('query',$rankWord)).Count 1 '重启后排除已停用的词典'
+        Click ToggleEnabledButton
+        Wait-Desktop { @(Invoke-Search @('query',$rankWord)).Count -eq 2 } '启用后未恢复两本词库'
+        if (@(Invoke-Search @('query',$rankWord))[0] -notlike '*甲,引号"释义"*') { throw '启用词典改变了保存的顺序' }
+        Write-Output 'PASS 重启后停用状态仍生效，重新启用后两本词库按保存的顺序返回'
+        Tab HotkeyTab
+        if ((Control CurrentHotkey).Current.Name -notmatch 'F8') { throw '重启后设置页未显示已保存热键' }
+        $window.GetCurrentPattern([Windows.Automation.WindowPattern]::Pattern).Close()
+        return
+    }
+
+    $mdx=if ($MdxSample) { $MdxSample } else { $jaPath }
+    Stage-File $mdx
+    Import-File ([IO.Path]::GetFileName($mdx))
+    $mdxLine=@(Invoke-Search @('list') | Where-Object { $_.EndsWith(("`t"+[IO.Path]::GetFileName($mdx)),[StringComparison]::OrdinalIgnoreCase) })[0]
+    $mdxFields=$mdxLine -split "`t"
+    if ([int]$mdxFields[2] -lt 1 -or $mdxFields[3] -cne (Get-FileHash -LiteralPath $mdx).Hash) { throw "MDX 校验失败：$mdxLine" }
+    if ($mdxFields[0] -eq "shogakukan" -and @(Invoke-Search @("query","食べる"))[0] -notlike "*たべる · 吃*") { throw "小学馆真实 MDX 入库后未查询到预期记录" }
+    Write-Output "PASS WPF 导入 MDX $($mdxFields[4])，$($mdxFields[2]) 条，SHA-256 一致"
+
+    [IO.File]::WriteAllText($csv, "释义,读音,词头`r`n`"甲,引号`"`"释义`"`"`",,$rankWord`r`n茶,ちゃ,茶叶样本`r`n", [Text.UTF8Encoding]::new($true))
+    Stage-File $csv
+    Check-Preview 3
+    if ((Control HasHeader).GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq 'Off') {
+        (Control HasHeader).GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Toggle()
+    }
+    Choose HeadColumn 2; Choose GlossColumn 0; Choose ReadingColumn 2
+    Import-File ([IO.Path]::GetFileName($csv))
+    $csvLine=Invoke-Search @('list') | Where-Object { $_ -like '*优先级甲.csv*' }
+    if (($csvLine -split "`t")[2] -ne '2') { throw 'CSV 表头、条数或列映射错误' }
+    if ((Invoke-Search @('query','ちゃ') | Out-String) -notlike '*茶叶样本*茶*') { throw 'CSV 可选读音列未建立正确索引' }
+    Write-Output 'PASS CSV 预览并按列序号映射，跳过表头，空读音、UTF-8 BOM、带逗号和双引号的释义均已验证'
+
+    [IO.File]::WriteAllText($tsv,"乙释义`t$rankWord`r`n第二行`t另一词`r`n")
+    Stage-File $tsv
+    Check-Preview 2
+    if ((Control HasHeader).GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq 'On') {
+        (Control HasHeader).GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Toggle()
+    }
+    Choose HeadColumn 1; Choose GlossColumn 0; Choose ReadingColumn 0
+    Import-File ([IO.Path]::GetFileName($tsv))
+    if (@(Invoke-Search @('query',$rankWord))[0] -notlike '*乙释义*') { throw '无表头 TSV 的第一行或新词表优先级错误' }
+    Write-Output 'PASS TSV 两列预览和映射，首行数据与无读音词条正确入库'
+
+    Tab CatalogTab
+    Pick-Book '优先级甲'
+
+    Click MoveUpButton
+    Wait-Desktop { @(Invoke-Search @('query',$rankWord))[0] -like '*甲,引号"释义"*' } '调整优先级后首义未改变'
+    Write-Output 'PASS 设置页上移词典后，查询首义实际从 TSV 变为 CSV'
+
+    $old=Invoke-Search @('list') | Out-String
+    # 故意放在预览样例之后，验证写入多行后遇错时整本回滚。
+    $invalid=@('释义,读音,词头')
+    $invalid+=foreach($i in 1..32){ "临时释义,,回滚样本$i" }
+    $invalid+='字段缺失,,'
+    [IO.File]::WriteAllLines($csv,$invalid)
+    Stage-File $csv
+    Check-Preview 3
+    if ((Control HasHeader).GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq 'Off') {
+        (Control HasHeader).GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Toggle()
+    }
+    Choose HeadColumn 2; Choose GlossColumn 0; Choose ReadingColumn 2
+    Click ImportButton
+    Wait-Desktop { (Control ImportStatus).Current.Name -match '失败|不能为空|第\s*34\s*行' } '损坏的重新导入没有报告错误'
+    Assert-Equal (Invoke-Search @('list') | Out-String) $old '失败重导的词库元数据、哈希及优先级'
+    if (@(Invoke-Search @('query','回滚样本1')).Count -ne 0) { throw '失败重导留下部分新数据' }
+    if (@(Invoke-Search @('query',$rankWord))[0] -notlike '*甲,引号"释义"*') { throw '失败重导丢失原词条' }
+    Write-Output "PASS 设置页重新导入在第 34 行失败，旧库、顺序、哈希保留，部分新记录回滚；$((Control ImportStatus).Current.Name)"
+
+    Tab CatalogTab
+    Pick-Book '优先级甲'
+    Click ToggleEnabledButton
+    Wait-Desktop { @(Invoke-Search @('query',$rankWord))[0] -like '*乙释义*' } '停用首选词典后首义没有切换'
+    Pick-Book '优先级甲'
+    Click ToggleEnabledButton
+    Wait-Desktop { @(Invoke-Search @('query',$rankWord))[0] -like '*甲,引号"释义"*' } '启用词典后首义没有恢复'
+    Pick-Book '优先级乙'
+    Click ToggleEnabledButton
+    Wait-Desktop { @(Invoke-Search @('query',$rankWord)).Count -eq 1 } '停用第二本词典后仍存在其候选'
+    Write-Output 'PASS 停用首选词典后显示后备释义，重新启用恢复首义；第二本词典停用状态已保存'
+
+    Tab HotkeyTab
+    $capture=Control HotkeyCapture
+    $capture.SetFocus()
+    $settingsHwnd=[IntPtr]::new($window.Current.NativeWindowHandle)
+    Wait-Desktop { $capture.Current.HasKeyboardFocus -and [ESearchDesktop]::GetForegroundWindow() -eq $settingsHwnd } '快捷键输入框未获得焦点'
+    [ESearchDesktop]::Press($settingsHwnd,17,18,119)
+    Wait-Desktop { $capture.GetCurrentPattern($valuePattern).Current.Value -match 'Ctrl.*Alt.*F8' } '真实按键未捕获 Ctrl+Alt+F8'
+    Click SaveHotkeyButton
+    Wait-Desktop { (Control CurrentHotkey).Current.Name -match 'F8' } '保存 Ctrl+Alt+F8 失败'
+    if (![ESearchDesktop]::RegisterHotKey($form.Handle,0x1471,3,120)) { throw '无法预留冲突验收键 Ctrl+Alt+F9' }
+    try {
+        Edit HotkeyCapture 'Ctrl + Alt + F9'; Click SaveHotkeyButton
+        Wait-Desktop { (Control HotkeyStatus).Current.Name -match '冲突|占用' } '外部进程占用热键时没有冲突提示'
+        if ((Control CurrentHotkey).Current.Name -notmatch 'F8') { throw '冲突覆盖了原热键' }
+        $window.GetCurrentPattern([Windows.Automation.WindowPattern]::Pattern).Close()
+        Prove-Hotkey
+        Write-Output 'PASS Ctrl+Alt+F9 由独立进程真实注册占用，冲突后已有 Ctrl+Alt+F8 仍能实际唤起'
+    } finally { [void][ESearchDesktop]::UnregisterHotKey($form.Handle,0x1471) }
+}
 # 实际桌面验收使用自建的原窗口。每次发键前检查前台句柄，避免输入到用户文档。
-function Test-Desktop([string]$Database, [switch]$Files) {
+function Test-Desktop([string]$Database, [switch]$Files, [switch]$Settings, [switch]$Restarted) {
     Add-Type -AssemblyName System.Windows.Forms, UIAutomationClient, UIAutomationTypes
     if (-not ('ESearchDesktop' -as [type])) {
         Add-Type @"
@@ -238,6 +428,8 @@ public static class ESearchDesktop {
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint thread);
     [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int pid);
+    [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr window, int id, uint modifiers, uint key);
+    [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr window, int id);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] static extern bool AttachThreadInput(uint caller,uint other,bool attach);
     public static void ActivateFixture(IntPtr window) {
@@ -339,7 +531,8 @@ public static class ESearchDesktop {
         [ESearchDesktop]::ActivateFixture($form.Handle)
         Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $form.Handle } '测试原窗口未获得焦点'
         $gui=Join-Path $PSScriptRoot 'bin/Release/net10.0-windows/E_Search.exe'
-        $appProcess=Start-Process -FilePath $gui -ArgumentList 'gui','shogakukan' -PassThru
+        $guiArgs = if ($Settings) { @('gui') } else { @('gui','shogakukan') }
+        $appProcess=Start-Process -FilePath $gui -ArgumentList $guiArgs -PassThru
         [void][ESearchDesktop]::AllowSetForegroundWindow($appProcess.Id)
         Wait-Desktop {
             [ESearchDesktop]::FindSearch($appProcess.Id) -ne 0
@@ -356,6 +549,7 @@ public static class ESearchDesktop {
         $query=Control QueryBox
         $value=$query.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
         if ((Control StatusText).Current.Name -match '占用') { Write-Warning 'Alt+Space 已占用，重新唤起验收可能需要关闭冲突程序' }
+        if ($Settings) { Test-SettingsPage -Restarted:$Restarted; return }
         if ($Files) { Test-FileSearch; return }
         # 从受控文本框用真实全局热键建立来源，避免把创建进程时临时活动的窗口当作来源。
         [ESearchDesktop]::Press($handle,27)
@@ -486,6 +680,17 @@ try {
     Assert-Equal (Invoke-Search @('list') | Out-String) $before '失败重导后原词典元数据'
     Assert-Equal (Invoke-Search @('query','箸','shogakukan')) "shogakukan:4`theadword`t箸`tはし · 筷子" '失败重导后旧词条'
     Write-Output 'PASS 查询路径、候选排序、别名、未命中和失败重导回滚'
+    if ($SettingsDesktop) {
+        if ($MdxSample) { $MdxSample=(Resolve-Path -LiteralPath $MdxSample).Path }
+        $settingsDb = Join-Path $scratch "settings.db"
+        $previousEngine = $env:E_SEARCH_EVERYTHING_EXE
+        try {
+            # 设置测试不启动用户的文件索引，也不使用工作区日常词库数据库。
+            $env:E_SEARCH_EVERYTHING_EXE = Join-Path $scratch "no-test-engine.exe"
+            Test-Desktop $settingsDb -Settings
+            Test-Desktop $settingsDb -Settings -Restarted
+        } finally { $env:E_SEARCH_EVERYTHING_EXE = $previousEngine }
+    }
     if (($Desktop -or $FileDesktop) -and !$RealDatabase) { $RealDatabase=(Resolve-Path (Join-Path $PSScriptRoot '.data/dictionaries.db')).Path }
     if ($RealDatabase) {
         $env:E_SEARCH_DB = $RealDatabase
