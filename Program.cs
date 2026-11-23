@@ -1,5 +1,47 @@
 using System.Text;
 
+#if WINDOWS
+// WinExe 默认从托盘浮窗进入；独立的 net10.0 入口继续承载原命令行操作。
+if (args.Length == 0 || args[0] == "gui")
+{
+    int result = 0;
+    var ui = new Thread(() =>
+    {
+        try
+        {
+            string? id = args.Length > 1 ? args[1] : null;
+            if (args.Length > 2 || (id != null && !Source.All.Any(s => s.Id == id)))
+                throw new ArgumentException("用法：gui [词典ID]");
+            SQLitePCL.raw.SetProvider(new SQLitePCL.SQLite3Provider_winsqlite3());
+            var app = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
+            var window = new ESearch.SearchWindow(FindDatabase(), id);
+            window.StartResident();
+            app.Run();
+        }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show(ex.Message, "E_Search 启动失败");
+            result = 1;
+        }
+    });
+    ui.SetApartmentState(ApartmentState.STA);
+    ui.Start();
+    ui.Join();
+    return result;
+}
+
+static string FindDatabase()
+{
+    var configured = Environment.GetEnvironmentVariable("E_SEARCH_DB");
+    if (!string.IsNullOrWhiteSpace(configured)) return Path.GetFullPath(configured);
+    // 从资源管理器或其他工作目录启动时，从程序位置寻找项目内已导入的索引。
+    for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
+        if (File.Exists(Path.Combine(dir.FullName, "E_Search.csproj")))
+            return Path.Combine(dir.FullName, ".data", "dictionaries.db");
+    return Path.GetFullPath(".data/dictionaries.db");
+}
+#endif
+
 Console.OutputEncoding = new UTF8Encoding(false);
 if (args.Length == 0 || args[0] is "help" or "--help")
 {

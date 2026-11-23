@@ -5,11 +5,14 @@ internal sealed class DictionaryStore : IDisposable
 {
     private readonly SqliteConnection db;
 
-    public DictionaryStore(string path)
+    public DictionaryStore(string path, bool readOnly = false)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
-        db = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = path }.ToString());
+        if (!readOnly) Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+        db = new SqliteConnection(new SqliteConnectionStringBuilder {
+            DataSource = path, Mode = readOnly ? SqliteOpenMode.ReadOnly : SqliteOpenMode.ReadWriteCreate
+        }.ToString());
         db.Open();
+        if (readOnly) return;
         using var schema = Command("""
             PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS dictionaries(
