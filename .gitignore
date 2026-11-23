@@ -1,0 +1,6 @@
+.tools/
+.data/
+bin/
+obj/
+*.mdx
+*.mdd

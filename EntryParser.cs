@@ -1,0 +1,157 @@
+using System.Net;
+using System.Text.RegularExpressions;
+
+internal sealed record ParsedEntry(string Headword, string? Reading, string? ReadingSource,
+    string Gloss, string? LinkTarget, string[] Aliases);
+
+internal static partial class EntryParser
+{
+    private static readonly StringComparison IgnoreCase = StringComparison.OrdinalIgnoreCase;
+
+    public static ParsedEntry Parse(string sourceId, string key, string raw)
+    {
+        key = key.Trim();
+        var body = raw.Trim('\0', ' ', '\r', '\n', '\t');
+        if (body.StartsWith("@@@LINK=", IgnoreCase))
+            return new(key, null, null, "", body[8..].Trim(), []);
+
+        // 各辞书的 HTML 结构不同。只从已识别的字段建立读音索引，不从释义、例句猜读音。
+        if (sourceId == "shogakukan")
+            return Shogakukan(key, body);
+        if (sourceId == "sanseido")
+            return Sanseido(key, body);
+
+        string? gloss = null;
+        if (sourceId == "oxford")
+            gloss = Between(body, "color=#FF5000>", "</font>")?.TrimStart('•', ' ');
+        else if (sourceId == "hanying")
+        {
+            // 只读第一义项的 JX 区，遇到“常用词组”时结束，避免误取短语翻译。
+            var start = body.IndexOf("<span class=\"JX\">", IgnoreCase);
+            var phrases = body.IndexOf("<span class=\"CZ\">", IgnoreCase);
+            if (start >= 0 && (phrases < 0 || start < phrases))
+                gloss = Between(body, "<span class=\"entryDot\">■</span>", "</span>", start);
+        }
+        return new(key, null, null, Preview(gloss, body), null, []);
+    }
+
+    private static ParsedEntry Shogakukan(string key, string body)
+    {
+        // 首行是假名。第二行可能含【词头】或直接给出首义。词头中的横杠代表省略部分。
+        var lines = Lines(body, 4096);
+        if (lines.Length == 0) return new(key, null, null, "", null, []);
+        var reading = Kana(lines[0]);
+        var written = lines.Length > 1 ? WrittenForms(lines[1]) : [];
+        var head = written.FirstOrDefault() ?? reading ?? key;
+        var start = lines.Length > 1 && lines[1].StartsWith('【') ? 2 : 1;
+        string? gloss = null;
+        foreach (var line in lines.Skip(start))
+        {
+            if (line.StartsWith("例：") || line.StartsWith("例:")) break;
+            var sense = LeadingLabels().Replace(line, "").Trim();
+            if (sense.Length == 0) continue;
+            // 注音附在汉字后，如“吃chī”。只移除可辨识的拼音，正文保持原样。
+            sense = Pinyin().Replace(sense, m => ToneMark().IsMatch(m.Value) ? "" : m.Value);
+            gloss = sense;
+            break;
+        }
+        return new(head, reading, reading == null ? null : "MDX 正文首行假名",
+            Preview(gloss, body), null, written.Skip(1).ToArray());
+    }
+
+    private static ParsedEntry Sanseido(string key, string body)
+    {
+        // 带汉字的索引一般在首个粗体标出假名。无粗体的假名索引可直接作为读音依据。
+        var prefix = body[..Math.Min(body.Length, 380)];
+        var bold = LeadingBold().Match(prefix);
+        var reading = bold.Success ? Kana(bold.Groups[1].Value) : null;
+        string? evidence = reading == null ? null : "MDX 正文首个粗体读音";
+        if (reading == null && Kana(key) is { } indexKana)
+        {
+            reading = indexKana;
+            evidence = "MDX 假名索引";
+        }
+        var headerEnd = prefix.IndexOf("</body2>", IgnoreCase);
+        var header = headerEnd < 0 ? prefix : prefix[..headerEnd];
+        var title = SanseidoTitle().Match(header);
+        var written = title.Success ? WrittenForms(title.Groups[1].Value) : [];
+        var head = written.Contains(key) ? key : written.FirstOrDefault() ?? key;
+        const string firstSense = "<font color=\"#008000\">(1)</font>";
+        var first = body.IndexOf(firstSense, IgnoreCase);
+        string? gloss = null;
+        if (first >= 0 && first < 768)
+            gloss = Lines(body[(first + firstSense.Length)..], 300).FirstOrDefault();
+        else if (headerEnd >= 0)
+            gloss = Lines(body[(headerEnd + "</body2>".Length)..], 300).FirstOrDefault();
+        else if (title.Success)
+        {
+            // 同一本书还收录了日英词条，其红色词头后以两个换行引出英文释义。
+            const string separator = "</font><br><br>";
+            var firstLine = body.IndexOf(separator, title.Index + title.Length, IgnoreCase);
+            if (firstLine >= 0 && firstLine < 380)
+                gloss = Lines(body[(firstLine + separator.Length)..], 300).FirstOrDefault();
+        }
+        if (gloss != null)
+        {
+            var sentenceEnd = gloss.IndexOf('。');
+            gloss = sentenceEnd >= 0 ? gloss[..(sentenceEnd + 1)] : gloss.TrimEnd('；', ';');
+        }
+        return new(head, reading, evidence, Preview(gloss, body), null,
+            written.Where(s => s != head).ToArray());
+    }
+
+    private static string? Kana(string text)
+    {
+        var cleaned = text.Replace("・", "").Replace("－", "").Trim();
+        return cleaned.Length > 0 && cleaned.All(c =>
+            c is >= 'ぁ' and <= 'ゖ' or >= 'ァ' and <= 'ヺ' or 'ー' or 'ゝ' or 'ゞ' or 'ヽ' or 'ヾ')
+            ? cleaned : null;
+    }
+
+    private static string[] WrittenForms(string heading)
+    {
+        if (heading.Length < 3 || heading[0] != '【' || heading[^1] != '】') return [];
+        return heading[1..^1].Split('・', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Where(form => form.IndexOfAny(['―', '…', '～', '【', '】']) < 0).Distinct().ToArray();
+    }
+
+    private static string? Between(string text, string open, string close, int start = 0)
+    {
+        var begin = text.IndexOf(open, start, IgnoreCase);
+        if (begin < 0) return null;
+        begin += open.Length;
+        var end = text.IndexOf(close, begin, IgnoreCase);
+        return end < 0 ? null : Plain(text[begin..end]);
+    }
+
+    private static string[] Lines(string html, int limit)
+    {
+        var sample = html[..Math.Min(limit, html.Length)];
+        return BlockBreak().Replace(sample, "\n").Split(['\r', '\n'])
+            .Select(Plain).Where(s => s.Length > 0).ToArray();
+    }
+
+    private static string Plain(string value) =>
+        WebUtility.HtmlDecode(Tags().Replace(value, "")).Trim().TrimEnd('\0').TrimEnd();
+
+    private static string Preview(string? sense, string body)
+    {
+        var text = string.IsNullOrWhiteSpace(sense) ? Lines(body, 1024).FirstOrDefault() ?? "" : sense.Trim();
+        return text.Length > 70 ? string.Concat(text.AsSpan(0, char.IsHighSurrogate(text[69]) ? 69 : 70), "…") : text;
+    }
+
+    [GeneratedRegex(@"<(?:br|hr|/?p)(?=[\s/>])[^>]*>", RegexOptions.IgnoreCase)]
+    private static partial Regex BlockBreak();
+    [GeneratedRegex(@"<[^>]*>")]
+    private static partial Regex Tags();
+    [GeneratedRegex(@"^(?:(?:[（(]\d+[)）]|〔[^〕]*〕|［[^］]*］)\s*)+")]
+    private static partial Regex LeadingLabels();
+    [GeneratedRegex(@"(?<=[\u3400-\u9fff])[A-Za-zÀ-žǍ-ǜ]+(?:[ ’'][A-Za-zÀ-žǍ-ǜ]+)*")]
+    private static partial Regex Pinyin();
+    [GeneratedRegex("[āáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ]", RegexOptions.IgnoreCase)]
+    private static partial Regex ToneMark();
+    [GeneratedRegex(@"^\s*<font\b[^>]*>\s*<b>([^<>]+)</b>", RegexOptions.IgnoreCase)]
+    private static partial Regex LeadingBold();
+    [GeneratedRegex(@"<font color=""#FF0000"">\s*(?:<br>\s*)?(【[^【】<>]+】)", RegexOptions.IgnoreCase)]
+    private static partial Regex SanseidoTitle();
+}
