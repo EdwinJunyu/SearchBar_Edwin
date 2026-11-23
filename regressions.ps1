@@ -317,22 +317,35 @@ function Confirm-FixtureBrowser([string]$Title) {
     }
     Wait-Desktop { (ForegroundTitle) -like "*$Title*" } "默认浏览器未显示测试页 $Title" 20000
     $browser=[ESearchDesktop]::GetForegroundWindow()
-    if ((ForegroundTitle) -like "*$Title*") { [ESearchDesktop]::Press($browser,17,87) }
+    try {
+        Assert-Equal ([ESearchDesktop]::FindSearch($appProcess.Id)) $handle '打开文件后原搜索窗仍然可见'
+        Assert-Equal ([ESearchDesktop]::IsAbove($browser,$handle)) $true '浏览器位于搜索窗上方'
+    } finally {
+        if ((ForegroundTitle) -like "*$Title*") { [ESearchDesktop]::Press($browser,17,87) }
+    }
+    Wait-Desktop { (ForegroundTitle) -notlike "*$Title*" } '测试文档标签未关闭'
+    # 浏览器可复用已有窗口。只有整个窗口关闭时，才应直接用到下层的搜索窗。
+    if (![ESearchDesktop]::IsWindowVisible($browser)) {
+        Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle } '关闭浏览器窗口后未回到搜索窗'
+    }
 }
 function Summon-Fixture {
+    # 需要空白查询的旧场景从搜索窗主动收起，再从受控文本框唤起新一轮搜索。
+    if ([ESearchDesktop]::FindSearch($appProcess.Id) -ne 0) {
+        [ESearchDesktop]::ActivateFixture($handle)
+        Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle } '无法激活待收起的搜索窗'
+        [ESearchDesktop]::Press($handle,17,18,16,130)
+        Wait-Desktop { [ESearchDesktop]::FindSearch($appProcess.Id) -eq 0 } '再次按快捷键未收起浮窗'
+    }
     Wait-Desktop {
         [void]$box.Focus()
         [ESearchDesktop]::ActivateFixture($form.Handle)
         [ESearchDesktop]::GetForegroundWindow() -eq $form.Handle
     } '无法从验收文本框重新唤起'
-    if ([ESearchDesktop]::FindSearch($appProcess.Id) -ne 0) {
-        [ESearchDesktop]::Press($form.Handle,17,18,16,130)
-        Wait-Desktop { [ESearchDesktop]::FindSearch($appProcess.Id) -eq 0 } '再次按快捷键未收起浮窗'
-    }
     [ESearchDesktop]::Press($form.Handle,17,18,16,130)
     Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle -and $value.Current.Value -eq '' } '快捷键打开后不是空白查询框'
 }
-function Test-FileResultActions([scriptblock]$Reopen = { Summon-Fixture }) {
+function Test-FileResultActions([int]$Hotkey = 130) {
     $tag='ESearchClick' + [Guid]::NewGuid().ToString('N').Substring(0,10)
     $name="$tag 样本,文件.html"
     # 个人索引可排除工作区。专项允许把同名样本写入已索引的目录，每轮使用独立子目录。
@@ -347,14 +360,6 @@ function Test-FileResultActions([scriptblock]$Reopen = { Summon-Fixture }) {
     # 先让浮窗启动索引；等两份新样本均可查到后再提交完整文件名。
     $value.SetValue($tag)
     Wait-Desktop { @(Get-EnginePaths $name | Where-Object { $markers.ContainsKey($_) }).Count -eq 2 } "Everything 未索引 $fixtureRoot 下的两个同名样本" 90000
-    function Show-FixturePair {
-        $value.SetValue($name)
-        Wait-Desktop {
-            $rows=@(FileRows)
-            $rows.Count -eq 2 -and $markers.ContainsKey($rows[0].Current.Name) -and
-                $markers.ContainsKey($rows[1].Current.Name) -and (SelectedPath) -ceq $rows[0].Current.Name
-        } '没有显示两个同名结果并默认选中第一项'
-    }
     function Click-FileAction([string]$ActionId) {
         $row=@(FileRows | Where-Object { $_.Current.Name -ceq $target })[0]
         if (!$row) { throw "未找到要操作的结果 $target" }
@@ -364,21 +369,32 @@ function Test-FileResultActions([scriptblock]$Reopen = { Summon-Fixture }) {
         $point=$button.GetClickablePoint()
         [ESearchDesktop]::ClickPoint($handle,[int]$point.X,[int]$point.Y)
     }
-    Show-FixturePair
+    $value.SetValue($name)
+    Wait-Desktop {
+        $rows=@(FileRows)
+        $rows.Count -eq 2 -and $markers.ContainsKey($rows[0].Current.Name) -and
+            $markers.ContainsKey($rows[1].Current.Name) -and (SelectedPath) -ceq $rows[0].Current.Name
+    } '没有显示两个同名结果并默认选中第一项'
     $target=@(FileRows)[1].Current.Name
+    $paths=PathsOnScreen
+    function Confirm-SearchSession {
+        Assert-Equal ([ESearchDesktop]::FindSearch($appProcess.Id)) $handle '保留原搜索窗'
+        Assert-Equal (QueryValue) $name '保留原关键词'
+        Assert-Equal (PathsOnScreen) $paths '保留两个同名文件及其顺序'
+        Assert-Equal (SelectedPath) $target '保留点选的第二个文件'
+    }
     Click-FileAction OpenFileButton
     Confirm-FixtureBrowser $markers[$target]
-    Write-Output "PASS 单击第二个同名结果，默认浏览器显示 $target 的独立标题"
-    & $Reopen
-    Show-FixturePair
-    Assert-Equal (@(FileRows)[1].Current.Name) $target '重新查询后仍由第二项定位'
-    Click-FileAction RevealFileButton
-    Wait-Desktop {
-        if ([ESearchDesktop]::FindSearch($appProcess.Id) -eq 0) { return $true }
-        if ((Control FileStatusText).Current.Name -like '无法定位*') { throw (Control FileStatusText).Current.Name }
-        return $false
-    } '定位按钮未将文件交给资源管理器，搜索窗仍然可见'
+    Confirm-SearchSession
+    if ([ESearchDesktop]::GetForegroundWindow() -ne $handle) {
+        # 测试标签若在已有浏览器窗口内，直接激活原搜索窗继续下一项操作。
+        [ESearchDesktop]::ActivateFixture($handle)
+        Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle } '无法激活已保留的搜索窗'
+    }
+    Write-Output "PASS 单击第二项在上层浏览器打开 $target；关闭样本标签后保留原搜索和选择"
     $shell=New-Object -ComObject Shell.Application
+    $existingExplorer=@($shell.Windows() | ForEach-Object HWND)
+    Click-FileAction RevealFileButton
     function FixtureExplorerViews {
         foreach ($explorer in $shell.Windows()) {
             try {
@@ -400,7 +416,9 @@ function Test-FileResultActions([scriptblock]$Reopen = { Summon-Fixture }) {
     try {
         Wait-Desktop { SelectedFixtureExplorer } "Explorer 没有实际选中 $target" 15000
         $shown=SelectedFixtureExplorer
-        Write-Output "PASS 点击定位后，资源管理器实际选中 $target"
+        Confirm-SearchSession
+        Assert-Equal ([ESearchDesktop]::IsAbove($shown,$handle)) $true '资源管理器位于搜索窗上方'
+        Write-Output "PASS 点击定位后，资源管理器在原搜索窗上方选中 $target"
         # 同一目录打开两个窗口，两边均先选择其它文件；仅 Shell 实际激活的窗口应改变选区。
         $parent=[IO.Path]::GetDirectoryName($target)
         $keepers=@('保留选择一.txt','保留选择二.txt')
@@ -415,9 +433,12 @@ function Test-FileResultActions([scriptblock]$Reopen = { Summon-Fixture }) {
             $doc.SelectItem($doc.Folder.ParseName($keepers[1]),1)
             Wait-Desktop { @(SelectedLeaves $view).Count -eq 2 } '测试窗口未建立多选'
         }
-        & $Reopen
-        Show-FixturePair
-        Click-FileAction RevealFileButton
+        $front=[ESearchDesktop]::GetForegroundWindow()
+        if ($front.ToInt64() -notin @($views | ForEach-Object HWND)) { throw '本轮资源管理器窗口没有获得前台' }
+        [ESearchDesktop]::Press($front,17,18,16,$Hotkey)
+        Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle } '热键未将后台搜索窗调回前台'
+        Confirm-SearchSession
+        [ESearchDesktop]::Press($handle,16,13)
         Wait-Desktop { SelectedFixtureExplorer } '实际激活的 Explorer 窗口未选中目标'
         # 等补选逻辑运行后复核后台窗口，不能只看任意窗口碰巧选中了目标。
         Start-Sleep -Milliseconds 700
@@ -430,30 +451,50 @@ function Test-FileResultActions([scriptblock]$Reopen = { Summon-Fixture }) {
         }
         Write-Output 'PASS 同目录多窗口定位：前台选中目标，后台保留原有两项选择'
     } finally {
-        # 仅关闭本轮专用目录对应的 Explorer 视图。
-        foreach ($view in @(FixtureExplorerViews)) { $view.Quit() }
+        # 先关闭后台测试视图，再关闭活动视图，让系统按窗口层级返回搜索窗。
+        $closing=@(FixtureExplorerViews)
+        foreach ($view in ($closing | Sort-Object { [IntPtr]$_.HWND -eq $active })) { $view.Quit() }
     }
-    & $Reopen
-    Show-FixturePair
+    Wait-Desktop { @(FixtureExplorerViews).Count -eq 0 } '测试资源管理器视图未关闭'
+    if ($active.ToInt64() -notin $existingExplorer -or ![ESearchDesktop]::IsWindowVisible($active)) {
+        Wait-Desktop {
+            ![ESearchDesktop]::IsWindowVisible($active) -and [ESearchDesktop]::GetForegroundWindow() -eq $handle -and
+                $query.Current.HasKeyboardFocus
+        } '关闭资源管理器窗口后未直接回到原搜索框继续输入'
+        Write-Output 'PASS 关闭独立的资源管理器窗口后，原搜索框直接获得键盘焦点'
+    } elseif ([ESearchDesktop]::GetForegroundWindow() -ne $handle) {
+        # 共用的窗口仍有其他标签，直接回到搜索窗，保留用户的标签。
+        [ESearchDesktop]::ActivateFixture($handle)
+        Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle } '无法返回保留的搜索窗'
+    }
+    Confirm-SearchSession
+    Write-Output 'PASS 从资源管理器按热键回到同一搜索，Shift+Enter 再次定位，关闭测试视图后保留查询、列表和选中行'
     # 文件移到本轮暂存目录，保留搜索时的旧行，验证两个失败操作都不会隐藏浮窗。
     $moved=[IO.Directory]::CreateDirectory((Join-Path $fixtureRoot '已移走'))
     [IO.File]::Move($target,(Join-Path $moved.FullName $name))
-    function Confirm-MissingAction([string]$Expected) {
-        Wait-Desktop {
-            $message=(Control FileStatusText).Current.Name
-            $message -and $message.StartsWith($Expected) -and $message.Contains($target) -and
-                [ESearchDesktop]::GetForegroundWindow() -eq $handle
-        } "文件移走后，未保留浮窗并提示 $Expected 和对应路径"
+    function Confirm-MissingAction([string]$InputAction,[string]$Expected) {
+        try {
+            Wait-Desktop {
+                $message=(Control FileStatusText).Current.Name
+                $message -and $message.StartsWith($Expected) -and $message.Contains($target) -and
+                    [ESearchDesktop]::GetForegroundWindow() -eq $handle
+            } "文件移走后，$InputAction 应提示 $Expected 和对应路径"
+        } catch {
+            $foreground=[ESearchDesktop]::GetForegroundWindow()
+            $focus=[Windows.Automation.AutomationElement]::FocusedElement.Current
+            $state="搜索 HWND=$handle，前台 HWND=$foreground，焦点控件=$($focus.ControlType.ProgrammaticName)/$($focus.AutomationId)"
+            throw "$($_.Exception.Message)。$state，实际提示「$((Control FileStatusText).Current.Name)」，查询「$(QueryValue)」，选中「$(SelectedPath)」，预期路径「$target」。"
+        }
     }
     Click-FileAction OpenFileButton
-    Confirm-MissingAction '无法打开'
+    Confirm-MissingAction '鼠标点击文件' '无法打开'
     Click-FileAction RevealFileButton
-    Confirm-MissingAction '无法定位'
+    Confirm-MissingAction '鼠标点击定位' '无法定位'
     # 在同一选择上交替动作，每次错误消息都必须改变，避免误读上一次的提示。
     [ESearchDesktop]::Press($handle,13)
-    Confirm-MissingAction '无法打开'
+    Confirm-MissingAction 'Enter' '无法打开'
     [ESearchDesktop]::Press($handle,16,13)
-    Confirm-MissingAction '无法定位'
+    Confirm-MissingAction 'Shift+Enter' '无法定位'
     Write-Output 'PASS 文件移走后，点击、Enter 和 Shift+Enter 均保留浮窗并提示对应操作和完整路径'
 }
 function Test-FileSearch {
@@ -1227,7 +1268,7 @@ function Test-WindowInteractions {
     Launch-Again
     Wait-Desktop { [ESearchDesktop]::FindSearch($appProcess.Id) -eq $handle } '二次启动未唤起原搜索窗'
     Write-Output 'PASS 设置窗口复用和层级、重复启动、快捷键显隐、鼠标拖动并恢复位置'
-    if ($FileActionsDesktop) { Test-FileResultActions -Reopen { Reopen-Search } }
+    if ($FileActionsDesktop) { Test-FileResultActions -Hotkey 126 }
 }
 
 function Test-Desktop([string]$Database, [switch]$Files, [switch]$Settings, [switch]$Restarted,[string]$Scenario) {
@@ -1346,7 +1387,16 @@ public static class ESearchDesktop {
     delegate bool WindowCallback(IntPtr h,IntPtr param);
     [DllImport("user32.dll")] static extern bool EnumWindows(WindowCallback callback,IntPtr p);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h,System.Text.StringBuilder s,int cap);
-    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    public static bool IsAbove(IntPtr target,IntPtr search) {
+        // 从上往下枚举顶层窗口，区分前台目标和盖在它上方的置顶窗。
+        bool targetFirst=false;
+        EnumWindows((window,param)=>{
+            targetFirst=window==target;
+            return !targetFirst && window!=search;
+        },IntPtr.Zero);
+        return targetFirst;
+    }
     public static IntPtr FindSearch(int process) {
         IntPtr matched=IntPtr.Zero;
         EnumWindows((h,p)=>{ uint owner; GetWindowThreadProcessId(h,out owner);

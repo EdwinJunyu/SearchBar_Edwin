@@ -39,6 +39,7 @@ public partial class SearchWindow : Window
     private string hotkeyWarning = "";
     private long revision, detailRevision;
     private long fileRevision = -1;
+    private long fileActionRevision;
     private CancellationTokenSource? pending;
 
     public SearchWindow(string databasePath, string? dictionaryId = null)
@@ -66,6 +67,8 @@ public partial class SearchWindow : Window
                 Dispatcher.BeginInvoke(DispatcherPriority.Loaded, FitExpandedWindow);
         };
         PreviewKeyDown += HandleKey;
+        // 从文件窗口回到搜索时才恢复置顶，交接期间由 Windows 管理两个窗口的前后顺序。
+        Activated += (_, _) => Topmost = true;
         // WPF 组合事件覆盖 TSF 输入法。只在组合结束、TextBox 已收到最终文字后检索。
         QueryBox.AddHandler(TextCompositionManager.PreviewTextInputStartEvent,
             new TextCompositionEventHandler((_, _) => { composing = true; RefreshInput(); }), true);
@@ -233,7 +236,7 @@ public partial class SearchWindow : Window
                 if (IsVisible) Dispatcher.BeginInvoke(DispatcherPriority.Loaded, PositionSearchWindow);
                 break;
             case 0x0312 when registered && wParam == hotkeyId: // 忽略切换注册前排队的 WM_HOTKEY。
-                if (IsVisible) Dismiss();
+                if (IsVisible && (Topmost || IsActive)) Dismiss();
                 else Summon();
                 handled = true;
                 break;
@@ -250,6 +253,7 @@ public partial class SearchWindow : Window
 
     internal void ActivateFromLaunch(string? requestedDictionary)
     {
+        if (IsVisible && dictionaryId != requestedDictionary) QueryBox.Clear();
         dictionaryId = requestedDictionary;
         Summon();
     }
@@ -263,11 +267,15 @@ public partial class SearchWindow : Window
             return;
         }
         RememberForeground(GetForegroundWindow());
-        composing = false;
-        QueryBox.Clear();
-        RefreshInput();
-        if (!IsVisible) Show();
-        PositionSearchWindow();
+        // 文件窗口在前时，托盘或热键调回原有搜索，保留列表、选择和滚动位置。
+        if (!IsVisible || Topmost)
+        {
+            composing = false;
+            QueryBox.Clear();
+            RefreshInput();
+            if (!IsVisible) Show();
+            PositionSearchWindow();
+        }
         SetForegroundWindow(hwnd);
         Activate();
         QueryBox.Focus();
@@ -370,11 +378,15 @@ public partial class SearchWindow : Window
         {
             if (e.Key == Key.Enter && Keyboard.Modifiers is ModifierKeys.None or ModifierKeys.Shift)
             {
+                // 上次回车的抬键可能发给已打开的窗口；用本次 WM_KEYDOWN 的先前按下位判断长按。
+                var message = ComponentDispatcher.CurrentKeyboardMessage;
+                bool repeated = message.message == 0x0100 && message.wParam == 0x0D
+                    ? (message.lParam.ToInt64() & (1L << 30)) != 0 : e.IsRepeat;
                 var focused = Keyboard.FocusedElement as System.Windows.Controls.Button;
                 // 原生按钮自行响应 Enter 和空格；在定位按钮上按 Enter 也应执行定位。
-                if (!e.IsRepeat && Keyboard.Modifiers == ModifierKeys.None && focused != null) return;
+                if (!repeated && Keyboard.Modifiers == ModifierKeys.None && focused != null) return;
                 e.Handled = true;
-                if (!e.IsRepeat)
+                if (!repeated)
                     ActivateFile(focused?.DataContext as FileHit ?? FileList.SelectedItem as FileHit,
                         Keyboard.Modifiers == ModifierKeys.Shift ? FileAction.Reveal : FileAction.Open);
             }
@@ -408,10 +420,16 @@ public partial class SearchWindow : Window
 
     private void OpenWithShell(string target, FileAction? fileAction = null)
     {
+        long request = ++fileActionRevision;
         try
         {
-            if (fileAction != null && !File.Exists(target))
-                throw new FileNotFoundException("文件已移动、已删除或无法访问。");
+            if (fileAction != null)
+            {
+                if (!File.Exists(target)) throw new FileNotFoundException("文件已移动、已删除或无法访问。");
+                // 先把输入焦点留在搜索框，再让出置顶层，关闭外部窗口后即可继续输入。
+                QueryBox.Focus();
+                Topmost = false;
+            }
             if (fileAction == FileAction.Reveal)
             {
                 // 在同一个 Shell 请求中指定目录和要选中的子项，由 Explorer 选定目标视图。
@@ -430,11 +448,8 @@ public partial class SearchWindow : Window
             }
             if (fileAction != null)
             {
-                // 操作交给关联程序或资源管理器后直接隐藏，让目标窗口保有焦点。
-                Hide();
-                QueryBox.Clear();
-                RefreshInput();
-                if (fileAction == FileAction.Reveal) _ = CompleteExplorerSelectionAsync(target, revision);
+                ShowFileCount(FileList.Items.Count);
+                if (fileAction == FileAction.Reveal) _ = CompleteExplorerSelectionAsync(target, request);
             }
         }
         catch (Exception ex) when (ex is Win32Exception or IOException or UnauthorizedAccessException
@@ -442,7 +457,11 @@ public partial class SearchWindow : Window
         {
             var action = fileAction == FileAction.Reveal ? "定位" : "打开";
             SetFileStatus($"无法{action}「{target}」：{ex.Message}");
-            if (fileAction != null) QueryBox.Focus();
+            if (fileAction != null && IsActive)
+            {
+                Topmost = true;
+                QueryBox.Focus();
+            }
         }
     }
 
@@ -460,7 +479,7 @@ public partial class SearchWindow : Window
             while (timer.Elapsed < TimeSpan.FromSeconds(5))
             {
                 await Task.Delay(120);
-                if (exiting || request != revision) return;
+                if (exiting || request != fileActionRevision) return;
                 var foreground = GetForegroundWindow();
                 foreach (dynamic view in shell.Windows())
                 {
@@ -512,6 +531,7 @@ public partial class SearchWindow : Window
     private void RefreshInput()
     {
         revision++;
+        fileActionRevision++; // 编辑或收起搜索后，旧的 Explorer 定位不再补选。
         debounce.Stop();
         pending?.Cancel();
         // 同步撤销旧选择；即使用户在 debounce 或原生查询期间按回车，也不会打开上一项。
@@ -746,12 +766,7 @@ public partial class SearchWindow : Window
                 FileList.SelectedIndex = 0;
                 FileList.ScrollIntoView(FileList.SelectedItem);
             }
-            SetFileStatus(files.Count switch
-            {
-                0 => "没有匹配的文件",
-                EverythingSearch.ResultLimit => $"当前显示前 {EverythingSearch.ResultLimit} 个文件",
-                _ => ""
-            });
+            ShowFileCount(files.Count);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception
@@ -763,6 +778,13 @@ public partial class SearchWindow : Window
         }
         finally { finished = true; }
     }
+
+    private void ShowFileCount(int count) => SetFileStatus(count switch
+    {
+        0 => "没有匹配的文件",
+        EverythingSearch.ResultLimit => $"当前显示前 {EverythingSearch.ResultLimit} 个文件",
+        _ => ""
+    });
 
     private void SetFileStatus(string text)
     {
