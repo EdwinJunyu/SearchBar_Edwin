@@ -113,6 +113,16 @@
                 </Button>
             </Grid>
 
+            <ItemsControl x:Name="OtherGlosses" AutomationProperties.AutomationId="OtherGlosses"
+                          AutomationProperties.Name="其他词条预览" Margin="20,0">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <TextBlock Text="{Binding}" ToolTip="{Binding}" Margin="0,0,0,6"
+                                   Foreground="{StaticResource Accent}" TextTrimming="CharacterEllipsis"/>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
             <Border x:Name="DetailsPanel" AutomationProperties.AutomationId="DetailsPanel"
                     BorderThickness="0,1,0,0" BorderBrush="{StaticResource Divider}" Visibility="Collapsed">
                 <StackPanel Margin="20,15,20,17">

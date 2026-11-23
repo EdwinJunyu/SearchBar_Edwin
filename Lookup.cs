@@ -70,6 +70,17 @@ public static class Lookup
             .ThenBy(x => x.Hit.Entry.EntryId).Select(x => x.Hit).ToArray();
     }
 
+    public static string[] AdditionalPreviews(IReadOnlyList<LookupHit> matches)
+    {
+        // 首项已显示在输入行。按检索顺序选每组的首选词典，详情仍使用完整的 matches。
+        return matches.DistinctBy(hit => (hit.Entry.Language, Normalize(hit.Entry.Headword),
+                NormalizeReading(hit.Entry.Reading ?? "")))
+            .Skip(1).Take(2).Select(hit =>
+                IsJapanese(hit.Entry) && hit.Method != "headword"
+                    ? hit.Display
+                    : $"{hit.Entry.Headword} · {hit.Display}").ToArray();
+    }
+
     private static bool IsJapanese(LookupEntry entry) =>
         entry.Language.StartsWith("ja", StringComparison.OrdinalIgnoreCase);
 

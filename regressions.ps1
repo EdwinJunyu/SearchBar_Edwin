@@ -1305,6 +1305,16 @@ if ($BackendTestDirectory) {
         $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $uiDir "$lib.dll"))
     }
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+    # 直接使用窗口所用的预览逻辑，同时保留详情选择器所需的全部原始命中。
+    $hits = [LookupHit[]]@(
+        foreach ($row in @(@('橋','はし','桥','A'), @('橋','ハシ','桥梁','B'), @('箸','はし','筷子','A'),
+                            @('端','はし','边缘','A'), @('梯','はし','梯子','A'))) {
+            $entry = [LookupEntry]::new($row[3],1,'ja',1,$row[0],$row[1],$row[2])
+            [LookupHit]::new($entry,'romaji','はし',"$($row[0])（$($row[1])） · $($row[2])")
+        }
+    )
+    Assert-Equal (([Lookup]::AdditionalPreviews($hits)) -join '|') '箸（はし） · 筷子|端（はし） · 边缘' '同读音候选合并来源并最多预览三个词头'
+    Assert-Equal ([Lookup]::AdditionalPreviews([LookupHit[]]$hits[0..1])).Count 0 '单词头多来源保留单行'
     Test-ImportIdentity $BackendTestDirectory $assembly
     Test-EverythingRecovery $BackendTestDirectory $assembly
     Test-JapaneseLookup $BackendTestDirectory $assembly

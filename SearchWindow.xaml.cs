@@ -199,6 +199,7 @@ public partial class SearchWindow : Window
         CandidatePicker.ItemsSource = null;
         DetailsButton.Visibility = Visibility.Collapsed;
         GlossText.Text = "";
+        OtherGlosses.ItemsSource = null;
         if (IsVisible && !composing && !string.IsNullOrWhiteSpace(QueryBox.Text))
             _ = SearchDictionaryAsync(QueryBox.Text, revision, CancellationToken.None);
     }
@@ -384,6 +385,7 @@ public partial class SearchWindow : Window
         ClearButton.Visibility = QueryBox.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
         DetailsButton.Visibility = Visibility.Collapsed;
         GlossText.Text = "";
+        OtherGlosses.ItemsSource = null;
         SetStatus(hotkeyWarning);
         if (!composing && IsVisible && !string.IsNullOrWhiteSpace(QueryBox.Text)) debounce.Start();
     }
@@ -419,6 +421,7 @@ public partial class SearchWindow : Window
             }, token);
             if (request != revision || catalog != catalogRevision || !IsVisible || matches.Count == 0) return;
             GlossText.Text = matches[0].Display;
+            OtherGlosses.ItemsSource = Lookup.AdditionalPreviews(matches);
             var items = matches.Select(hit => new Candidate(hit)).ToArray();
             CandidatePicker.ItemsSource = items;
             CandidatePicker.SelectedIndex = 0;
