@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -23,9 +24,7 @@ internal static partial class EntryParser
             return Sanseido(key, body);
 
         string? gloss = null;
-        if (sourceId == "oxford")
-            gloss = Between(body, "color=#FF5000>", "</font>")?.TrimStart('•', ' ');
-        else if (sourceId == "hanying")
+        if (sourceId == "hanying")
         {
             // 只读第一义项的 JX 区，遇到“常用词组”时结束，避免误取短语翻译。
             var start = body.IndexOf("<span class=\"JX\">", IgnoreCase);
@@ -35,8 +34,87 @@ internal static partial class EntryParser
         }
         // 未知排版保留原文，以词头查询；仅在日语词头本身为假名时建立读音索引。
         var reading = language == "ja" ? Kana(key) : null;
-        return new(key, reading, reading == null ? null : "MDX 假名词头", Preview(gloss, body), null, []);
+        var summary = sourceId == "oxford" ? OxfordGloss(body) : Preview(gloss, body);
+        return new(key, reading, reading == null ? null : "MDX 假名词头", summary, null, []);
     }
+
+    internal static string OxfordGloss(string body)
+    {
+        string? first = null, second = null;
+        string firstPart = "", secondPart = "";
+        foreach (var (part, gloss) in OxfordSenses(body))
+        {
+            if (first == null) { (firstPart, first) = (part, gloss); continue; }
+            if (gloss == first) continue;
+            // 暂存同词性的次义。后面若有另一词性，优先展示能区分用法的一对。
+            bool differentPart = part.Length > 0 && firstPart.Length > 0 && part != firstPart;
+            if (second == null || differentPart)
+            {
+                (secondPart, second) = (part, gloss);
+                if (differentPart || firstPart.Length == 0) break;
+            }
+        }
+        if (first == null || second == null) return Preview(first, body);
+        string left = firstPart.Length == 0 ? first : $"{firstPart} {first}";
+        string right = secondPart.Length == 0 || secondPart == firstPart ? second : $"{secondPart} {second}";
+
+        // 两义共享 70 个文本元素。短的一侧可将余量让给另一侧，截断保留完整字素。
+        const string separator = " / ";
+        int available = 70 - separator.Length;
+        var l = StringInfo.ParseCombiningCharacters(left);
+        var r = StringInfo.ParseCombiningCharacters(right);
+        int leftLimit = Math.Min(l.Length, Math.Max(available / 2, available - r.Length));
+        static string Fit(string s, int[] starts, int n) => starts.Length <= n ? s : s[..starts[n - 1]] + "…";
+        return Fit(left, l, leftLimit) + separator + Fit(right, r, available - leftLimit);
+    }
+
+    private static IEnumerable<(string Part, string Gloss)> OxfordSenses(string body)
+    {
+        int divDepth = 0, noteDepth = 0, fontDepth = 0, start = 0;
+        string part = "";
+        bool inPhrases = false;
+        foreach (Match tag in OxfordTokens().Matches(body))
+        {
+            if (fontDepth != 0)
+            {
+                if (tag.Groups["openFont"].Success) fontDepth++;
+                if (tag.Groups["closeFont"].Success && --fontDepth == 0)
+                {
+                    var sense = Plain(body[start..tag.Index]).TrimStart('•', ' ');
+                    if (sense.Length != 0) yield return (part, sense);
+                }
+                continue;
+            }
+            if (tag.Groups["openDiv"].Success) { divDepth++; continue; }
+            if (tag.Groups["closeDiv"].Success)
+            {
+                if (noteDepth == divDepth) noteDepth = 0;
+                divDepth = Math.Max(0, divDepth - 1);
+                continue;
+            }
+            if (tag.Groups["note"].Success && noteDepth == 0) noteDepth = divDepth;
+            if (noteDepth > 0) continue;
+            // 某些词条在习语段之后才开始下一个词性，须等到明确的词性标题再恢复采集。
+            if (tag.Groups["section"].Success) inPhrases = true;
+            if (tag.Groups["pos"].Success)
+            {
+                var label = tag.Groups["pos"].Value.Trim().ToLowerInvariant();
+                part = label switch { "noun" => "n.", "verb" => "v.", "adjective" => "adj.",
+                    "adverb" => "adv.", "preposition" => "prep.", "pronoun" => "pron.", _ => label };
+                inPhrases = false;
+            }
+            if (!inPhrases && tag.Groups["openFont"].Success && OxfordTranslationColor().IsMatch(tag.Value))
+            {
+                fontDepth = 1;
+                start = tag.Index + tag.Length;
+            }
+        }
+    }
+
+    [GeneratedRegex(@"<font\b[^>]*\scolor\s*=\s*[""']?darkred(?=[""'\s>])[^>]*>\s*<b>\s*<i>(?<pos>[a-z. -]+)</i>\s*</b>\s*</font>|(?<openDiv><div\b[^>]*>)|(?<closeDiv></div\s*>)|(?<openFont><font\b[^>]*>)|(?<closeFont></font\s*>)|(?<note>【(?:HELP|ORIGIN)】)|(?<section>【(?:IDIOMS|PHR V)】)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex OxfordTokens();
+    [GeneratedRegex(@"\scolor\s*=\s*[""']?#FF5000(?=[""'\s>])", RegexOptions.IgnoreCase)]
+    private static partial Regex OxfordTranslationColor();
 
     // 预览和导入共用此流式解析器。记录起始行用于定位嵌套换行及转义引号。
     internal static IEnumerable<(int Line, string[] Fields)> ReadTableRows(Stream input, char delimiter)

@@ -393,13 +393,16 @@ internal sealed class DictionaryStore : IDisposable
                 CASE WHEN {(schema.HasRevision ? "m.revision IS NULL AND" : "")} d.filename LIKE '%.mdx'
                     AND (e.dict='shogakukan' OR e.evidence='MDX 正文首行假名')
                     AND (e.reading IS NULL OR replace(replace(e.gloss,'・',''),'－','')=e.reading)
-                    THEN substr(e.raw,1,4096) END
+                    THEN substr(e.raw,1,4096) END,
+                CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
+                    CASE WHEN d.id='oxford' OR d.filename=$oxfordName THEN 'oxford' END)='oxford' THEN e.raw END
             FROM found f
             JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
             JOIN dictionaries d ON d.id=e.dict {schema.Join} WHERE e.link IS NULL
             {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
             """, snapshot);
         cmd.Parameters.AddWithValue("$key",key);
+        cmd.Parameters.AddWithValue("$oxfordName", Path.GetFileName(Source.All.First(s => s.Id == "oxford").RelativePath));
         cmd.Parameters.AddWithValue("$kind",reading ? 1 : 0);
         cmd.Parameters.AddWithValue("$only",(object?)only ?? DBNull.Value);
         using var r = cmd.ExecuteReader();
@@ -409,6 +412,8 @@ internal sealed class DictionaryStore : IDisposable
             // 旧索引可能把读音存成首义。只检查本次命中且符合旧版回退特征的正文前缀。
             var gloss = r.GetString(6);
             if (!r.IsDBNull(9)) gloss = EntryParser.RefreshShogakukanGloss(gloss, r.GetString(9));
+            // 已安装的牛津索引只存了首义。仅对本次命中的牛津词条从原文生成新版摘要。
+            if (!r.IsDBNull(10)) gloss = EntryParser.OxfordGloss(r.GetString(10));
             yield return new LookupEntry(r.GetString(0),r.GetInt64(1),r.GetString(2),r.GetInt32(3),
                 r.GetString(4), r.IsDBNull(5) ? null : r.GetString(5), gloss)
                 { DictionaryName = r.GetString(7), DictionaryRevision = r.GetString(8) };

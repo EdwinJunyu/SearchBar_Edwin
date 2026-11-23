@@ -641,6 +641,47 @@ function Test-SettingsPage([switch]$Restarted) {
         Write-Output 'PASS Ctrl+Alt+F9 由独立进程真实注册占用，冲突后已有 Ctrl+Alt+F8 仍能实际唤起'
     } finally { [void][ESearchDesktop]::UnregisterHotKey($form.Handle,0x1471) }
 }
+function Test-OxfordSummary([string]$Scratch, [Reflection.Assembly]$Assembly) {
+    $previous = $env:E_SEARCH_DB
+    $env:E_SEARCH_DB = Join-Path $Scratch 'oxford-summary.db'
+    try {
+        $mdx = Join-Path $Scratch 'summary.mdx'
+        $noun = '<font color=darkred font=+1><b><i>noun </i></b></font>'
+        $adj = '<font color=darkred font=+1><b><i>adj. </i></b></font>'
+        $light = $noun + '<div>【HELP】<font color=#FF5000>说明</font></div><font color=#FF5000>• 光</font><font color=#FF5000>光源</font>【IDIOMS】<font color=#FF5000>习语</font>' + $adj + '<font color=#FF5000>• 明<font color=black>亮</font></font>'
+        Write-Mdx $mdx ([ordered]@{
+            light=$light
+            solo=$noun + '<font color=#FF5000>苹果</font>【PHR V】<font color=#FF5000>短语</font>'
+            pair='<font color=#FF5000>甲</font><font color=#FF5000>甲</font><font color=#FF5000>乙</font><font color=#FF5000>丙</font>'
+            long='<font color=#FF5000>' + ('长' * 80) + '</font><font color=#FF5000>短</font>'
+        })
+        Invoke-Search @('import','oxford',$mdx) | Out-Null
+        $ctor = $Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool]))
+        $connection = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$env:E_SEARCH_DB")
+        try {
+            $connection.Open()
+            $cmd = $connection.CreateCommand()
+            $cmd.CommandText = "SELECT gloss FROM entries WHERE head='light'"
+            Assert-Equal ($cmd.ExecuteScalar()) 'n. 光 / adj. 明亮' '导入时选择两个不同词性的主词条义项'
+            $cmd.CommandText = "UPDATE entries SET gloss='旧版摘要'"
+            [void]$cmd.ExecuteNonQuery()
+            $cmd.CommandText = 'ALTER TABLE dictionary_metadata DROP COLUMN parser_id; ALTER TABLE dictionary_metadata DROP COLUMN revision;'
+            [void]$cmd.ExecuteNonQuery()
+        } finally { $connection.Dispose() }
+        $reader = $ctor.Invoke([object[]]@($env:E_SEARCH_DB,$true))
+        try {
+            foreach ($row in @(@('light','n. 光 / adj. 明亮'), @('solo','苹果'), @('pair','甲 / 乙'))) {
+                $hit = $reader.Search($row[0],'oxford',[Threading.CancellationToken]::None)[0]
+                Assert-Equal $hit.Display $row[1] "既有索引摘要 $($row[0])"
+                if ($row[0] -eq 'light') { Assert-Equal ($reader.CurrentBody($hit.Entry)) $light '展开多义词仍读原文' }
+            }
+            $long = $reader.Search('long','oxford',[Threading.CancellationToken]::None)[0].Display
+            Assert-Equal ($long.Length -le 70 -and $long -like '*… / 短') $true '长首义与短次义都可读'
+        } finally { $reader.Dispose() }
+        Write-Output 'PASS 牛津多义摘要、词性、附录边界及既有索引'
+    } finally { $env:E_SEARCH_DB = $previous }
+}
+
 function Test-JapaneseLookup([string]$Scratch, [Reflection.Assembly]$Assembly) {
     $previous = $env:E_SEARCH_DB
     $env:E_SEARCH_DB = Join-Path $Scratch 'japanese-lookup.db'
@@ -1317,6 +1358,7 @@ if ($BackendTestDirectory) {
     Assert-Equal ([Lookup]::AdditionalPreviews([LookupHit[]]$hits[0..1])).Count 0 '单词头多来源保留单行'
     Test-ImportIdentity $BackendTestDirectory $assembly
     Test-EverythingRecovery $BackendTestDirectory $assembly
+    Test-OxfordSummary $BackendTestDirectory $assembly
     Test-JapaneseLookup $BackendTestDirectory $assembly
     Test-EntryRevision $BackendTestDirectory $assembly
     Test-ReleaseDataLocation
