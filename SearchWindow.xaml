@@ -65,7 +65,7 @@
                              Foreground="{StaticResource Ink}" CaretBrush="{StaticResource Accent}"
                              FontSize="21" Padding="1,0" BorderThickness="0" Background="Transparent"
                              VerticalScrollBarVisibility="Hidden" HorizontalScrollBarVisibility="Hidden"/>
-                    <TextBlock Text="输入词语或文件名" Margin="2,0,0,0" IsHitTestVisible="False"
+                    <TextBlock Text="输入词语或文件名，或用 ai 加空格提问" Margin="2,0,0,0" IsHitTestVisible="False"
                                Foreground="#607780" FontSize="20" VerticalAlignment="Center">
                         <TextBlock.Style>
                             <Style TargetType="TextBlock">

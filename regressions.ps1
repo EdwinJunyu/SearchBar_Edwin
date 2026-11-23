@@ -1305,6 +1305,21 @@ if ($BackendTestDirectory) {
         $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $uiDir "$lib.dll"))
     }
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+    # 通过桌面程序集验证真实的命令识别和编码，不在常规回归中启动浏览器。
+    $windowType = $assembly.GetType('ESearch.SearchWindow', $true)
+    $flags = [Reflection.BindingFlags]'Static,NonPublic'
+    $isCommand = $windowType.GetMethod('IsChatGptInput', $flags)
+    $target = $windowType.GetMethod('GetChatGptUrl', $flags)
+    if (!$isCommand -or !$target) { throw '缺少 ai 前缀跳转逻辑' }
+    foreach ($ordinary in 'ai','airport',' ai question') {
+        Assert-Equal ($isCommand.Invoke($null,@($ordinary))) $false "普通查询 $ordinary"
+    }
+    Assert-Equal ($isCommand.Invoke($null,@('ai '))) $true '空提示词仍处于 AI 模式'
+    Assert-Equal ($null -eq $target.Invoke($null,@('ai   '))) $true '空提示词不跳转'
+    $prompt = '解释 C++、a&b、#、%20 和 😊'
+    $url = $target.Invoke($null,@("ai $prompt"))
+    Assert-Equal $url ('https://chatgpt.com/?q=' + [Uri]::EscapeDataString($prompt)) '中文与 URL 特殊字符'
+    Write-Output 'PASS AI 前缀、空提示词与 ChatGPT 链接编码'
     Test-ImportIdentity $BackendTestDirectory $assembly
     Test-EverythingRecovery $BackendTestDirectory $assembly
     Test-JapaneseLookup $BackendTestDirectory $assembly

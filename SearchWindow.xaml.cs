@@ -199,7 +199,7 @@ public partial class SearchWindow : Window
         CandidatePicker.ItemsSource = null;
         DetailsButton.Visibility = Visibility.Collapsed;
         GlossText.Text = "";
-        if (IsVisible && !composing && !string.IsNullOrWhiteSpace(QueryBox.Text))
+        if (IsVisible && !composing && !IsChatGptInput(QueryBox.Text) && !string.IsNullOrWhiteSpace(QueryBox.Text))
             _ = SearchDictionaryAsync(QueryBox.Text, revision, CancellationToken.None);
     }
 
@@ -296,6 +296,19 @@ public partial class SearchWindow : Window
         SetWindowPos(hwnd, 0, (int)Math.Round(origin.X), y, 0, 0, 0x0015);
     }
 
+    private const string ChatGptPrefix = "ai ";
+
+    private static bool IsChatGptInput(string text) =>
+        text.StartsWith(ChatGptPrefix, StringComparison.Ordinal);
+
+    private static string? GetChatGptUrl(string text)
+    {
+        if (!IsChatGptInput(text)) return null;
+        string prompt = text[ChatGptPrefix.Length..];
+        // 只编码参数值，保留提示词中的空格、换行和 URL 特殊字符。
+        return string.IsNullOrWhiteSpace(prompt) ? null : "https://chatgpt.com/?q=" + Uri.EscapeDataString(prompt);
+    }
+
     private void HandleKey(object sender, System.Windows.Input.KeyEventArgs e)
     {
         // IME 自己消费确认、翻页和取消键。文件打开只接受当前查询的独立一次按键。
@@ -319,6 +332,14 @@ public partial class SearchWindow : Window
             CandidatePicker.IsDropDownOpen = true;
             e.Handled = true;
         }
+        else if (e.Key == Key.Enter && Keyboard.Modifiers == ModifierKeys.None && QueryBox.IsKeyboardFocused
+            && IsChatGptInput(QueryBox.Text))
+        {
+            // 空命令和长按回车都在这里消费，避免打开旧文件或重复启动浏览器。
+            e.Handled = true;
+            if (!e.IsRepeat && IsVisible && GetChatGptUrl(QueryBox.Text) is string url)
+                OpenWithShell(url, isFile: false, closeOnSuccess: true);
+        }
         else if (Keyboard.Modifiers == ModifierKeys.None && (QueryBox.IsKeyboardFocused || FileList.IsKeyboardFocusWithin))
         {
             if (e.Key == Key.Enter)
@@ -337,16 +358,16 @@ public partial class SearchWindow : Window
         }
     }
 
-    private void OpenWithShell(string target, bool isFile)
+    private void OpenWithShell(string target, bool isFile, bool closeOnSuccess = false)
     {
         try
         {
             if (isFile && !File.Exists(target))
                 throw new FileNotFoundException("文件已移动、已删除或无法访问。");
             using var process = Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
-            if (isFile)
+            if (isFile || closeOnSuccess)
             {
-                // Shell 已经把文件交给关联程序；此处隐藏即可，让新打开的窗口保有焦点。
+                // 文件或提问已交给关联程序，隐藏浮窗并让目标窗口保有焦点。
                 Hide();
                 QueryBox.Clear();
                 RefreshInput();
@@ -354,7 +375,8 @@ public partial class SearchWindow : Window
         }
         catch (Exception ex) when (ex is Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
         {
-            SetFileStatus("无法打开：" + ex.Message);
+            if (closeOnSuccess) SetStatus("无法打开 ChatGPT：" + ex.Message);
+            else SetFileStatus("无法打开：" + ex.Message);
         }
     }
 
@@ -384,6 +406,12 @@ public partial class SearchWindow : Window
         ClearButton.Visibility = QueryBox.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
         DetailsButton.Visibility = Visibility.Collapsed;
         GlossText.Text = "";
+        // 前缀一旦成立就停止本地检索，切换回普通文本后再恢复防抖查询。
+        if (IsChatGptInput(QueryBox.Text))
+        {
+            SetStatus("输入问题，按回车带到 ChatGPT，在网页中发送。");
+            return;
+        }
         SetStatus(hotkeyWarning);
         if (!composing && IsVisible && !string.IsNullOrWhiteSpace(QueryBox.Text)) debounce.Start();
     }
