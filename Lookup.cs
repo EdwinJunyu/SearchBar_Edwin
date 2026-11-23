@@ -6,11 +6,14 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 
+internal sealed record EntryAnchor(Range Title, Range Sense);
+
 public sealed record LookupEntry(string DictionaryId, long EntryId, string Language, int Priority,
     string Headword, string? Reading, string Gloss)
 {
     public string? DictionaryName { get; init; }
     public string? DictionaryRevision { get; init; }
+    internal EntryAnchor? Anchor { get; init; }
     internal (string Headword, string? Form)? Reference { get; init; }
 }
 
@@ -40,11 +43,12 @@ public static partial class Lookup
         if (term.Length == 0) return Array.Empty<LookupHit>();
         var hits = new Dictionary<(string, long), (int Rank, LookupHit Hit)>();
 
-        void Collect(string key, bool byReading, string method, int rank, string? language)
+        void Collect(string key, bool byReading, string method, int rank, string? language, string? dictionary = null)
         {
             foreach (var entry in find(key, byReading))
             {
                 if (language != null && !entry.Language.StartsWith(language, StringComparison.OrdinalIgnoreCase)) continue;
+                if (dictionary != null && entry.DictionaryId != dictionary) continue;
                 // 有些 MDX 额外把假名做成词头别名。命中已知读音时按读音显示规范词头。
                 var isReadingAlias = method == "headword" && IsJapanese(entry) && entry.Reading != null
                     && IsKana(key) && Normalize(entry.Headword) != key
@@ -64,11 +68,28 @@ public static partial class Lookup
 
         // 还原规则只生成候选。存在于启用的日语词库中的候选才参与排序。
         var inflected = IsKana(term) ? NormalizeReading(term) : term;
-        foreach (var lemma in Lemmas(inflected).Distinct(StringComparer.Ordinal))
+        void CollectJapanese(string lemma, int rank)
         {
-            Collect(lemma, false, "deinflection", 2, "ja");
-            // 纯假名变形的原形可能只存在于汉字词头的读音索引。两路按同一条目标识去重。
-            if (IsKana(lemma)) Collect(NormalizeReading(lemma), true, "deinflection", 2, "ja");
+            Collect(lemma, false, "deinflection", rank, "ja");
+            if (IsKana(lemma)) Collect(NormalizeReading(lemma), true, "deinflection", rank, "ja");
+        }
+        var direct = Lemmas(inflected).Distinct(StringComparer.Ordinal).ToArray();
+        foreach (var lemma in direct) CollectJapanese(lemma, 2);
+        // エ段＋る也可能本来就是一段动词（食べる）。已有常规命中时不按此弱证据另猜五段原形。
+        bool guessPotential = !hits.Values.Any(x => IsJapanese(x.Hit.Entry));
+        foreach (var lemma in AuxiliaryLemmas(inflected, direct, guessPotential).Except(direct, StringComparer.Ordinal))
+            CollectJapanese(lemma, 3);
+        // 有些可能动词也独立收录，如「読める＝能念」。只有外层活用、词典释义和同书原形三者
+        // 同时支持时才添加更深一层，避免把日常的「食べました」解释为古语「食ぶ」。
+        if (direct.Length > 0 && inflected.Any(c => c is >= '一' and <= '鿿')
+            && !hits.Values.Any(x => x.Rank < 2 && IsJapanese(x.Hit.Entry)))
+        {
+            var attested = hits.Values.Where(x => x.Rank == 2 && IsJapanese(x.Hit.Entry)
+                    && x.Hit.Term == Normalize(x.Hit.Entry.Headword) && PotentialGloss().IsMatch(x.Hit.Entry.Gloss))
+                .Select(x => (x.Hit.Term, x.Hit.Entry.DictionaryId)).Distinct().ToArray();
+            foreach (var (form, dictionary) in attested)
+                if (form.EndsWith('る') && Godan(form[..^1], "えけげせてねべめれ") is { } root)
+                    Collect(root, false, "deinflection", 3, "ja", dictionary);
         }
         foreach (var lemma in EnglishLemmas(term).Distinct(StringComparer.Ordinal))
             Collect(lemma, false, "deinflection", 2, "en");
@@ -111,7 +132,7 @@ public static partial class Lookup
     }
 
     private sealed record Phrase(string Surface, string Key, string Language, bool Reading,
-        int Units, int Offset, bool Restored);
+        int Units, int Offset, bool Restored, string? Canonical = null, bool WeakPotential = false);
 
     internal static IReadOnlyList<LookupHit> SearchPhrases(string input,
         Func<IEnumerable<string>, bool, string, HashSet<string>> existing,
@@ -132,13 +153,17 @@ public static partial class Lookup
     }
 
     internal static IReadOnlyList<LookupHit> SearchOxfordPhrases(string input,
-        Func<string, IEnumerable<LookupEntry>> subentries, CancellationToken token)
+        Func<string, IEnumerable<LookupEntry>> subentries, IReadOnlyList<LookupHit> indexed, CancellationToken token)
     {
         // 只为后接小品词的动词（含其原形）读取父词条，每个词头在本轮至多查询一次。
         var matches = new List<Phrase>();
         var entries = new Dictionary<string, List<LookupEntry>>(StringComparer.Ordinal);
-        foreach (var family in EnglishSpans(input, token, phrasalVerbs: true)
-                     .GroupBy(p => p.Key[..p.Key.IndexOf(' ')]))
+        if (indexed.Count > 0 && !IsEnglish(indexed[0].Entry)) return indexed;
+        // 已有独立词组时，只查能覆盖更长原文的可分标题，例如 turn the traffic light off。
+        int indexedWords = indexed.Count == 0 ? 0 : EnglishWords.Matches(indexed[0].Term).Count;
+        var candidates = SeparableSpans(input, token).Where(p => p.Units > indexedWords);
+        if (indexed.Count == 0) candidates = candidates.Concat(EnglishSpans(input, token, phrasalVerbs: true));
+        foreach (var family in candidates.GroupBy(p => p.Key[..p.Key.IndexOf(' ')]))
         {
             token.ThrowIfCancellationRequested();
             var spans = family.ToLookup(p => p.Key);
@@ -153,7 +178,7 @@ public static partial class Lookup
                 senses.Add(entry);
             }
         }
-        return LongestPhraseHits(matches, p => entries[p.Key]);
+        return matches.Count == 0 ? indexed : LongestPhraseHits(matches, p => entries[p.Key]);
     }
 
     private static IReadOnlyList<LookupHit> LongestPhraseHits(IEnumerable<Phrase> possible,
@@ -161,20 +186,27 @@ public static partial class Lookup
     {
         foreach (var length in possible.GroupBy(p => p.Units).OrderByDescending(g => g.Key))
         {
-            var hits = new Dictionary<(string,long,string), (Phrase Phrase, LookupHit Hit)>();
-            foreach (var phrase in length.OrderBy(p => p.Restored).ThenBy(p => p.Offset)
+            var hits = new Dictionary<(string,long,string,EntryAnchor?), (Phrase Phrase, LookupHit Hit)>();
+            var resolvedJapanese = new HashSet<int>();
+            foreach (var phrase in length.OrderBy(p => p.WeakPotential).ThenBy(p => p.Restored).ThenBy(p => p.Offset)
                          .DistinctBy(p => (p.Key, p.Language, p.Reading)))
             {
+                // 同一位置已有可打开的日语词条时，不再用エ段猜测古语或其他同形词。
+                if (phrase.WeakPotential && resolvedJapanese.Contains(phrase.Offset)) continue;
                 foreach (var entry in resolve(phrase))
                 {
                     if (entry.Language != phrase.Language) continue;
-                    var label = phrase.Surface == entry.Headword ? phrase.Surface : $"{phrase.Surface} → {entry.Headword}";
+                    if (!phrase.WeakPotential && phrase.Language == "ja") resolvedJapanese.Add(phrase.Offset);
+                    var head = phrase.Canonical ?? entry.Headword;
+                    var label = phrase.Surface == head ? phrase.Surface : $"{phrase.Surface} → {head}";
                     var hit = new LookupHit(entry, "phrase", phrase.Surface, $"{label} · {Format(entry, "headword")}");
-                    hits.TryAdd((entry.DictionaryId, entry.EntryId, entry.Headword), (phrase, hit));
+                    // 同一双占位标题可经 sb、sth 两条路径命中一次；相同父词头下不同标题仍保留各自的释义。
+                    var anchor = phrase.Canonical == null ? null : entry.Anchor;
+                    hits.TryAdd((entry.DictionaryId, entry.EntryId, anchor == null ? entry.Headword : head, anchor), (phrase, hit));
                 }
             }
             if (hits.Count > 0)
-                return hits.Values.OrderBy(x => x.Phrase.Offset).ThenBy(x => x.Phrase.Restored)
+                return hits.Values.OrderBy(x => x.Phrase.Offset).ThenBy(x => x.Phrase.Canonical != null).ThenBy(x => x.Phrase.Restored)
                     .ThenBy(x => x.Hit.Entry.Priority).ThenBy(x => x.Hit.Entry.DictionaryId, StringComparer.Ordinal)
                     .ThenBy(x => x.Hit.Entry.EntryId).Select(x => x.Hit).ToArray();
         }
@@ -221,9 +253,82 @@ public static partial class Lookup
 
     }
 
+    private static IEnumerable<Phrase> SeparableSpans(string input, CancellationToken token)
+    {
+        var words = EnglishWords.Matches(input);
+        if (words.Count < 3) yield break;
+        var keys = words.Select(w => Normalize(w.Value)).ToArray();
+        for (int start = 0; start + 2 < words.Count; start++)
+        {
+            token.ThrowIfCancellationRequested();
+            // 动词 + 最多三个宾语单词 + 小品词。词间出现标点或换行即停止。
+            for (int end = start + 1; end < words.Count && end <= start + 4; end++)
+            {
+                int gapStart = words[end-1].Index + words[end-1].Length;
+                var gap = input.AsSpan(gapStart, words[end].Index - gapStart);
+                if (gap.IsEmpty || gap.IndexOfAnyExcept(' ', '\t', '　') >= 0) break;
+                if (end == start + 1) continue;
+                foreach (bool afterParticle in new[] { false, true })
+                {
+                    string particle = keys[afterParticle ? start + 1 : end];
+                    if (particle is not ("off" or "on" or "up" or "down" or "out" or "in" or "over" or "back"
+                        or "away" or "around" or "round" or "through" or "along" or "apart" or "aside")) continue;
+                    int objectStart = start + (afterParticle ? 2 : 1);
+                    foreach (string slot in ObjectSlots(keys, objectStart, end - start - 1, afterParticle))
+                    {
+                        string surface = input[words[start].Index..(words[end].Index + words[end].Length)];
+                        foreach (string verb in new[] { keys[start] }.Concat(EnglishLemmas(keys[start])))
+                        {
+                            string head = verb + " " + particle;
+                            // 查的都是词典本身明示宾语位置的词头，绝不把普通 “look after” 拆用。
+                            foreach (string separator in afterParticle ? new[] { "∽", "↔" } : new[] { " ", "∽", "↔" })
+                                yield return new(surface, verb + " " + slot + separator + particle, "en", false,
+                                    end - start + 1, words[start].Index, verb != keys[start], head);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<string> ObjectSlots(string[] words, int start, int count, bool afterParticle)
+    {
+        string first = words[start];
+        if (count == 1)
+        {
+            // 代词只能放在小品词前。them 既可指人也可指物，保留两个有词典依据的义项。
+            if (afterParticle) yield break;
+            if (first is "it" or "them") yield return "sth";
+            if (first is "me" or "him" or "her" or "us" or "you" or "them") yield return "sb";
+            yield break;
+        }
+        if (first is not ("the" or "a" or "an" or "my" or "your" or "his" or "her" or "our" or "their"
+            or "this" or "that" or "these" or "those")) yield break;
+        // 中置宾语由末尾的小品词定界，允许未知修饰语。后置的多词宾语还需可辨认的中心名词，
+        // 避免把 “turn off the light immediately” 的副词误纳入短语。
+        for (int i = start + 1; i < start + count; i++)
+        {
+            string word = words[i];
+            if (!word.All(c => c is >= 'a' and <= 'z') || word is "and" or "or" or "to" or "of" or "for"
+                or "at" or "is" or "was" or "are" or "were" or "will" or "can" or "please") yield break;
+        }
+        string? slot = words[start + count - 1] switch
+        {
+            "person" or "people" or "child" or "children" or "boy" or "girl" or "man" or "woman"
+                or "friend" or "friends" or "teacher" or "teachers" or "customer" or "customers" => "sb",
+            "light" or "lights" or "lamp" or "lamps" or "radio" or "tv" or "television" or "computer"
+                or "machine" or "engine" or "phone" or "power" or "water" or "gas" or "tap" or "fan" => "sth",
+            _ => null
+        };
+        if (afterParticle && count == 3 && slot == null) yield break;
+        if (slot != "sth") yield return "sb";
+        if (slot != "sb") yield return "sth";
+    }
+
     private static IEnumerable<Phrase> SentenceSpans(string input, CancellationToken token)
     {
         foreach (var phrase in EnglishSpans(input, token, phrasalVerbs: false)) yield return phrase;
+        foreach (var phrase in SeparableSpans(input, token)) yield return phrase;
         // 没有假名的汉语文本和短小的孤立词不做日语切片。窗口有上限，长句的候选数随字数线性增长。
         if (!input.Any(c => c is >= 'ぁ' and <= 'ゖ' || IsKatakanaUnit(c))) yield break;
         foreach (System.Text.RegularExpressions.Match run in JapaneseRuns.Matches(input))
@@ -243,12 +348,17 @@ public static partial class Lookup
                     string key = Normalize(surface);
                     if (key.Length < 3) continue;
                     if (key.Length > 32) break;
-                    foreach (var candidate in new[] { key }.Concat(Lemmas(IsKana(key) ? NormalizeReading(key) : key)))
+                    var inflected = IsKana(key) ? NormalizeReading(key) : key;
+                    var direct = Lemmas(inflected).ToArray();
+                    var regular = direct.Prepend(key).Concat(AuxiliaryLemmas(inflected, direct, false));
+                    var potential = direct.Prepend(inflected).Where(form => form.EndsWith('る'))
+                        .Select(form => Godan(form[..^1], "えけげせてねべめれ")).OfType<string>();
+                    foreach (var (candidate, weak) in regular.Select(s => (s, false)).Concat(potential.Select(s => (s, true))).DistinctBy(p => p.Item1))
                     {
                         bool restored = candidate != key;
-                        yield return new(surface, candidate, "ja", false, key.Length, start, restored);
+                        yield return new(surface, candidate, "ja", false, key.Length, start, restored, WeakPotential: weak);
                         if (IsKana(candidate))
-                            yield return new(surface, NormalizeReading(candidate), "ja", true, key.Length, start, restored);
+                            yield return new(surface, NormalizeReading(candidate), "ja", true, key.Length, start, restored, WeakPotential: weak);
                     }
                 }
             }
@@ -280,7 +390,7 @@ public static partial class Lookup
     {
         // 首项已显示在输入行。按检索顺序选每组的首选词典，详情仍使用完整的 matches。
         return matches.DistinctBy(hit => (hit.Entry.Language, Normalize(hit.Entry.Headword),
-                NormalizeReading(hit.Entry.Reading ?? "")))
+                NormalizeReading(hit.Entry.Reading ?? ""), hit.Entry.Anchor == null ? null : hit.Entry.Gloss))
             .Skip(1).Take(2).Select(hit =>
                 hit.Method != "headword" || hit.HasReferencePreview
                     ? hit.Display
@@ -483,6 +593,73 @@ public static partial class Lookup
         foreach (var (suffix, endings) in VerbEndings)
             if (word.EndsWith(suffix, StringComparison.Ordinal))
                 foreach (var lemmaEnding in endings) yield return word[..^suffix.Length] + lemmaEnding;
+    }
+
+    [GeneratedRegex(@"^(?:能|会|會|可|can\b|be\s+able\s+to\b)|可能動詞|ことができる", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex PotentialGloss();
+
+    private static IEnumerable<string> AuxiliaryLemmas(string word, string[] direct, bool guessPotential)
+    {
+        // 固定顺序最多各剥一层：礼貌/时态（direct）、体、语态。不会递归展开整棵候选树。
+        foreach (var form in direct.Prepend(word))
+        {
+            if (form.Length < 2) continue;
+            foreach (var root in VoiceRoots(form, guessPotential)) yield return root;
+            int auxiliaryLength = form.EndsWith("いる", StringComparison.Ordinal) ? 2 :
+                form.EndsWith("しまう", StringComparison.Ordinal) ? 3 :
+                form.EndsWith("おく", StringComparison.Ordinal) ? 2 : 0;
+            if (auxiliaryLength == 0 || form.Length <= auxiliaryLength + 1) continue;
+            int end = form.Length - auxiliaryLength;
+            if (form[end - 1] is not ('て' or 'で')) continue;
+            foreach (var plain in Lemmas(form[..end]))
+            {
+                yield return plain;
+                foreach (var root in VoiceRoots(plain, guessPotential)) yield return root;
+            }
+        }
+    }
+
+    private static IEnumerable<string> VoiceRoots(string form, bool guessPotential)
+    {
+        if (form.Length < 2 || form[^1] != 'る') yield break;
+        if (form.EndsWith("られる", StringComparison.Ordinal) && form.Length > 3)
+        {
+            string stem = form[..^3];
+            yield return stem + "る"; // 食べられる → 食べる、来られる → 来る。
+            if (stem == "こ") yield return "くる";
+            if (stem.EndsWith('せ'))
+                foreach (var root in CausativeRoots(stem[..^1])) yield return root;
+        }
+        if (form.EndsWith("れる", StringComparison.Ordinal))
+        {
+            var stem = form[..^2];
+            if (Godan(stem, "わかがさたなばまら") is { } passive) yield return passive;
+            if (stem.EndsWith('さ'))
+            {
+                yield return stem[..^1] + "する"; // 勉強される，以及縮约形「書かされる」。
+                if (Godan(stem[..^1], "わかがさたなばまら") is { } contracted) yield return contracted;
+            }
+        }
+        if (form.EndsWith("せる", StringComparison.Ordinal))
+            foreach (var root in CausativeRoots(form[..^2])) yield return root;
+        if (guessPotential && Godan(form[..^1], "えけげせてねべめれ") is { } potential)
+            yield return potential;
+    }
+
+    private static IEnumerable<string> CausativeRoots(string stem)
+    {
+        if (Godan(stem, "わかがさたなばまら") is { } godan) yield return godan;
+        if (!stem.EndsWith('さ')) yield break;
+        var baseStem = stem[..^1];
+        if (baseStem.Length > 0) yield return baseStem + "る";
+        if (baseStem == "こ") yield return "くる";
+        else yield return baseStem + "する";
+    }
+
+    private static string? Godan(string stem, string row)
+    {
+        int index = stem.Length == 0 ? -1 : row.IndexOf(stem[^1]);
+        return index < 0 ? null : stem[..^1] + "うくぐすつぬぶむる"[index];
     }
 
     private static IEnumerable<string> FromStem(string stem, string row, string dictionaryRow)

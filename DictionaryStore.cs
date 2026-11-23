@@ -368,12 +368,13 @@ internal sealed class DictionaryStore : IDisposable
             IEnumerable<LookupEntry> FindKey(string key, bool reading) => Find(key, reading, only, snapshot, schema, token);
             var hits = Lookup.Search(input, FindKey);
             if (hits.Count == 0)
+            {
                 hits = Lookup.SearchPhrases(input,
                     (keys, reading, language) => ExistingTerms(keys, reading, language, only, snapshot, schema, token),
                     FindKey, token);
-            if (hits.Count == 0)
                 hits = Lookup.SearchOxfordPhrases(input,
-                    key => Find(key, false, only, snapshot, schema, token, phrasalSenses: true), token);
+                    key => Find(key, false, only, snapshot, schema, token, phrasalSenses: true), hits, token);
+            }
             if (hits.Count == 0)
                 hits = SuggestSpelling(input, only, snapshot, schema, token);
             hits = ApplyReadingPreferences(hits, snapshot, token);
@@ -530,7 +531,7 @@ internal sealed class DictionaryStore : IDisposable
                 // 第 10 列只给已识别的牛津 MDX 原文；继续保留父词条的词典、序号及版本以打开详情。
                 if (entry.Language == "en" && !r.IsDBNull(10) && Lookup.Normalize(entry.Headword) == key)
                     foreach (var phrase in EntryParser.OxfordPhrasalSenses(r.GetString(10), key))
-                        yield return entry with { Headword = phrase.Headword, Gloss = phrase.Gloss };
+                        yield return entry with { Headword = phrase.Headword, Gloss = phrase.Gloss, Anchor = phrase.Anchor };
                 continue;
             }
             var gloss = entry.Gloss;

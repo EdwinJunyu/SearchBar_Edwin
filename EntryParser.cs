@@ -42,7 +42,7 @@ internal static partial class EntryParser
     {
         string? first = null, second = null;
         string firstPart = "", secondPart = "";
-        foreach (var (part, gloss) in OxfordSenses(body))
+        foreach (var (part, gloss, _) in OxfordSenses(body))
         {
             if (first == null) { (firstPart, first) = (part, gloss); continue; }
             if (gloss == first) continue;
@@ -99,7 +99,7 @@ internal static partial class EntryParser
     [GeneratedRegex(@"(?:^|>)\s*(?:=|(?:--›\s*)?see\b|(?<form>pt|pp|past tense|past participle)\s+of\b)\s*(?:<b\s*>\s*)?<a\s+href\s*=\s*[""']entry://(?<word>[a-z]+(?:[ '\-][a-z]+)*)[""']", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex OxfordReference();
 
-    private static IEnumerable<(string Part, string Gloss)> OxfordSenses(string body)
+    private static IEnumerable<(string Part, string Gloss, Range RawSpan)> OxfordSenses(string body)
     {
         int divDepth = 0, noteDepth = 0, fontDepth = 0, start = 0;
         string part = "";
@@ -112,7 +112,7 @@ internal static partial class EntryParser
                 if (tag.Groups["closeFont"].Success && --fontDepth == 0)
                 {
                     var sense = Plain(body[start..tag.Index]).TrimStart('•', ' ');
-                    if (sense.Length != 0) yield return (part, sense);
+                    if (sense.Length != 0) yield return (part, sense, start..tag.Index);
                 }
                 continue;
             }
@@ -147,7 +147,7 @@ internal static partial class EntryParser
     [GeneratedRegex(@"\scolor\s*=\s*[""']?#FF5000(?=[""'\s>])", RegexOptions.IgnoreCase)]
     private static partial Regex OxfordTranslationColor();
 
-    internal static IEnumerable<(string Headword, string Gloss)> OxfordPhrasalSenses(string body, string parent)
+    internal static IEnumerable<(string Headword, string Gloss, EntryAnchor Anchor)> OxfordPhrasalSenses(string body, string parent)
     {
         if (!body.Contains("【PHR V】", IgnoreCase)) yield break;
         bool inPhrases = false;
@@ -166,19 +166,17 @@ internal static partial class EntryParser
                 if (close >= 0)
                 {
                     string title = Plain(body[start..close]).Replace("7", "").Replace("'", "").Trim().ToLowerInvariant();
-                    var form = OxfordPhraseForm().Match(title);
-                    string key = form.Groups["key"].Value;
-                    if (form.Success && key.StartsWith(parent + " ", StringComparison.Ordinal)
-                        && !key.Split(' ').Any(w => w is "sb" or "sth"))
+                    string[] keys = OxfordPhraseKeys(title, parent).ToArray();
+                    if (keys.Length > 0)
                     {
                         int from = close + "</span>".Length;
                         int example = body.IndexOf("color:#04F", from, limit - from, IgnoreCase);
-                        var sense = OxfordSenses(body[from..(example >= 0 ? example : limit)]).FirstOrDefault().Gloss;
-                        if (!string.IsNullOrEmpty(sense))
+                        var sense = OxfordSenses(body[from..(example >= 0 ? example : limit)]).FirstOrDefault();
+                        if (!string.IsNullOrEmpty(sense.Gloss))
                         {
-                            yield return (key, sense);
-                            string particle = form.Groups["optional"].Value;
-                            if (particle.Length != 0) yield return (key + " " + particle, sense);
+                            // 返回父词条的原始位置；同文例句或重复的短语标题不会改变展开后的定位。
+                            var anchor = new EntryAnchor(start..close, (from + sense.RawSpan.Start.Value)..(from + sense.RawSpan.End.Value));
+                            foreach (var key in keys) yield return (key, sense.Gloss, anchor);
                         }
                     }
                 }
@@ -189,6 +187,31 @@ internal static partial class EntryParser
 
     [GeneratedRegex(@"<div\b[^>]*>\s*<b>\s*【(?<section>PHR V|IDIOMS)】|<font\b[^>]*\scolor\s*=\s*[""']?darkred(?=[""'\s>])[^>]*>\s*<b>\s*<i>|(?<title><span\s+style\s*=\s*[""']color:\s*blue;\s*font-weight:\s*bold;?[""']>\s*<font\s+color\s*=\s*[""']?red[""']?>\s*◘\s*</font>)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex OxfordPhraseMarker();
+
+    private static IEnumerable<string> OxfordPhraseKeys(string title, string parent)
+    {
+        title = title.TrimStart('|', ' ');
+        if (!title.StartsWith(parent + " ", StringComparison.Ordinal)) yield break;
+        // 明确位于动词和小品词之间的宾语占位才允许拆开。双向标记还允许名词放在小品词后。
+        var split = OxfordSeparableTitle().Match(title);
+        if (split.Success)
+        {
+            string separator = split.Groups["arrow"].Success ? "∽" : " ";
+            foreach (Capture slot in split.Groups["object"].Captures)
+                foreach (Capture part in split.Groups["particle"].Captures)
+                    yield return parent + " " + slot.Value + separator + part.Value;
+            yield break;
+        }
+        var form = OxfordPhraseForm().Match(title);
+        string key = form.Groups["key"].Value;
+        if (!form.Success || key.Split(' ').Any(w => w is "sb" or "sth")) yield break;
+        yield return key;
+        string particle = form.Groups["optional"].Value;
+        if (particle.Length != 0) yield return key + " " + particle;
+    }
+
+    [GeneratedRegex(@"^[a-z]+ (?<object>sb|sth)(?: */ *(?<object>sb|sth))?(?: *(?<arrow>[∽↔]) *| +)(?<particle>[a-z]+)(?: */ *(?<particle>[a-z]+))*$", RegexOptions.CultureInvariant)]
+    private static partial Regex OxfordSeparableTitle();
 
     // sb / sth 是宾语占位；(of sth) 允许匹配 “run out” 和 “run out of” 两种词形。
     [GeneratedRegex(@"^(?<key>[a-z]+(?: [a-z]+)+?)(?: (?:sb|sth)(?:\s*/\s*(?:sb|sth))?| \((?<optional>[a-z]+) (?:sb|sth)\))?$", RegexOptions.CultureInvariant)]

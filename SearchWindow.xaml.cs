@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Automation;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Threading;
@@ -575,6 +576,80 @@ public partial class SearchWindow : Window
         finally { ReadingPreferencePanel.IsEnabled = true; }
     }
 
+    private sealed record DetailBody(string Text, EntryAnchor? Anchor);
+
+    private static DetailBody FormatDetail(string raw, EntryAnchor? anchor)
+    {
+        // 坐标分界均在完整标签之间，先分段解码再映射。实体、嵌套标签和重复文字都不靠文本搜索定位。
+        static string Decode(string html)
+        {
+            var lines = Regex.Replace(html, @"<(?:br\b[^>]*|/p\s*|/div\s*|/li\s*|/tr\s*)>", "\n", RegexOptions.IgnoreCase);
+            return WebUtility.HtmlDecode(Regex.Replace(lines, @"</?[a-zA-Z][^>]*>", ""));
+        }
+        if (anchor == null)
+        {
+            var lines = Decode(raw).Split(['\r','\n'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            return new(string.Join(Environment.NewLine, lines), null);
+        }
+
+        var rawOffsets = new[] { anchor.Title.Start.Value, anchor.Title.End.Value, anchor.Sense.Start.Value, anchor.Sense.End.Value };
+        var offsets = new int[4];
+        var decoded = new StringBuilder();
+        int previous = 0;
+        for (int i = 0; i < offsets.Length; i++)
+        {
+            decoded.Append(Decode(raw[previous..rawOffsets[i]]));
+            offsets[i] = decoded.Length;
+            previous = rawOffsets[i];
+        }
+        decoded.Append(Decode(raw[previous..]));
+
+        // 与普通正文同样逐行裁切并省略空行，同时将四个解码后的边界换算为最终文本的位置。
+        var text = new StringBuilder();
+        int mapped = 0;
+        foreach (Match line in Regex.Matches(decoded.ToString(), @"[^\r\n]+"))
+        {
+            var trimmed = line.ValueSpan.Trim();
+            if (trimmed.IsEmpty) continue;
+            int start = line.Index + line.Length - line.ValueSpan.TrimStart().Length;
+            if (text.Length > 0) text.AppendLine();
+            while (mapped < offsets.Length && offsets[mapped] <= line.Index + line.Length)
+            {
+                offsets[mapped] = text.Length + Math.Clamp(offsets[mapped] - start, 0, trimmed.Length);
+                mapped++;
+            }
+            text.Append(trimmed);
+        }
+        while (mapped < offsets.Length) offsets[mapped++] = text.Length;
+        return new(text.ToString(), new EntryAnchor(offsets[0]..offsets[1], offsets[2]..offsets[3]));
+    }
+
+    private void DisplayDetail(DetailBody body)
+    {
+        DetailScroll.ScrollToTop();
+        if (body.Anchor is not { } anchor)
+        {
+            EntryText.Text = body.Text.Length == 0 ? "此词条正文为空。" : body.Text;
+            return;
+        }
+
+        var text = body.Text;
+        EntryText.Inlines.Clear();
+        Run Highlight(Range range) => new(text[range]) {
+            FontWeight = FontWeights.Bold, Background = System.Windows.Media.Brushes.LightGoldenrodYellow
+        };
+        var title = Highlight(anchor.Title);
+        EntryText.Inlines.Add(new Run(text[..anchor.Title.Start]));
+        EntryText.Inlines.Add(title);
+        EntryText.Inlines.Add(new Run(text[anchor.Title.End..anchor.Sense.Start]));
+        EntryText.Inlines.Add(Highlight(anchor.Sense));
+        EntryText.Inlines.Add(new Run(text[anchor.Sense.End..]));
+        // 按实际换行布局获得标题行的位置，长正文和缩放时仍滚到命中的小节。
+        EntryText.UpdateLayout();
+        var bounds = title.ContentStart.GetCharacterRect(LogicalDirection.Forward);
+        if (!bounds.IsEmpty) DetailScroll.ScrollToVerticalOffset(Math.Max(0, bounds.Top - 4));
+    }
+
     private async Task ShowEntryAsync()
     {
         if (CandidatePicker.SelectedItem is not Candidate chosen) return;
@@ -588,13 +663,8 @@ public partial class SearchWindow : Window
             {
                 using var store = new DictionaryStore(databasePath, readOnly: true);
                 var raw = store.CurrentBody(chosen.Hit.Entry);
-                if (raw == null) return (Body: (string?)null, Preferred: (string?)null);
-                // MDX HTML 仅作为文字呈现；保留义项和例句的段落，不执行外部资源。
-                var lines = Regex.Replace(raw, @"<(?:br\b[^>]*|/p\s*|/div\s*|/li\s*|/tr\s*)>", "\n", RegexOptions.IgnoreCase);
-                var plain = WebUtility.HtmlDecode(Regex.Replace(lines, @"</?[a-zA-Z][^>]*>", ""));
-                var text = string.Join(Environment.NewLine, plain.Split(['\r','\n'],
-                    StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries));
-                return (Body: text, Preferred: reading == null ? null : store.ReadReadingPreference(reading));
+                if (raw == null) return (Body: (DetailBody?)null, Preferred: (string?)null);
+                return (Body: FormatDetail(raw, chosen.Hit.Entry.Anchor), Preferred: reading == null ? null : store.ReadReadingPreference(reading));
             });
             if (request != detailRevision || !DetailsPanel.IsVisible) return;
             if (full.Body == null)
@@ -602,7 +672,7 @@ public partial class SearchWindow : Window
                 RefreshDictionary();
                 return;
             }
-            EntryText.Text = full.Body.Length == 0 ? "此词条正文为空。" : full.Body;
+            DisplayDetail(full.Body);
             if (reading != null)
             {
                 bool current = Lookup.Normalize(chosen.Hit.Entry.Headword) == full.Preferred;

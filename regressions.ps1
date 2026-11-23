@@ -787,7 +787,82 @@ function Test-SentencePhrases([string]$Scratch) {
         Write-Mdx $en ([ordered]@{run=$run; 'run out of'='独立词头释义'})
         Invoke-Search @('import','oxford',$en) | Out-Null
         Assert-Equal (@(Invoke-Search @('query','I ran out of time.'))[0] -split "`t")[3] 'ran out of → run out of · 独立词头释义' '已收录独立词头时优先'
+        # 真实牛津分开标记人和物。相同父词条的其他 off 义项不能冒充可分用法。
+        $turn='<div><b>【PHR V】</b></div>' + $mark + 'turn off</SPAN><br><font color=#FF5000>转弯</font>' +
+            $mark + "turn sb∽'off</SPAN><br><font color=#FF5000>使人厌烦</font>" +
+            $mark + "turn sth↔'off</SPAN><br><font color=#FF5000>关掉设备</font>"
+        $forms=[ordered]@{turn=$turn; 'traffic light'='信号灯'; 'look after'='照顾'; 'pick sth up'='捡起'}
+        $forms['lift']='<div><b>【PHR V】</b></div>' + $mark + "lift sb∽'up</SPAN><font color=#FF5000>接人</font>" +
+            $mark + "lift sb / sth∽'up</SPAN><font color=#FF5000>举起</font>"
+        Write-Mdx $en $forms
+        Invoke-Search @('import','oxford',$en) | Out-Null
+        foreach ($text in 'turn the bright light off','turn it off','turned it off','turn the light off','turn the traffic light off','turn off the light') {
+            $items=@(Invoke-Search @('query',"Could you $text please?"))
+            Assert-Equal $items.Count 1 '可分动词只显示与宾语相符的最长义项'
+            $parts=$items[0] -split "`t"
+            Assert-Equal $parts[0] 'oxford:1' '可分义项指向父条目详情'
+            Assert-Equal $parts[3] "$text → turn off · 关掉设备" '原文、连写原形及物义'
+        }
+        Assert-Equal (@(Invoke-Search @('query','turn him off'))[0] -split "`t")[3] 'turn him off → turn off · 使人厌烦' '人称宾语优先匹配 sb'
+        Assert-Equal (@(Invoke-Search @('query','turn the teacher off'))[0] -split "`t")[3] 'turn the teacher off → turn off · 使人厌烦' '已知人的名词宾语'
+        Assert-Equal @(Invoke-Search @('query','turn the unknown floom off')).Count 2 '不确定人或物时保留有词典依据的两种义项'
+        $shared=@(Invoke-Search @('query','lift him up'))
+        Assert-Equal ($shared.Count -eq 2 -and ($shared -like '*接人') -and ($shared -like '*举起')) $true '两个标题共享 sb 位置时均保留义项'
+        Assert-Equal (@(Invoke-Search @('query','lift it up'))[0] -split "`t")[3] 'lift it up → lift up · 举起' '双占位的物义'
+        Assert-Equal @(Invoke-Search @('query','lift them up')).Count 2 '同一双占位标题同时适用人或物只出现一次'
+        Assert-Equal @(Invoke-Search @('query','turn them off')).Count 2 'them 的两种对象含义均可检查'
+        Assert-Equal (@(Invoke-Search @('query','pick it up'))[0] -split "`t")[3] 'pick it up → pick up · 捡起' '独立词头可显式标明中间宾语'
+        foreach ($text in 'look it after','turn it, off') {
+            Assert-Equal @(Invoke-Search @('query',$text)).Count 0 "不可分及标点禁止越界 $text"
+        }
+        $forms['turn the light off']='该独立表达'
+        Write-Mdx $en $forms
+        Invoke-Search @('import','oxford',$en) | Out-Null
+        Assert-Equal (@(Invoke-Search @('query','Please turn the light off.'))[0] -split "`t")[3] 'turn the light off · 该独立表达' '同长度时独立词头优先'
         Write-Output 'PASS 英日句中最长短语、活用、原文、边界和词库筛选'
+    } finally { $env:E_SEARCH_DB=$previous }
+}
+
+function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly) {
+    $previous=$env:E_SEARCH_DB
+    $env:E_SEARCH_DB=Join-Path $Scratch 'phrase-anchor.db'
+    try {
+        $book=Join-Path $Scratch 'phrase-anchor.mdx'
+        $title='<SPAN style="color:blue;font-weight:bold"><font color=red>◘</font> '
+        $body=('run out (of sth) · 用完 &amp; 耗尽<br>' * 15) + '<div><b>【PHR V】</b></div>' +
+            $title + 'run out </SPAN><br><font color=#FF5000>到期</font>' +
+            $title + '<i>run</i> out (of sth) </SPAN><br>definition<br><font color=#FF5000>用完 &amp; 耗尽</font>' +
+            '<br>剩余例句'
+        Write-Mdx $book ([ordered]@{run=$body})
+        Invoke-Search @('import','oxford',$book) | Out-Null
+        $ctor=$Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool]))
+        $reader=$ctor.Invoke([object[]]@($env:E_SEARCH_DB,$true))
+        try {
+            $entry=$reader.Search('I ran out of time.','oxford',[Threading.CancellationToken]::None)[0].Entry
+            Assert-Equal $entry.Gloss '用完 & 耗尽' '定位含实体的内嵌义项'
+            $property=$entry.GetType().GetProperty('Anchor',[Reflection.BindingFlags]'Instance,NonPublic')
+            if (!$property -or !($anchor=$property.GetValue($entry))) { throw '内嵌义项未保留原文位置' }
+            $raw=$reader.CurrentBody($entry)
+            Assert-Equal $raw $body '定位命中时仍提供整篇正文'
+            $titleRange=$anchor.Title.GetOffsetAndLength($raw.Length)
+            $senseRange=$anchor.Sense.GetOffsetAndLength($raw.Length)
+            Assert-Equal $raw.Substring($titleRange.Item1,$titleRange.Item2).Trim() '<i>run</i> out (of sth)' '定位不同标题，保留内部格式的原始范围'
+            Assert-Equal $raw.Substring($senseRange.Item1,$senseRange.Item2) '用完 &amp; 耗尽' '定位义项而非父词条同文'
+            Assert-Equal ($senseRange.Item1 -gt $raw.IndexOf('definition')) $true '重复译文锚点指向真实小节'
+            # 将同一父正文经过窗口使用的文本转换，核对去标签、实体解码及换行后的高亮位置。
+            $format=$Assembly.GetType('ESearch.SearchWindow').GetMethod('FormatDetail',[Reflection.BindingFlags]'Static,NonPublic')
+            $view=$format.Invoke($null,@($raw,$anchor))
+            Assert-Equal $view.Text ($format.Invoke($null,@($raw,$null))).Text '高亮不会删减父词条内容'
+            $titleRange=$view.Anchor.Title.GetOffsetAndLength($view.Text.Length)
+            $senseRange=$view.Anchor.Sense.GetOffsetAndLength($view.Text.Length)
+            Assert-Equal $view.Text.Substring($titleRange.Item1,$titleRange.Item2).Trim() 'run out (of sth)' '窗口标题高亮跨越嵌套标签'
+            Assert-Equal $view.Text.Substring($senseRange.Item1,$senseRange.Item2) '用完 & 耗尽' '窗口义项高亮包含解码后的实体'
+            Assert-Equal ($titleRange.Item1 -gt $view.Text.IndexOf('【PHR V】')) $true '同文只突出短语动词区对应小节'
+            Write-Mdx $book ([ordered]@{run='新词条'})
+            Invoke-Search @('import','oxford',$book) | Out-Null
+            Assert-Equal ($null -eq $reader.CurrentBody($entry)) $true '过期的正文位置不得套用在新版本'
+        } finally { $reader.Dispose() }
+        Write-Output 'PASS 内嵌词条原文位置、重名文本、转义字符和词库版本'
     } finally { $env:E_SEARCH_DB=$previous }
 }
 
@@ -911,6 +986,52 @@ function Test-ReadingPreference([string]$Scratch, [Reflection.Assembly]$Assembly
         } finally { $cli.Dispose() }
     } finally { $legacy.Dispose() }
     Write-Output 'PASS 同读音首选保存、跨词典排序、过期候选、清除及旧库只读兼容'
+}
+
+function Test-JapaneseAuxiliaries([string]$Scratch) {
+    $savedDb = $env:E_SEARCH_DB
+    $env:E_SEARCH_DB = Join-Path $Scratch 'japanese-auxiliaries.db'
+    try {
+        $mdx = Join-Path $Scratch 'auxiliaries.mdx'
+        Write-Mdx $mdx ([ordered]@{
+            '食べる' = 'たべる<br>【食べる】<br>吃'; '読む' = 'よむ<br>【読む】<br>读'
+            '書く' = 'かく<br>【書く】<br>写'; '勉強する' = 'べんきょうする<br>【勉強する】<br>学习'
+            '着る' = 'きる<br>【着る】<br>穿'; '切る' = 'きる<br>【切る】<br>切'
+            '来る' = 'くる<br>【来る】<br>来'
+            '読める' = 'よめる<br>【読める】<br>能读'; '食ぶ' = 'たぶ<br>【食ぶ】<br>古语'
+            '話す' = 'はなす<br>【話す】<br>说'; '話される' = 'はなされる<br>【話される】<br>被说'
+            '話されました' = 'はなされました<br>【話されました】<br>原词记录'
+        })
+        Invoke-Search @('import','shogakukan',$mdx) | Out-Null
+        foreach ($pair in @(@('食べられませんでした','食べる'), @('読んでいます','読む'), @('読んでいなかった','読む'),
+                             @('書かれました','書く'), @('書かせた','書く'),
+                             @('読ませられていました','読む'), @('勉強させなかった','勉強する'), @('来られました','来る'),
+                             @('ヨンデイマス','読む'), @('読んでしまった','読む'))) {
+            $lines = @(Invoke-Search @('query',$pair[0],'shogakukan'))
+            Assert-Equal $lines.Count 1 "多步还原只列出词典收录的原形 $($pair[0])"
+            $parts = $lines[0] -split "`t"
+            Assert-Equal $parts[1] 'deinflection' '独立变形词标记为还原命中'
+            Assert-Equal ($parts[3].StartsWith($pair[1]+'（')) $true "原形 $($pair[0]) → $($pair[1])"
+        }
+        foreach ($row in @(@('読めません','読める|読む'), @('読める','読める'), @('よめません','よめる'),
+                             @('食べました','食べる'), @('たべました','たべる'))) {
+            $terms = @(Invoke-Search @('query',$row[0],'shogakukan') | ForEach-Object { ($_ -split "`t")[2] })
+            Assert-Equal ($terms -join '|') $row[1] "可能动词与普通一段动词的排序 $($row[0])"
+        }
+        $ranked = @(Invoke-Search @('query','話されました','shogakukan') | ForEach-Object { ($_ -split "`t")[2] })
+        Assert-Equal ($ranked -join '|') '話されました|話される|話す' '精确词头、一步还原、多步还原顺序稳定'
+        $ambiguous = @(Invoke-Search @('query','きられません','shogakukan'))
+        Assert-Equal $ambiguous.Count 2 '相同读音的两个已收录原形均保留'
+        $sentence = @(Invoke-Search @('query','本を読んでいませんでした。','shogakukan'))
+        Assert-Equal (($sentence[0] -split "`t")[2]) '読んでいませんでした' '句中完整活用片段优先于较短的て形'
+        $plainSentence = @(Invoke-Search @('query','ご飯を食べました。','shogakukan'))
+        Assert-Equal $plainSentence.Count 1 '句内已有普通一段动词时不追加弱推测的古语'
+        Assert-Equal ($plainSentence[0].Contains('食べる')) $true '句内保持正常的一步还原'
+        $potentialSentence = @(Invoke-Search @('query','彼は書けませんでした。','shogakukan'))
+        Assert-Equal ($potentialSentence[0].Contains('書けませんでした → 書く')) $true '句内缺少直接候选时保留可能态还原'
+        Assert-Equal @(Invoke-Search @('query','飛ばされませんでした','shogakukan')).Count 0 '未收录的原形不展示'
+        Write-Output 'PASS 日语礼貌、否定、体及可能被动使役组合与句中还原'
+    } finally { $env:E_SEARCH_DB = $savedDb }
 }
 
 function Test-JapaneseLookup([string]$Scratch, [Reflection.Assembly]$Assembly) {
@@ -1590,10 +1711,12 @@ if ($BackendTestDirectory) {
     Test-ImportIdentity $BackendTestDirectory $assembly
     Test-EverythingRecovery $BackendTestDirectory $assembly
     Test-OxfordSummary $BackendTestDirectory $assembly
+    Test-JapaneseAuxiliaries $BackendTestDirectory
     Test-JapaneseLookup $BackendTestDirectory $assembly
     Test-ReadingPreference $BackendTestDirectory $assembly
     Test-EnglishReferencePreview $BackendTestDirectory $assembly
     Test-SentencePhrases $BackendTestDirectory
+    Test-PhraseDetailAnchor $BackendTestDirectory $assembly
     Test-EnglishLookup $BackendTestDirectory $assembly
     Test-SpellingSuggestions $BackendTestDirectory $assembly
     Test-EntryRevision $BackendTestDirectory $assembly
