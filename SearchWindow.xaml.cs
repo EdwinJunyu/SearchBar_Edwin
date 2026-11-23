@@ -21,12 +21,14 @@ public partial class SearchWindow : Window
     private const uint NoRepeat = 0x4000;
     private (uint Modifiers, uint Key) hotkey = (1, 0x20);
     private SettingsWindow? settings;
+    private bool returnToSearchAfterSettings;
     private long catalogRevision;
     private readonly string databasePath;
-    private readonly string? dictionaryId;
+    private string? dictionaryId;
     private readonly DispatcherTimer debounce;
     private readonly EverythingSearch everything = new();
     private readonly double preferredWidth;
+    private (string Monitor, int X, int Y)? dragPosition;
     private readonly ForegroundCallback observeForeground;
     private nint hwnd, previousWindow, foregroundHook;
     private HwndSource? source;
@@ -54,14 +56,7 @@ public partial class SearchWindow : Window
         SettingsButton.Click += (_, _) => OpenSettings();
         ClearButton.Click += (_, _) => { QueryBox.Clear(); QueryBox.Focus(); };
         DetailsButton.Click += (_, _) => ToggleDetails();
-        FileList.PreviewMouseLeftButtonUp += (_, e) =>
-        {
-            // 鼠标选中一行后仍可继续键入新的搜索词。
-            if (e.OriginalSource is DependencyObject target &&
-                System.Windows.Controls.ItemsControl.ContainerFromElement(FileList, target) is System.Windows.Controls.ListBoxItem)
-                QueryBox.Focus();
-        };
-        InstallEverythingButton.Click += (_, _) => OpenWithShell("https://www.voidtools.com/downloads/", false);
+        InstallEverythingButton.Click += (_, _) => OpenWithShell("https://www.voidtools.com/downloads/");
         CandidatePicker.SelectionChanged += (_, _) => { if (DetailsPanel.IsVisible) _ = ShowEntryAsync(); };
         SizeChanged += (_, e) =>
         {
@@ -99,7 +94,7 @@ public partial class SearchWindow : Window
         }
         registered = RegisterHotKey(hwnd, hotkeyId, hotkey.Modifiers | NoRepeat, hotkey.Key);
         if (!registered)
-            hotkeyWarning = $"{FormatHotkey(hotkey.Modifiers, hotkey.Key)} 未能注册，可能已被占用。可从托盘进入设置。";
+            hotkeyWarning = $"{FormatHotkey(hotkey.Modifiers, hotkey.Key)} 无法注册，可能已被占用。请选择其他组合。";
         var menu = new Forms.ContextMenuStrip();
         menu.Items.Add("打开搜索", null, (_, _) => Dispatcher.BeginInvoke(Summon));
         menu.Items.Add("设置…", null, (_, _) => Dispatcher.BeginInvoke(OpenSettings));
@@ -159,36 +154,48 @@ public partial class SearchWindow : Window
         registered = true;
         hotkey = (modifiers, key);
         hotkeyWarning = "";
-        SetStatus("");
         return null;
     }
 
     private void OpenSettings()
     {
-        bool fromSearch = IsVisible;
         if (settings == null)
         {
-            settings = new SettingsWindow(databasePath, ApplyHotkey, RefreshDictionary);
-            settings.Closed += (_, _) =>
+            var page = new SettingsWindow(databasePath, ApplyHotkey, RefreshDictionary, hotkeyWarning);
+            settings = page;
+            page.Closing += (_, e) =>
+            {
+                if (!page.IsImporting || exiting) return;
+                // 导入仍由此页接收结果。用户可先回到搜索，再打开同一页查看进度或错误。
+                e.Cancel = true;
+                page.Hide();
+                ReturnFromSettings();
+            };
+            page.Closed += (_, _) =>
             {
                 settings = null;
-                if (fromSearch && !exiting && !IsVisible)
-                {
-                    Show();
-                    Activate();
-                    QueryBox.Focus();
-                    RefreshInput();
-                }
+                ReturnFromSettings();
             };
         }
+        if (!settings.IsVisible) returnToSearchAfterSettings = IsVisible;
         if (IsVisible)
         {
             Hide();
             RefreshInput();
         }
-        settings.Show();
+        if (!settings.IsVisible) settings.Show();
         if (settings.WindowState == WindowState.Minimized) settings.WindowState = WindowState.Normal;
         settings.Activate();
+    }
+
+    private void ReturnFromSettings()
+    {
+        if (!returnToSearchAfterSettings || exiting || IsVisible) return;
+        Show();
+        if (dragPosition.HasValue) PositionSearchWindow();
+        Activate();
+        QueryBox.Focus();
+        RefreshInput();
     }
 
     private void RefreshDictionary()
@@ -219,8 +226,13 @@ public partial class SearchWindow : Window
     {
         switch (message)
         {
+            case 0x007E: // WM_DISPLAYCHANGE
+            case 0x001A when wParam == 0x002F: // WM_SETTINGCHANGE / SPI_SETWORKAREA
+                if (IsVisible) Dispatcher.BeginInvoke(DispatcherPriority.Loaded, PositionSearchWindow);
+                break;
             case 0x0312 when registered && wParam == hotkeyId: // 忽略切换注册前排队的 WM_HOTKEY。
-                Summon();
+                if (IsVisible) Dismiss();
+                else Summon();
                 handled = true;
                 break;
             case 0x010D: // WM_IME_STARTCOMPOSITION：兼容传统 IMM 输入法。
@@ -234,45 +246,78 @@ public partial class SearchWindow : Window
         return 0;
     }
 
+    internal void ActivateFromLaunch(string? requestedDictionary)
+    {
+        dictionaryId = requestedDictionary;
+        Summon();
+    }
+
     private void Summon()
     {
-        var foreground = GetForegroundWindow();
-        // 浮窗仍显示时，用户也可能先切到另一应用，再从那里重新唤起。
-        if (settings is { IsVisible: true } && foreground == new WindowInteropHelper(settings).Handle)
-            previousWindow = foreground;
-        else if (!IsVisible || !composing)
-            RememberForeground(foreground);
+        // 托盘、快捷键和再次启动程序都经过这里，设置打开时只激活现有设置页。
+        if (settings is { IsVisible: true })
+        {
+            OpenSettings();
+            return;
+        }
+        RememberForeground(GetForegroundWindow());
         composing = false;
         QueryBox.Clear();
         RefreshInput();
         if (!IsVisible) Show();
-        PositionAtOrigin();
+        PositionSearchWindow();
         SetForegroundWindow(hwnd);
         Activate();
         QueryBox.Focus();
         Keyboard.Focus(QueryBox);
     }
 
-    private void PositionAtOrigin()
+    private void DragSearchWindow(object sender, MouseButtonEventArgs e)
     {
-        // 用来源窗口所在显示器的工作区计算物理位置；跨屏之后再按实际 DPI 限制 WPF 宽度。
-        var screen = Forms.Screen.FromHandle(previousWindow != 0 ? previousWindow : hwnd);
+        if (e.LeftButton != MouseButtonState.Pressed || hwnd == 0) return;
+        e.Handled = true;
+        var before = PointToScreen(new Point(0, 0));
+        DragMove();
+        if (!IsVisible) return;
+        var after = PointToScreen(new Point(0, 0));
+        if (after == before) return;
+
+        // 保存相对工作区的物理像素位置，屏幕重新排列后仍可在同一显示器上恢复。
+        var screen = Forms.Screen.FromHandle(hwnd);
+        var work = screen.WorkingArea;
+        dragPosition = (screen.DeviceName, (int)Math.Round(after.X) - work.Left, (int)Math.Round(after.Y) - work.Top);
+        PositionSearchWindow();
+    }
+
+    private void PositionSearchWindow()
+    {
+        if (!IsVisible || hwnd == 0) return;
+        var screen = dragPosition is { } saved
+            ? Forms.Screen.AllScreens.FirstOrDefault(monitor => monitor.DeviceName == saved.Monitor)
+            : null;
+        screen ??= Forms.Screen.FromHandle(previousWindow != 0 ? previousWindow : hwnd);
         var work = screen.WorkingArea;
         const uint moveOnly = 0x0015; // SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE
-        SetWindowPos(hwnd, 0, work.Left + work.Width / 3, work.Top + work.Height / 3, 0, 0, moveOnly);
+        // 跨屏后按目标屏的实际 DPI 测量，再限制宽高和坐标。
+        if (Forms.Screen.FromHandle(hwnd).DeviceName != screen.DeviceName)
+            SetWindowPos(hwnd, 0, work.Left + work.Width / 3, work.Top + work.Height / 3, 0, 0, moveOnly);
         var dpi = System.Windows.Media.VisualTreeHelper.GetDpi(this);
         Width = Math.Min(preferredWidth, Math.Max(1, work.Width / dpi.DpiScaleX - 12));
         var availableHeight = work.Height / dpi.DpiScaleY;
         FileList.MaxHeight = Math.Clamp(availableHeight * .30, 60, 280);
         DetailScroll.MaxHeight = Math.Clamp(availableHeight * .19, 48, 215);
         UpdateLayout();
-        var x = work.Left + (work.Width - (int)Math.Round(ActualWidth * dpi.DpiScaleX)) / 2;
-        var y = work.Top + Math.Max(0, (work.Height - (int)Math.Round(ActualHeight * dpi.DpiScaleY)) / 3);
-        SetWindowPos(hwnd, 0, x, y, 0, 0, moveOnly);
+        var maxX = Math.Max(0, work.Width - (int)Math.Ceiling(ActualWidth * dpi.DpiScaleX));
+        var maxY = Math.Max(0, work.Height - (int)Math.Ceiling(ActualHeight * dpi.DpiScaleY));
+        var x = Math.Clamp(dragPosition?.X ?? maxX / 2, 0, maxX);
+        var y = Math.Clamp(dragPosition?.Y ?? maxY / 3, 0, maxY);
+        SetWindowPos(hwnd, 0, work.Left + x, work.Top + y, 0, 0, moveOnly);
     }
+
     private void Dismiss()
     {
-        var target = previousWindow;
+        // 从别的应用按热键收起浮窗时，让当前前台应用继续接收输入。
+        var target = GetForegroundWindow() == hwnd ? previousWindow : 0;
         composing = false;
         QueryBox.Clear();
         RefreshInput();
@@ -319,43 +364,139 @@ public partial class SearchWindow : Window
             CandidatePicker.IsDropDownOpen = true;
             e.Handled = true;
         }
-        else if (Keyboard.Modifiers == ModifierKeys.None && (QueryBox.IsKeyboardFocused || FileList.IsKeyboardFocusWithin))
+        else if (QueryBox.IsKeyboardFocused || FileList.IsKeyboardFocusWithin)
         {
-            if (e.Key == Key.Enter)
+            if (e.Key == Key.Enter && Keyboard.Modifiers is ModifierKeys.None or ModifierKeys.Shift)
             {
+                var focused = Keyboard.FocusedElement as System.Windows.Controls.Button;
+                // 原生按钮自行响应 Enter 和空格；在定位按钮上按 Enter 也应执行定位。
+                if (!e.IsRepeat && Keyboard.Modifiers == ModifierKeys.None && focused != null) return;
                 e.Handled = true;
-                if (!e.IsRepeat && fileRevision == revision && IsVisible && FileList.SelectedItem is FileHit file)
-                    OpenWithShell(file.FullPath, true);
+                if (!e.IsRepeat)
+                    ActivateFile(focused?.DataContext as FileHit ?? FileList.SelectedItem as FileHit,
+                        Keyboard.Modifiers == ModifierKeys.Shift ? FileAction.Reveal : FileAction.Open);
             }
-            else if (e.Key is Key.Up or Key.Down && fileRevision == revision && FileList.Items.Count > 0)
+            else if (Keyboard.Modifiers == ModifierKeys.None && e.Key is Key.Up or Key.Down
+                && fileRevision == revision && FileList.Items.Count > 0)
             {
                 int delta = e.Key == Key.Down ? 1 : -1;
                 FileList.SelectedIndex = Math.Clamp(FileList.SelectedIndex + delta, 0, FileList.Items.Count - 1);
                 FileList.ScrollIntoView(FileList.SelectedItem);
+                QueryBox.Focus();
                 e.Handled = true;
             }
         }
     }
 
-    private void OpenWithShell(string target, bool isFile)
+    private enum FileAction { Open, Reveal }
+
+    private void OpenFileClicked(object sender, RoutedEventArgs e) =>
+        ActivateFile(((FrameworkElement)sender).DataContext as FileHit, FileAction.Open);
+
+    private void RevealFileClicked(object sender, RoutedEventArgs e) =>
+        ActivateFile(((FrameworkElement)sender).DataContext as FileHit, FileAction.Reveal);
+
+    private void ActivateFile(FileHit? file, FileAction action)
+    {
+        // 鼠标按钮携带被点击行的数据。输入改变或窗口隐藏后，旧行不能再启动 Shell。
+        if (file == null || !IsVisible || composing || fileRevision != revision || !FileList.Items.Contains(file)) return;
+        FileList.SelectedItem = file;
+        OpenWithShell(file.FullPath, action);
+    }
+
+    private void OpenWithShell(string target, FileAction? fileAction = null)
     {
         try
         {
-            if (isFile && !File.Exists(target))
+            if (fileAction != null && !File.Exists(target))
                 throw new FileNotFoundException("文件已移动、已删除或无法访问。");
-            using var process = Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
-            if (isFile)
+            if (fileAction == FileAction.Reveal)
             {
-                // Shell 已经把文件交给关联程序；此处隐藏即可，让新打开的窗口保有焦点。
+                // 在同一个 Shell 请求中指定目录和要选中的子项，由 Explorer 选定目标视图。
+                SHParseDisplayName(Path.GetDirectoryName(target)!, 0, out var folder, 0, 0);
+                try
+                {
+                    SHParseDisplayName(target, 0, out var item, 0, 0);
+                    try { SHOpenFolderAndSelectItems(folder, 1, [ILFindLastID(item)], 0); }
+                    finally { Marshal.FreeCoTaskMem(item); }
+                }
+                finally { Marshal.FreeCoTaskMem(folder); }
+            }
+            else
+            {
+                using var process = Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+            }
+            if (fileAction != null)
+            {
+                // 操作交给关联程序或资源管理器后直接隐藏，让目标窗口保有焦点。
                 Hide();
                 QueryBox.Clear();
                 RefreshInput();
+                if (fileAction == FileAction.Reveal) _ = CompleteExplorerSelectionAsync(target, revision);
             }
         }
-        catch (Exception ex) when (ex is Win32Exception or IOException or UnauthorizedAccessException or InvalidOperationException)
+        catch (Exception ex) when (ex is Win32Exception or IOException or UnauthorizedAccessException
+            or InvalidOperationException or COMException or ArgumentException)
         {
-            SetFileStatus("无法打开：" + ex.Message);
+            var action = fileAction == FileAction.Reveal ? "定位" : "打开";
+            SetFileStatus($"无法{action}「{target}」：{ex.Message}");
+            if (fileAction != null) QueryBox.Focus();
         }
+    }
+
+    private async Task CompleteExplorerSelectionAsync(string target, long request)
+    {
+        // 冷打开时 Explorer 偶尔只聚焦文件。只给前台标签中已获焦点的目标补上选择。
+        var shellType = Type.GetTypeFromProgID("Shell.Application");
+        if (shellType == null) return;
+        object? shellObject = null;
+        try
+        {
+            if ((shellObject = Activator.CreateInstance(shellType)) == null) return;
+            dynamic shell = shellObject;
+            var timer = Stopwatch.StartNew();
+            while (timer.Elapsed < TimeSpan.FromSeconds(5))
+            {
+                await Task.Delay(120);
+                if (exiting || request != revision) return;
+                var foreground = GetForegroundWindow();
+                foreach (dynamic view in shell.Windows())
+                {
+                    try
+                    {
+                        if ((nint)(long)view.HWND != foreground) continue;
+                        if (!Uri.TryCreate((string)view.LocationURL, UriKind.Absolute, out var uri) || !uri.IsFile) continue;
+                        dynamic document = view.Document;
+                        dynamic item = document.FocusedItem;
+                        if (item is null) continue;
+                        if (!string.Equals((string)item.Path, target, StringComparison.OrdinalIgnoreCase)
+                            || !IsExposedExplorerView(view, foreground)) continue;
+                        if ((int)document.SelectedItems().Count == 0 && GetForegroundWindow() == foreground)
+                            document.SelectItem(item, 1); // SVSI_SELECT 只添加此项，保留已有选择。
+                        return;
+                    }
+                    catch (COMException) { } // 视图正在导航或关闭。
+                }
+            }
+        }
+        catch (COMException) { } // Shell 已接到定位请求。
+        finally { if (shellObject != null) Marshal.ReleaseComObject(shellObject); }
+    }
+
+    private static bool IsExposedExplorerView(object view, nint foreground)
+    {
+        // Windows 11 的标签页共用顶层 HWND，按浏览区中心实际命中的子窗口识别当前标签。
+        var browserService = new Guid("4C96BE40-915C-11CF-99D3-00AA004AE837"); // SID_STopLevelBrowser
+        var oleWindow = new Guid("00000114-0000-0000-C000-000000000046"); // IID_IOleWindow
+        if (IUnknown_QueryService(view, in browserService, in oleWindow, out var browser) < 0) return false;
+        try
+        {
+            if (IUnknown_GetWindow(browser, out var tab) < 0 || !GetWindowRect(tab, out var rect)) return false;
+            var hit = WindowFromPoint(new System.Drawing.Point(rect.Left + (rect.Right - rect.Left) / 2,
+                rect.Top + (rect.Bottom - rect.Top) / 2));
+            return GetForegroundWindow() == foreground && (hit == tab || IsChild(tab, hit));
+        }
+        finally { Marshal.ReleaseComObject(browser); }
     }
 
     private void FinishComposition()
@@ -384,7 +525,7 @@ public partial class SearchWindow : Window
         ClearButton.Visibility = QueryBox.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
         DetailsButton.Visibility = Visibility.Collapsed;
         GlossText.Text = "";
-        SetStatus(hotkeyWarning);
+        SetStatus("");
         if (!composing && IsVisible && !string.IsNullOrWhiteSpace(QueryBox.Text)) debounce.Start();
     }
 
@@ -578,6 +719,20 @@ public partial class SearchWindow : Window
     }
 
     private delegate void ForegroundCallback(nint hook, uint evt, nint window, int objectId, int child, uint thread, uint time);
+    [StructLayout(LayoutKind.Sequential)] private struct WindowRect { public int Left, Top, Right, Bottom; }
+    [DllImport("shlwapi.dll", ExactSpelling=true)]
+    private static extern int IUnknown_QueryService([MarshalAs(UnmanagedType.IUnknown)] object view, in Guid service,
+        in Guid iid, [MarshalAs(UnmanagedType.IUnknown)] out object browser);
+    [DllImport("shlwapi.dll", ExactSpelling=true)]
+    private static extern int IUnknown_GetWindow([MarshalAs(UnmanagedType.IUnknown)] object browser, out nint window);
+    [DllImport("user32.dll")] private static extern bool GetWindowRect(nint hwnd, out WindowRect rect);
+    [DllImport("user32.dll")] private static extern nint WindowFromPoint(System.Drawing.Point point);
+    [DllImport("user32.dll")] private static extern bool IsChild(nint parent, nint child);
+    [DllImport("shell32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, PreserveSig=false)]
+    private static extern void SHParseDisplayName(string name, nint context, out nint item, uint attributes, nint resultAttributes);
+    [DllImport("shell32.dll", ExactSpelling=true, PreserveSig=false)]
+    private static extern void SHOpenFolderAndSelectItems(nint folder, uint count, nint[] children, uint flags);
+    [DllImport("shell32.dll", ExactSpelling=true)] private static extern nint ILFindLastID(nint item);
     [DllImport("user32.dll")] private static extern nint SetWinEventHook(uint min, uint max, nint module, ForegroundCallback callback, uint pid, uint tid, uint flags);
     [DllImport("user32.dll")] private static extern bool UnhookWinEvent(nint hook);
     [DllImport("user32.dll", SetLastError=true)] private static extern bool RegisterHotKey(nint hwnd, int id, uint modifiers, uint key);

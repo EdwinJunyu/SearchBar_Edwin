@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 
 public sealed record LookupEntry(string DictionaryId, long EntryId, string Language, int Priority,
     string Headword, string? Reading, string Gloss)
@@ -14,7 +15,7 @@ public sealed record LookupEntry(string DictionaryId, long EntryId, string Langu
 
 public sealed record LookupHit(LookupEntry Entry, string Method, string Term, string Display);
 
-public static class Lookup
+public static partial class Lookup
 {
     public static string Normalize(string text) =>
         text.Normalize(NormalizationForm.FormKC).Trim().ToLowerInvariant();
@@ -34,6 +35,7 @@ public static class Lookup
         var term = Normalize(input);
         if (term.Length == 0) return Array.Empty<LookupHit>();
         var hits = new Dictionary<(string, long), (int Rank, LookupHit Hit)>();
+        var romaji = RomajiReadings(term).ToArray();
 
         void Collect(string key, bool byReading, string method, int rank, bool japaneseOnly)
         {
@@ -54,7 +56,7 @@ public static class Lookup
         Collect(term, false, "headword", 0, false);
         if (IsKana(term))
             Collect(NormalizeReading(term), true, "reading", 1, true);
-        else if (ToHiragana(term) is string kana)
+        foreach (var kana in romaji)
             Collect(kana, true, "romaji", 1, true);
 
         // 还原规则只生成候选。存在于启用的日语词库中的候选才参与排序。
@@ -65,7 +67,10 @@ public static class Lookup
             // 纯假名变形的原形可能只存在于汉字词头的读音索引。两路按同一条目标识去重。
             if (IsKana(lemma)) Collect(NormalizeReading(lemma), true, "deinflection", 2, true);
         }
-        return hits.Values.OrderBy(x => x.Rank).ThenBy(x => x.Hit.Entry.Priority)
+        // 可作罗马字的输入也可能是英文词头，如 KO。仅当确有日语候选时提升英文精确命中。
+        bool japaneseCollision = romaji.Length != 0 && hits.Values.Any(x => IsJapanese(x.Hit.Entry));
+        return hits.Values.OrderBy(x => japaneseCollision && x.Rank == 0 && x.Hit.Entry.Language == "en" ? -1 : x.Rank)
+            .ThenBy(x => x.Hit.Entry.Priority)
             .ThenBy(x => x.Hit.Entry.DictionaryId, StringComparer.Ordinal)
             .ThenBy(x => x.Hit.Entry.EntryId).Select(x => x.Hit).ToArray();
     }
@@ -73,8 +78,11 @@ public static class Lookup
     private static bool IsJapanese(LookupEntry entry) =>
         entry.Language.StartsWith("ja", StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsKana(string text) => text.Length > 0 &&
+    internal static bool IsKana(string text) => text.Length > 0 &&
         text.All(c => c is >= 'ぁ' and <= 'ゖ' or >= 'ァ' and <= 'ヶ' or 'ー' or 'ゝ' or 'ゞ' or 'ヽ' or 'ヾ');
+
+    internal static string ToKatakana(string hiragana) =>
+        string.Concat(hiragana.Select(c => c is >= 'ぁ' and <= 'ゖ' or 'ゝ' or 'ゞ' ? (char)(c + ('ァ' - 'ぁ')) : c));
 
     private static string Format(LookupEntry entry, string method)
     {
@@ -116,14 +124,44 @@ public static class Lookup
         return syllables;
     }
 
+    [GeneratedRegex(@"(?<v>[aeiou])(?:\k<v>|(?<=o)u|(?<=e)i|-)")]
+    private static partial Regex LongVowel();
+
+    private static IEnumerable<string> RomajiReadings(string term)
+    {
+        if (!term.All(c => c is >= 'a' and <= 'z' or '\'' or '-' or 'ā' or 'ī' or 'ū' or 'ē' or 'ō')) yield break;
+        var latin = term.Replace("ā","a-").Replace("ī","i-").Replace("ū","u-").Replace("ē","e-").Replace("ō","o-");
+        var literal = ToHiragana(latin);
+        if (literal == null) yield break;
+        yield return literal;
+
+        // 保留原拼法，再按长音符、和语常见的 ou/ei、重复元音补查。每种整词拼法只查一次，
+        // 长词中的多个长音不会生成指数级组合，是否命中仍由实际的假名索引决定。
+        var marked = LongVowel().Replace(latin, "${v}-");
+        if (!marked.Contains('-')) yield break;
+        var native = marked.Replace("o-","ou").Replace("e-","ei");
+        var seen = new HashSet<string>(StringComparer.Ordinal) { literal };
+        foreach (var form in new[] { marked, ExpandDoubledVowels(native), ExpandDoubledVowels(marked) })
+            if (ToHiragana(form) is string kana && seen.Add(kana)) yield return kana;
+    }
+
+    private static string ExpandDoubledVowels(string text) =>
+        text.Replace("a-","aa").Replace("i-","ii").Replace("u-","uu").Replace("e-","ee").Replace("o-","oo");
+
     private static string? ToHiragana(string text)
     {
-        if (!text.All(c => c is >= 'a' and <= 'z' or '\'')) return null;
         var kana = new StringBuilder();
         for (int i = 0; i < text.Length;)
         {
             char current = text[i];
             char next = i + 1 < text.Length ? text[i + 1] : '\0';
+            if (current == '-')
+            {
+                if (i == 0 || !"aeiou".Contains(text[i - 1])) return null;
+                kana.Append('ー');
+                i++;
+                continue;
+            }
             if (current == 'n' && (next == '\0' || !"aeiouy".Contains(next)))
             {
                 kana.Append('ん');

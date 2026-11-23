@@ -46,7 +46,7 @@
             <DropShadowEffect BlurRadius="12" ShadowDepth="2" Color="#1F3842" Opacity="0.18"/>
         </Border.Effect>
         <StackPanel>
-            <Grid Margin="18,0,12,0" Height="62">
+            <Grid Margin="10,0,12,0" Height="62">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="6*"/>
@@ -55,17 +55,28 @@
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
-                <Path Width="20" Height="20" Stretch="Uniform" VerticalAlignment="Center"
-                      Stroke="{StaticResource Accent}" StrokeThickness="1.8"
-                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"
-                      Data="M 15,8.5 A 6.5,6.5 0 1 1 2,8.5 A 6.5,6.5 0 1 1 15,8.5 M 13.4,13.4 L 19,19"/>
+                <!-- 只让左侧抓点和搜索图标参与拖动，输入框与结果保留各自的鼠标操作。 -->
+                <Label x:Name="DragHandle" AutomationProperties.AutomationId="DragHandle"
+                       AutomationProperties.Name="拖动搜索窗口" ToolTip="拖动搜索窗口"
+                       Cursor="SizeAll" Focusable="False" Background="Transparent" Padding="2,0,3,0"
+                       VerticalContentAlignment="Center" MouseLeftButtonDown="DragSearchWindow">
+                    <StackPanel Orientation="Horizontal" IsHitTestVisible="False">
+                        <Path VerticalAlignment="Center" Margin="0,0,6,0" Stroke="#79939B" StrokeThickness="2.5"
+                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                              Data="M 2,2 h 0.2 M 6,2 h 0.2 M 2,7 h 0.2 M 6,7 h 0.2 M 2,12 h 0.2 M 6,12 h 0.2"/>
+                        <Path Width="20" Height="20" Stretch="Uniform" VerticalAlignment="Center"
+                              Stroke="{StaticResource Accent}" StrokeThickness="1.8"
+                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                              Data="M 15,8.5 A 6.5,6.5 0 1 1 2,8.5 A 6.5,6.5 0 1 1 15,8.5 M 13.4,13.4 L 19,19"/>
+                    </StackPanel>
+                </Label>
                 <Grid Grid.Column="1" Margin="13,0,0,0">
                     <TextBox x:Name="QueryBox" AutomationProperties.AutomationId="QueryBox"
                              AutomationProperties.Name="搜索词典和文件" VerticalContentAlignment="Center"
                              Foreground="{StaticResource Ink}" CaretBrush="{StaticResource Accent}"
                              FontSize="21" Padding="1,0" BorderThickness="0" Background="Transparent"
                              VerticalScrollBarVisibility="Hidden" HorizontalScrollBarVisibility="Hidden"/>
-                    <TextBlock Text="输入词语或文件名" Margin="2,0,0,0" IsHitTestVisible="False"
+                    <TextBlock Text="搜索" Margin="2,0,0,0" IsHitTestVisible="False"
                                Foreground="#607780" FontSize="20" VerticalAlignment="Center">
                         <TextBlock.Style>
                             <Style TargetType="TextBlock">
@@ -150,7 +161,7 @@
                                 <Setter Property="Template">
                                     <Setter.Value>
                                         <ControlTemplate TargetType="ListBoxItem">
-                                            <Border x:Name="Row" Padding="10,6" Background="Transparent" BorderThickness="2,0,0,0"
+                                            <Border x:Name="Row" Background="Transparent" BorderThickness="2,0,0,0"
                                                     BorderBrush="Transparent" CornerRadius="3">
                                                 <ContentPresenter/>
                                             </Border>
@@ -172,13 +183,41 @@
                             <DataTemplate>
                                 <Grid>
                                     <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="5*"/>
-                                        <ColumnDefinition Width="6*"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
-                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="{StaticResource Ink}"
-                                               TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="0,0,12,0"/>
-                                    <TextBlock Grid.Column="1" Text="{Binding Parent}" FontSize="12" Foreground="#506770"
-                                               FlowDirection="LeftToRight" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                                    <!-- 两个按钮各自接收点击，按此行绑定的完整路径操作，避免同名项互相干扰。 -->
+                                    <Button AutomationProperties.AutomationId="OpenFileButton"
+                                            AutomationProperties.Name="{Binding FullPath, StringFormat='打开 {0}'}"
+                                            ToolTip="{Binding FullPath}" Click="OpenFileClicked" Cursor="Hand">
+                                        <Button.Template>
+                                            <ControlTemplate TargetType="Button">
+                                                <Border x:Name="HitArea" Background="Transparent" Padding="9,4"
+                                                        BorderBrush="Transparent" BorderThickness="1" CornerRadius="3">
+                                                    <ContentPresenter/>
+                                                </Border>
+                                                <ControlTemplate.Triggers>
+                                                    <Trigger Property="IsKeyboardFocused" Value="True">
+                                                        <Setter TargetName="HitArea" Property="BorderBrush" Value="{StaticResource Accent}"/>
+                                                    </Trigger>
+                                                </ControlTemplate.Triggers>
+                                            </ControlTemplate>
+                                        </Button.Template>
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="5*"/>
+                                                <ColumnDefinition Width="6*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="{StaticResource Ink}"
+                                                       TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                                            <TextBlock Grid.Column="1" Text="{Binding Parent}" FontSize="12" Foreground="#506770"
+                                                       FlowDirection="LeftToRight" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                                        </Grid>
+                                    </Button>
+                                    <Button Grid.Column="1" AutomationProperties.AutomationId="RevealFileButton"
+                                            AutomationProperties.Name="{Binding FullPath, StringFormat='在资源管理器中定位 {0}'}"
+                                            Style="{StaticResource IconButton}" Content="定位" Width="48" Height="32" Margin="0,1,4,1"
+                                            ToolTip="在资源管理器中选中文件 (Shift+Enter)" Click="RevealFileClicked" Cursor="Hand"/>
                                 </Grid>
                             </DataTemplate>
                         </ListBox.ItemTemplate>

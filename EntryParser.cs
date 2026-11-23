@@ -14,7 +14,11 @@ internal static partial class EntryParser
         key = key.Trim();
         var body = raw.Trim('\0', ' ', '\r', '\n', '\t');
         if (body.StartsWith("@@@LINK=", IgnoreCase))
-            return new(key, null, null, "", body[8..].Trim(), []);
+        {
+            // 日语词典显式给出的假名重定向键也是读音依据，保留在别名记录上。
+            var aliasReading = language == "ja" ? Kana(Lookup.Normalize(key)) : null;
+            return new(key, aliasReading, aliasReading == null ? null : "MDX 假名重定向键", "", body[8..].Trim(), []);
+        }
 
         // 各辞书的 HTML 结构不同。只从已识别的字段建立读音索引，不从释义、例句猜读音。
         if (sourceId == "shogakukan")
@@ -24,7 +28,7 @@ internal static partial class EntryParser
 
         string? gloss = null;
         if (sourceId == "oxford")
-            gloss = Between(body, "color=#FF5000>", "</font>")?.TrimStart('•', ' ');
+            gloss = OxfordSense(body);
         else if (sourceId == "hanying")
         {
             // 只读第一义项的 JX 区，遇到“常用词组”时结束，避免误取短语翻译。
@@ -37,6 +41,41 @@ internal static partial class EntryParser
         var reading = language == "ja" ? Kana(key) : null;
         return new(key, reading, reading == null ? null : "MDX 假名词头", Preview(gloss, body), null, []);
     }
+
+    // 牛津把义项和 HELP、ORIGIN 框的译文标成同色。按框的边界找主词条首义，
+    // 同时保留译文中嵌套的字体标记之间的文字，找不到则沿用原文首行预览。
+    private static string? OxfordSense(string body)
+    {
+        int divDepth = 0, noteDepth = 0, fontDepth = 0, senseStart = 0;
+        foreach (Match tag in OxfordMarkup().Matches(body))
+        {
+            if (fontDepth > 0)
+            {
+                if (tag.Groups["font"].Success) fontDepth++;
+                if (tag.Groups["endfont"].Success && --fontDepth == 0)
+                {
+                    var text = Plain(body[senseStart..tag.Index]).TrimStart('•', ' ');
+                    if (text.Length > 0) return text;
+                }
+            }
+            else if (tag.Groups["div"].Success) divDepth++;
+            else if (tag.Groups["enddiv"].Success)
+            {
+                if (divDepth == noteDepth) noteDepth = 0;
+                divDepth = Math.Max(0, divDepth - 1);
+            }
+            else if (tag.Groups["note"].Success && divDepth > 0 && noteDepth == 0) noteDepth = divDepth;
+            else if (noteDepth == 0 && tag.Groups["section"].Success) break;
+            else if (noteDepth == 0 && tag.Groups["font"].Success && OxfordSenseColor().IsMatch(tag.Value))
+            {
+                senseStart = tag.Index + tag.Length;
+                fontDepth = 1;
+            }
+        }
+        return null;
+    }
+
+    internal static string OxfordGloss(string body) => Preview(OxfordSense(body), body);
 
     // 预览和导入共用此流式解析器。记录起始行用于定位嵌套换行及转义引号。
     internal static IEnumerable<(int Line, string[] Fields)> ReadTableRows(Stream input, char delimiter)
@@ -213,6 +252,10 @@ internal static partial class EntryParser
     private static partial Regex BlockBreak();
     [GeneratedRegex(@"<[^>]*>")]
     private static partial Regex Tags();
+    [GeneratedRegex(@"(?<div><div\b[^>]*>)|(?<enddiv></div\s*>)|(?<font><font\b[^>]*>)|(?<endfont></font\s*>)|(?<note>【(?:HELP|ORIGIN)】)|(?<section>【(?:IDIOMS|PHR V)】)", RegexOptions.IgnoreCase)]
+    private static partial Regex OxfordMarkup();
+    [GeneratedRegex(@"\scolor\s*=\s*[""']?#FF5000(?=[""'\s>])", RegexOptions.IgnoreCase)]
+    private static partial Regex OxfordSenseColor();
     [GeneratedRegex(@"^(?:(?:[（(]\d+[)）]|〔[^〕]*〕|［[^］]*］)\s*)+")]
     private static partial Regex LeadingLabels();
     [GeneratedRegex(@"(?<=[\u3400-\u9fff])[A-Za-zÀ-žǍ-ǜ]+(?:[ ’'][A-Za-zÀ-žǍ-ǜ]+)*")]

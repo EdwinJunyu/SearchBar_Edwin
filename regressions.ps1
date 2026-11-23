@@ -2,7 +2,7 @@
 param([string] $RealDatabase, [switch] $Desktop, [switch] $FileDesktop, [string] $ColdStartFile,
       [switch] $SettingsDesktop, [string] $MdxSample, [string] $GuiExecutable, [switch] $OutOfOrder, [switch] $RestartEngine,
       [ValidateSet('Files','Keyboard','ColdEdit','Tray')][string[]] $AcceptanceDesktop,
-      [string] $BackendTestDirectory)
+      [string] $BackendTestDirectory, [switch] $PrepareDesktop, [switch] $WindowDesktop, [switch] $FileActionsDesktop, [string] $FileFixtureRoot)
 $ErrorActionPreference = 'Stop'
 # 失败重导本身也是验收项，命令退出码由 Invoke-Search 明确检查。
 $PSNativeCommandUseErrorActionPreference = $false
@@ -259,6 +259,10 @@ function Open-SelectedFixture([string]$ExpectedPath,[string]$Title) {
         throw "输入法提交后未将前台还给浮窗；当前前台进程 $application，窗口 $active"
     }
     [ESearchDesktop]::Press($handle,13)
+    Confirm-FixtureBrowser $Title
+    Write-Output "PASS Enter 实际打开 $ExpectedPath，浏览器标题 $Title"
+}
+function Confirm-FixtureBrowser([string]$Title) {
     function ForegroundTitle {
         $h=[ESearchDesktop]::GetForegroundWindow()
         if ($h -ne 0) { [Windows.Automation.AutomationElement]::FromHandle($h).Current.Name }
@@ -266,7 +270,6 @@ function Open-SelectedFixture([string]$ExpectedPath,[string]$Title) {
     Wait-Desktop { (ForegroundTitle) -like "*$Title*" } "默认浏览器未显示测试页 $Title" 20000
     $browser=[ESearchDesktop]::GetForegroundWindow()
     if ((ForegroundTitle) -like "*$Title*") { [ESearchDesktop]::Press($browser,17,87) }
-    Write-Output "PASS Enter 实际打开 $ExpectedPath，浏览器标题 $Title"
 }
 function Summon-Fixture {
     Wait-Desktop {
@@ -274,8 +277,136 @@ function Summon-Fixture {
         [ESearchDesktop]::ActivateFixture($form.Handle)
         [ESearchDesktop]::GetForegroundWindow() -eq $form.Handle
     } '无法从验收文本框重新唤起'
-    [ESearchDesktop]::Press($form.Handle,18,32)
+    if ([ESearchDesktop]::FindSearch($appProcess.Id) -ne 0) {
+        [ESearchDesktop]::Press($form.Handle,17,18,16,130)
+        Wait-Desktop { [ESearchDesktop]::FindSearch($appProcess.Id) -eq 0 } '再次按快捷键未收起浮窗'
+    }
+    [ESearchDesktop]::Press($form.Handle,17,18,16,130)
     Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle -and $value.Current.Value -eq '' } '快捷键打开后不是空白查询框'
+}
+function Test-FileResultActions([scriptblock]$Reopen = { Summon-Fixture }) {
+    $tag='ESearchClick' + [Guid]::NewGuid().ToString('N').Substring(0,10)
+    $name="$tag 样本,文件.html"
+    # 个人索引可排除工作区。专项允许把同名样本写入已索引的目录，每轮使用独立子目录。
+    $fixtureParent=if ($FileFixtureRoot) { [IO.Path]::GetFullPath($FileFixtureRoot) } else { Join-Path $PSScriptRoot '.data/regressions' }
+    $fixtureRoot=Join-Path $fixtureParent $tag
+    $markers=@{}
+    foreach ($dirName in '甲 目录','乙,目录') {
+        $dir=[IO.Directory]::CreateDirectory((Join-Path $fixtureRoot $dirName))
+        $path=Join-Path $dir.FullName $name
+        $markers[$path]=Write-HtmlFixture $path
+    }
+    # 先让浮窗启动索引；等两份新样本均可查到后再提交完整文件名。
+    $value.SetValue($tag)
+    Wait-Desktop { @(Get-EnginePaths $name | Where-Object { $markers.ContainsKey($_) }).Count -eq 2 } "Everything 未索引 $fixtureRoot 下的两个同名样本" 90000
+    function Show-FixturePair {
+        $value.SetValue($name)
+        Wait-Desktop {
+            $rows=@(FileRows)
+            $rows.Count -eq 2 -and $markers.ContainsKey($rows[0].Current.Name) -and
+                $markers.ContainsKey($rows[1].Current.Name) -and (SelectedPath) -ceq $rows[0].Current.Name
+        } '没有显示两个同名结果并默认选中第一项'
+    }
+    function Click-FileAction([string]$ActionId) {
+        $row=@(FileRows | Where-Object { $_.Current.Name -ceq $target })[0]
+        if (!$row) { throw "未找到要操作的结果 $target" }
+        $filter=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::AutomationIdProperty,$ActionId)
+        $button=$row.FindFirst([Windows.Automation.TreeScope]::Descendants,$filter)
+        if (!$button -or $button.Current.IsOffscreen) { throw "结果中没有可点击的 $ActionId" }
+        $point=$button.GetClickablePoint()
+        [ESearchDesktop]::ClickPoint($handle,[int]$point.X,[int]$point.Y)
+    }
+    Show-FixturePair
+    $target=@(FileRows)[1].Current.Name
+    Click-FileAction OpenFileButton
+    Confirm-FixtureBrowser $markers[$target]
+    Write-Output "PASS 单击第二个同名结果，默认浏览器显示 $target 的独立标题"
+    & $Reopen
+    Show-FixturePair
+    Assert-Equal (@(FileRows)[1].Current.Name) $target '重新查询后仍由第二项定位'
+    Click-FileAction RevealFileButton
+    Wait-Desktop {
+        if ([ESearchDesktop]::FindSearch($appProcess.Id) -eq 0) { return $true }
+        if ((Control FileStatusText).Current.Name -like '无法定位*') { throw (Control FileStatusText).Current.Name }
+        return $false
+    } '定位按钮未将文件交给资源管理器，搜索窗仍然可见'
+    $shell=New-Object -ComObject Shell.Application
+    function FixtureExplorerViews {
+        foreach ($explorer in $shell.Windows()) {
+            try {
+                if ($explorer.Document.Folder.Self.Path -ieq [IO.Path]::GetDirectoryName($target)) { $explorer }
+            } catch [Runtime.InteropServices.COMException] { continue }
+        }
+    }
+    function SelectedFixtureExplorer {
+        foreach ($explorer in FixtureExplorerViews) {
+            if ([IntPtr]$explorer.HWND -ne [ESearchDesktop]::GetForegroundWindow()) { continue }
+            $items=$explorer.Document.SelectedItems()
+            if ($items.Count -eq 1 -and $items.Item(0).Path -ieq $target) { return [IntPtr]$explorer.HWND }
+        }
+    }
+    function SelectedLeaves($view) {
+        $items=$view.Document.SelectedItems()
+        @(for ($i=0;$i -lt $items.Count;$i++) { [IO.Path]::GetFileName($items.Item($i).Path) }) | Sort-Object
+    }
+    try {
+        Wait-Desktop { SelectedFixtureExplorer } "Explorer 没有实际选中 $target" 15000
+        $shown=SelectedFixtureExplorer
+        Write-Output "PASS 点击定位后，资源管理器实际选中 $target"
+        # 同一目录打开两个窗口，两边均先选择其它文件；仅 Shell 实际激活的窗口应改变选区。
+        $parent=[IO.Path]::GetDirectoryName($target)
+        $keepers=@('保留选择一.txt','保留选择二.txt')
+        foreach ($leaf in $keepers) { [IO.File]::WriteAllText((Join-Path $parent $leaf),'Explorer 多选验收') }
+        [ESearchDesktop]::Press($shown,17,78) # Ctrl+N 在同一目录打开另一个窗口。
+        Wait-Desktop { @((FixtureExplorerViews) | ForEach-Object HWND | Sort-Object -Unique).Count -eq 2 } '未能打开同目录的第二个窗口'
+        $views=@(FixtureExplorerViews)
+        foreach ($view in $views) {
+            $doc=$view.Document
+            Wait-Desktop { $doc.Folder.ParseName($keepers[1]) } '测试文件未进入 Explorer 视图'
+            $doc.SelectItem($doc.Folder.ParseName($keepers[0]),5)
+            $doc.SelectItem($doc.Folder.ParseName($keepers[1]),1)
+            Wait-Desktop { @(SelectedLeaves $view).Count -eq 2 } '测试窗口未建立多选'
+        }
+        & $Reopen
+        Show-FixturePair
+        Click-FileAction RevealFileButton
+        Wait-Desktop { SelectedFixtureExplorer } '实际激活的 Explorer 窗口未选中目标'
+        # 等补选逻辑运行后复核后台窗口，不能只看任意窗口碰巧选中了目标。
+        Start-Sleep -Milliseconds 700
+        $active=SelectedFixtureExplorer
+        if (!$active) { throw '激活的 Explorer 窗口选中项发生变化' }
+        foreach ($view in $views) {
+            if ([IntPtr]$view.HWND -ne $active) {
+                Assert-Equal ((SelectedLeaves $view) -join '|') (($keepers | Sort-Object) -join '|') '后台 Explorer 多选'
+            }
+        }
+        Write-Output 'PASS 同目录多窗口定位：前台选中目标，后台保留原有两项选择'
+    } finally {
+        # 仅关闭本轮专用目录对应的 Explorer 视图。
+        foreach ($view in @(FixtureExplorerViews)) { $view.Quit() }
+    }
+    & $Reopen
+    Show-FixturePair
+    # 文件移到本轮暂存目录，保留搜索时的旧行，验证两个失败操作都不会隐藏浮窗。
+    $moved=[IO.Directory]::CreateDirectory((Join-Path $fixtureRoot '已移走'))
+    [IO.File]::Move($target,(Join-Path $moved.FullName $name))
+    function Confirm-MissingAction([string]$Expected) {
+        Wait-Desktop {
+            $message=(Control FileStatusText).Current.Name
+            $message -and $message.StartsWith($Expected) -and $message.Contains($target) -and
+                [ESearchDesktop]::GetForegroundWindow() -eq $handle
+        } "文件移走后，未保留浮窗并提示 $Expected 和对应路径"
+    }
+    Click-FileAction OpenFileButton
+    Confirm-MissingAction '无法打开'
+    Click-FileAction RevealFileButton
+    Confirm-MissingAction '无法定位'
+    # 在同一选择上交替动作，每次错误消息都必须改变，避免误读上一次的提示。
+    [ESearchDesktop]::Press($handle,13)
+    Confirm-MissingAction '无法打开'
+    [ESearchDesktop]::Press($handle,16,13)
+    Confirm-MissingAction '无法定位'
+    Write-Output 'PASS 文件移走后，点击、Enter 和 Shift+Enter 均保留浮窗并提示对应操作和完整路径'
 }
 function Test-FileSearch {
     $tag = 'ESearchQA' + [Guid]::NewGuid().ToString('N').Substring(0,10)
@@ -428,6 +559,8 @@ function Test-FileSearch {
     Wait-Desktop { (SelectedPath) -ceq $exact[1] } '下键未重新选择第二项'
     Open-SelectedFixture $exact[1] $markers[$exact[1]]
     Write-Output 'PASS ↑/↓ 切换文件，Enter 打开第二个同名文件'
+    Summon-Fixture
+    Test-FileResultActions
 }
 
 # 在测试专属的 WPF 进程和数据库中操作设置；保留临时文件，便于复查失败现场。
@@ -468,7 +601,7 @@ function Test-SettingsPage([switch]$Restarted) {
     function Wait-Gloss([string]$word,[string]$expected) {
         $searchBox.SetValue($word)
         $filter=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::AutomationIdProperty,'GlossText')
-        Wait-Desktop { $searchWindow.FindFirst($tree,$filter).Current.Name -like "*$expected*" } "浮窗首义没有显示 $expected"
+        Wait-Desktop { ([string]$searchWindow.FindFirst($tree,$filter).Current.Name).Contains($expected,[StringComparison]::OrdinalIgnoreCase) } "浮窗首义没有显示 $expected"
     }
     function Inspect-Rank([string]$expected) {
         $window.GetCurrentPattern([Windows.Automation.WindowPattern]::Pattern).Close()
@@ -490,7 +623,7 @@ function Test-SettingsPage([switch]$Restarted) {
         @($root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object {$_.Current.Name -eq 'E_Search 设置'})[0]
     }
     function Pick-Book([string]$name) {
-        $row=@(Options (Control DictionaryList) | Where-Object { $_.Current.Name -like "*$name*" })[0]
+        $row=@(Options (Control DictionaryList) | Where-Object { $_.Current.Name.Contains($name,[StringComparison]::OrdinalIgnoreCase) })[0]
         if (!$row) { throw "列表中未找到 $name" }
         $row.GetCurrentPattern($itemPattern).Select()
         Wait-Desktop { (Control ToggleEnabledButton).Current.IsEnabled } '词库管理按钮未就绪'
@@ -506,10 +639,43 @@ function Test-SettingsPage([switch]$Restarted) {
         Assert-Equal $grid.Current.ColumnCount $columns "设置页原始列预览"
         if ($grid.Current.RowCount -lt 1) { throw "预览没有显示样例记录" }
     }
-    function Import-File([string]$name) {
-        Click ImportButton
+    function Wait-Import([string]$name) {
         Wait-Desktop { @(Invoke-Search @('list') | Where-Object { $_.EndsWith(("`t"+$name),[StringComparison]::OrdinalIgnoreCase) }).Count -eq 1 } "词典未入库：$name" 120000
-        Wait-Desktop { (Control ImportButton).Current.IsEnabled -or (Control ImportStatus).Current.Name -match '成功|完成|已导入' } '导入结果没有返回设置页'
+        Wait-Desktop { (Control ImportButton).Current.IsEnabled -and (Control ImportStatus).Current.Name.StartsWith("已导入 $name，",[StringComparison]::OrdinalIgnoreCase) } '导入结果没有返回设置页'
+    }
+    function Start-ImportAndReopen {
+        # 暂时持有测试库的写事务，使快慢机器上都能在提交前关闭、重新打开真实设置窗口。
+        if (!('Microsoft.Data.Sqlite.SqliteConnection' -as [type])) {
+            $uiDir=Join-Path $PSScriptRoot 'bin/Release/net10.0-windows'
+            foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite') {
+                [void][Reflection.Assembly]::LoadFrom((Join-Path $uiDir "$lib.dll"))
+            }
+            [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+        }
+        $config=[Microsoft.Data.Sqlite.SqliteConnectionStringBuilder]::new()
+        $config.DataSource=$Database
+        $writer=[Microsoft.Data.Sqlite.SqliteConnection]::new($config.ToString())
+        try {
+            $writer.Open()
+            $tx=$writer.BeginTransaction()
+            Click ImportButton
+            Wait-Desktop { (Control ImportStatus).Current.Name -like '正在导入*' } '导入没有开始'
+            $window.GetCurrentPattern([Windows.Automation.WindowPattern]::Pattern).Close()
+            Wait-Desktop { [ESearchDesktop]::FindSearch($appProcess.Id) -eq $handle } '导入期间关闭设置没有返回搜索窗'
+            $window=$searchWindow
+            Click SettingsButton
+            function Visible-Settings {
+                $root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object { $_.Current.Name -eq 'E_Search 设置' }
+            }
+            Wait-Desktop { @(Visible-Settings).Count -eq 1 -and [ESearchDesktop]::FindSearch($appProcess.Id) -eq 0 } '重新进入时应只显示一个设置窗口'
+            $window=@(Visible-Settings)[0]
+            Tab ImportTab
+            Wait-Desktop { (Control ImportStatus).Current.Name -like '正在导入*' -and !(Control ImportButton).Current.IsEnabled } '重开的设置页丢失导入状态或允许重复提交'
+        } finally {
+            if ($tx) { $tx.Dispose() }
+            $writer.Dispose()
+        }
+        $window
     }
     function Prove-Hotkey {
         # 从受控原文本框发送真实组合键；查询框清空和获得前台共同证明热键已生效。
@@ -519,6 +685,10 @@ function Test-SettingsPage([switch]$Restarted) {
             [ESearchDesktop]::ActivateFixture($form.Handle)
             [ESearchDesktop]::GetForegroundWindow() -eq $form.Handle
         } '验收原窗口未获得焦点'
+        if ([ESearchDesktop]::FindSearch($appProcess.Id) -ne 0) {
+            [ESearchDesktop]::Press($form.Handle,17,18,119)
+            Wait-Desktop { [ESearchDesktop]::FindSearch($appProcess.Id) -eq 0 } '已保存的 Ctrl+Alt+F8 没有收起浮窗'
+        }
         [ESearchDesktop]::Press($form.Handle,17,18,119) # Ctrl+Alt+F8
         Wait-Desktop {
             [ESearchDesktop]::GetForegroundWindow() -eq $handle -and $searchBox.Current.Value -eq ''
@@ -551,12 +721,15 @@ function Test-SettingsPage([switch]$Restarted) {
 
     $mdx=if ($MdxSample) { $MdxSample } else { $jaPath }
     Stage-File $mdx
-    Import-File ([IO.Path]::GetFileName($mdx))
+    $window=Start-ImportAndReopen
+    Wait-Import ([IO.Path]::GetFileName($mdx))
+    Tab CatalogTab
+    Pick-Book ([IO.Path]::GetFileName($mdx))
     $mdxLine=@(Invoke-Search @('list') | Where-Object { $_.EndsWith(("`t"+[IO.Path]::GetFileName($mdx)),[StringComparison]::OrdinalIgnoreCase) })[0]
     $mdxFields=$mdxLine -split "`t"
     if ([int]$mdxFields[2] -lt 1 -or $mdxFields[3] -cne (Get-FileHash -LiteralPath $mdx).Hash) { throw "MDX 校验失败：$mdxLine" }
     if ($mdxFields[0] -eq "shogakukan" -and @(Invoke-Search @("query","食べる"))[0] -notlike "*たべる · 吃*") { throw "小学馆真实 MDX 入库后未查询到预期记录" }
-    Write-Output "PASS WPF 导入 MDX $($mdxFields[4])，$($mdxFields[2]) 条，SHA-256 一致"
+    Write-Output "PASS WPF 导入 MDX $($mdxFields[4])，提交前关闭并重开设置仍显示进度、成功消息和新词库。$($mdxFields[2]) 条，SHA-256 一致"
 
     [IO.File]::WriteAllText($csv, "释义,读音,词头`r`n`"甲,引号`"`"释义`"`"`",,$rankWord`r`n茶,ちゃ,茶叶样本`r`n", [Text.UTF8Encoding]::new($true))
     Stage-File $csv
@@ -565,22 +738,28 @@ function Test-SettingsPage([switch]$Restarted) {
         (Control HasHeader).GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Toggle()
     }
     Choose HeadColumn 2; Choose GlossColumn 0; Choose ReadingColumn 2
-    Import-File ([IO.Path]::GetFileName($csv))
+    Click ImportButton
+    Wait-Import ([IO.Path]::GetFileName($csv))
     $csvLine=Invoke-Search @('list') | Where-Object { $_ -like '*优先级甲.csv*' }
     if (($csvLine -split "`t")[2] -ne '2') { throw 'CSV 表头、条数或列映射错误' }
     if ((Invoke-Search @('query','ちゃ') | Out-String) -notlike '*茶叶样本*茶*') { throw 'CSV 可选读音列未建立正确索引' }
     Write-Output 'PASS CSV 预览并按列序号映射，跳过表头，空读音、UTF-8 BOM、带逗号和双引号的释义均已验证'
 
-    [IO.File]::WriteAllText($tsv,"乙释义`t$rankWord`r`n第二行`t另一词`r`n")
+    $tsvRows=@("乙释义`t$rankWord")
+    $tsvRows+=foreach ($i in 2..6) { "普通释义$i`t样本词$i" }
+    $tsvRows+="第七行释义`t迟到的读音`tななめ"
+    [IO.File]::WriteAllLines($tsv,$tsvRows)
     Stage-File $tsv
     Check-Preview 2
     if ((Control HasHeader).GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq 'On') {
         (Control HasHeader).GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Toggle()
     }
-    Choose HeadColumn 1; Choose GlossColumn 0; Choose ReadingColumn 0
-    Import-File ([IO.Path]::GetFileName($tsv))
+    Choose HeadColumn 1; Choose GlossColumn 0; Edit ReadingColumn '3'
+    Click ImportButton
+    Wait-Import ([IO.Path]::GetFileName($tsv))
     if (@(Invoke-Search @('query',$rankWord))[0] -notlike '*乙释义*') { throw '无表头 TSV 的第一行或新词表优先级错误' }
-    Write-Output 'PASS TSV 两列预览和映射，首行数据与无读音词条正确入库'
+    if ((Invoke-Search @('query','ななめ') | Out-String) -notlike '*迟到的读音*第七行释义*') { throw '第七行才出现的第 3 列读音未能检索' }
+    Write-Output 'PASS 无表头 TSV 的前六行只有两列，窗口可输入第 3 列并查到第七行读音，首行仍保留'
 
     $window=Inspect-Rank '乙释义'
     Tab CatalogTab
@@ -603,12 +782,12 @@ function Test-SettingsPage([switch]$Restarted) {
         (Control HasHeader).GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern).Toggle()
     }
     Choose HeadColumn 2; Choose GlossColumn 0; Choose ReadingColumn 2
-    Click ImportButton
+    $window=Start-ImportAndReopen
     Wait-Desktop { (Control ImportStatus).Current.Name -match '失败|不能为空|第\s*34\s*行' } '损坏的重新导入没有报告错误'
     Assert-Equal (Invoke-Search @('list') | Out-String) $old '失败重导的词库元数据、哈希及优先级'
     if (@(Invoke-Search @('query','回滚样本1')).Count -ne 0) { throw '失败重导留下部分新数据' }
     if (@(Invoke-Search @('query',$rankWord))[0] -notlike '*甲,引号"释义"*') { throw '失败重导丢失原词条' }
-    Write-Output "PASS 设置页重新导入在第 34 行失败，旧库、顺序、哈希保留，部分新记录回滚；$((Control ImportStatus).Current.Name)"
+    Write-Output "PASS 导入中关闭并重开设置后收到第 34 行失败消息，旧库、顺序、哈希保留，部分新记录回滚。$((Control ImportStatus).Current.Name)"
 
     Tab CatalogTab
     Pick-Book '优先级甲'
@@ -641,6 +820,97 @@ function Test-SettingsPage([switch]$Restarted) {
         Write-Output 'PASS Ctrl+Alt+F9 由独立进程真实注册占用，冲突后已有 Ctrl+Alt+F8 仍能实际唤起'
     } finally { [void][ESearchDesktop]::UnregisterHotKey($form.Handle,0x1471) }
 }
+function Test-LookupAudit([string]$Scratch, [Reflection.Assembly]$Assembly) {
+    $previous = $env:E_SEARCH_DB
+    $env:E_SEARCH_DB = Join-Path $Scratch 'lookup-audit.db'
+    $ctor = $Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool]))
+    $token = [Threading.CancellationToken]::None
+    try {
+        $oxford = Join-Path $Scratch 'audit-oxford.mdx'
+        $go = 'go<hr><div><div>【HELP】<br><font color=#FF5000>• been 是过去分词</font></div></div><br>1. move<br><font color=#FF5000>• 去；<font color=black>走</font></font>'
+        Write-Mdx $oxford ([ordered]@{
+            'go'=$go; 'KO'='<font color=#FF5000>• 击倒</font>'; 'apple'='<font color=#FF5000>• 苹果</font>'
+            'raku'='English exact'
+            'acclimate'='acclimate<hr>see acclimatize'
+            'cameo'='cameo<hr><div>【ORIGIN】<font color=#FF5000>• 词源注释</font></div>【IDIOMS】<font color=#FF5000>• 短语</font>'
+        })
+        Invoke-Search @('import','oxford',$oxford) | Out-Null
+        $ja = Join-Path $Scratch 'audit-alias.mdx'
+        Write-Mdx $ja ([ordered]@{
+            'はし'='@@@LINK=橋'; '橋'='桥'; 'マチ'='@@@LINK=別名'; '別名'='@@@LINK=町'; '町'='城镇'
+            'コーヒー'='咖啡'; 'ゲーム'='游戏'; 'がっこう'='@@@LINK=学校'; '学校'='学校'
+            'KO'='拳击'; 'こ'='假名'; 'ループ'='@@@LINK=循環'; '循環'='@@@LINK=ループ'
+        })
+        $zh = Join-Path $Scratch 'audit-order.mdx'
+        Write-Mdx $zh ([ordered]@{'raku'='中英同形'})
+        $writer = $ctor.Invoke([object[]]@($env:E_SEARCH_DB,$false))
+        try {
+            $import = $writer.GetType().GetMethod('ImportDictionary')
+            $book = $import.Invoke($writer,@([string]$ja,'ja',$null,$null))
+            $chinese = $import.Invoke($writer,@([string]$zh,'zh',$null,$null))
+            $writer.SaveDictionaryOrder([string[]]@($chinese.Id,$book.Id,'oxford'))
+        } finally { $writer.Dispose() }
+
+        function Check-AuditIndex($reader, $stage) {
+            $hit = $reader.Search('go','oxford',$token)[0]
+            Assert-Equal $hit.Entry.Gloss '去；走' "$stage 牛津跳过说明框，完整提取嵌套字体"
+            Assert-Equal ($reader.CurrentBody($hit.Entry)) $go "$stage 牛津展开保留原文"
+            foreach ($word in 'apple','acclimate','cameo') {
+                $expected = @{apple='苹果'; acclimate='acclimate'; cameo='cameo'}[$word]
+                Assert-Equal $reader.Search($word,'oxford',$token)[0].Display $expected "$stage 普通义项或回退 $word"
+            }
+            foreach ($query in 'はし','ハシ','hashi','マチ','まち','machi') {
+                $results = $reader.Search($query,$book.Id,$token)
+                $bridge = $query -in 'はし','ハシ','hashi'
+                Assert-Equal $results.Count 1 "$stage 假名链接只返回同书正文 $query"
+                Assert-Equal $results[0].Method $(if ($query -match '^[a-z]+$') { 'romaji' } else { 'reading' }) "$stage 链接命中方式 $query"
+                Assert-Equal $results[0].Entry.Headword $(if ($bridge) { '橋' } else { '町' }) "$stage 链接目标 $query"
+                Assert-Equal $results[0].Entry.Reading $(if ($bridge) { 'はし' } else { 'マチ' }) "$stage 链接读音 $query"
+            }
+            Assert-Equal $reader.Search('ruupu',$book.Id,$token).Count 0 "$stage 循环链接终止"
+            foreach ($row in @(@('コーヒー','koohii','kōhī','ko-hi-'), @('ゲーム','geemu','gēmu'), @('学校','gakkō','gakkou'))) {
+                foreach ($query in $row[1..($row.Length-1)]) {
+                    $results = $reader.Search($query,$book.Id,$token)
+                    Assert-Equal $results.Count 1 "$stage 长音去重 $query"
+                    Assert-Equal $results[0].Entry.Headword $row[0] "$stage 长音拼法 $query"
+                }
+            }
+            $ranked = $reader.Search('ko',[System.Management.Automation.Language.NullString]::Value,$token)
+            Assert-Equal (($ranked | ForEach-Object { "$($_.Entry.Language)/$($_.Method)" }) -join ',') 'en/headword,ja/headword,ja/romaji' "$stage 英文精确优先于高优先级的日语 KO 与读音"
+            $noJapanese = $reader.Search('raku',[System.Management.Automation.Language.NullString]::Value,$token)
+            Assert-Equal (($noJapanese | ForEach-Object { $_.Entry.Language }) -join ',') 'zh,en' "$stage 没有日语候选时遵循用户排序"
+        }
+        $connection = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$env:E_SEARCH_DB")
+        $connection.Open()
+        try {
+            $cmd = $connection.CreateCommand()
+            $cmd.CommandText = "SELECT gloss FROM entries WHERE dict='oxford' AND head='go'"
+            Assert-Equal ($cmd.ExecuteScalar()) '去；走' '新导入保存正确牛津首义'
+            $cmd.CommandText = "SELECT count(*) FROM terms WHERE kind=1 AND term='はし'"
+            Assert-Equal ($cmd.ExecuteScalar()) 1 '新导入的假名链接建立读音索引'
+            foreach ($stage in '新导入','已记录版本的旧库','无版本列的旧库') {
+                if ($stage -eq '已记录版本的旧库') {
+                    # 仅改本测试库，重建旧版本实际存下的摘要、词头索引及空读音。
+                    $cmd.CommandText = @"
+UPDATE entries SET gloss='been 是过去分词' WHERE dict='oxford' AND head='go';
+DELETE FROM terms WHERE kind=1 AND (dict,ordinal) IN (SELECT dict,ordinal FROM entries WHERE link IS NOT NULL);
+UPDATE entries SET reading=NULL,evidence=NULL WHERE link IS NOT NULL;
+"@
+                    [void]$cmd.ExecuteNonQuery()
+                } elseif ($stage -eq '无版本列的旧库') {
+                    $cmd.CommandText = 'ALTER TABLE dictionary_metadata RENAME TO versioned_metadata;
+                        CREATE TABLE dictionary_metadata AS SELECT id,source_path,enabled FROM versioned_metadata;'
+                    [void]$cmd.ExecuteNonQuery()
+                }
+                $reader = $ctor.Invoke([object[]]@($env:E_SEARCH_DB,$true))
+                try { Check-AuditIndex $reader $stage } finally { $reader.Dispose() }
+            }
+            $cmd.Dispose()
+        } finally { $connection.Dispose() }
+    } finally { $env:E_SEARCH_DB = $previous }
+    Write-Output 'PASS 牛津首义、日语假名链接、罗马字长音及英文精确优先；覆盖新导入和两种旧索引'
+}
+
 function Test-JapaneseLookup([string]$Scratch, [Reflection.Assembly]$Assembly) {
     $previous = $env:E_SEARCH_DB
     $env:E_SEARCH_DB = Join-Path $Scratch 'japanese-lookup.db'
@@ -697,8 +967,7 @@ UPDATE dictionary_metadata SET revision=NULL WHERE id='shogakukan'
 
 # 实际桌面验收使用自建的原窗口。每次发键前检查前台句柄，避免输入到用户文档。
 function Test-Tray {
-    if ((Control StatusText).Current.Name -notmatch '占用') { throw '预注册默认快捷键后浮窗没有显示冲突提示' }
-    Write-Output "PASS 启动时默认 Alt+Space 确实被独立进程占用，浮窗提示：$((Control StatusText).Current.Name)"
+    if ((Control StatusText).Current.Name -match '注册|占用') { throw '默认快捷键冲突提示仍出现在搜索框下方' }
     [ESearchDesktop]::Press($handle,27)
     Wait-Desktop { [ESearchDesktop]::FindSearch($appProcess.Id) -eq 0 } '冲突验收浮窗未隐藏'
     $root=[Windows.Automation.AutomationElement]::RootElement
@@ -742,6 +1011,7 @@ function Test-Tray {
         Wait-Desktop { (SettingsTop) } '未从托盘进入设置'
         $window=SettingsTop
         (Control HotkeyTab).GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Select()
+        Wait-Desktop { (Control HotkeyStatus).Current.Name -match '占用' } '设置页缺少启动时的热键冲突信息'
         (Control HotkeyCapture).GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).SetValue('Ctrl + Alt + F8')
         (Control SaveHotkeyButton).GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
         Wait-Desktop { (Control CurrentHotkey).Current.Name -match 'F8' } '从托盘更改快捷键失败'
@@ -755,6 +1025,159 @@ function Test-Tray {
         if ($dpi -ne [IntPtr]::Zero) { [void][ESearchDesktop]::SetThreadDpiAwarenessContext($dpi) }
     }
 }
+function Test-LaunchReadiness {
+    $originalScope=$env:E_SEARCH_TEST_INSTANCE
+    try {
+        foreach ($ownerFails in $false,$true) {
+            $env:E_SEARCH_TEST_INSTANCE=[guid]::NewGuid().ToString('N')
+            $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            $endpoint="E_Search.Desktop.$sid.$([Diagnostics.Process]::GetCurrentProcess().SessionId).Test.$env:E_SEARCH_TEST_INSTANCE"
+            $resident=[Threading.Mutex]::new($true,$endpoint,[Threading.NamedWaitHandleOptions]::new())
+            $locked=$true
+            $second=$server=$reader=$writer=$null
+            try {
+                $second=Start-Process -FilePath $gui -ArgumentList @('gui','shogakukan') -PassThru
+                # 首启的创建和持锁是原子的；第二个句柄出现时 EXE 已打开既有对象，必定进入转发分支。
+                Wait-Desktop { [ESearchDesktop]::HandleCount($resident.SafeWaitHandle) -gt 1 } '二次启动没有打开隔离互斥量'
+                if ($ownerFails) {
+                    $resident.ReleaseMutex()
+                    $locked=$false
+                    $roots=[Windows.Automation.AutomationElement]::RootElement
+                    function StartupError {
+                        foreach ($dialog in $roots.FindAll([Windows.Automation.TreeScope]::Children,[Windows.Automation.Condition]::TrueCondition)) {
+                            if ($dialog.Current.ProcessId -eq $second.Id -and $dialog.Current.Name -ceq 'E_Search 启动失败') { return $dialog }
+                        }
+                    }
+                    Wait-Desktop { StartupError } '首启退出后未向二次启动报告失败'
+                    $dialog=StartupError
+                    # Windows 的原生提示框可能将正文和“确定”都暴露成 Pane。按内容验收，再向本进程对话框确认。
+                    $labels=@($dialog.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition) | ForEach-Object { $_.Current.Name })
+                    if ($labels -cnotcontains '常驻窗口在完成启动前已退出。') { throw "二次启动报告了不同的原因：$($labels -join ' / ')" }
+                    [ESearchDesktop]::ConfirmDialog([IntPtr]::new($dialog.Current.NativeWindowHandle),$second.Id)
+                } else {
+                    # 超过旧版的 30 秒连接上限，再检查进程既未退出也未弹错，最后才提供管道。
+                    Start-Sleep -Milliseconds 32000
+                    Assert-Equal $second.HasExited $false '大词库首启超过 30 秒时二次 EXE 应继续等待'
+                    $roots=[Windows.Automation.AutomationElement]::RootElement
+                    $pidFilter=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty,$second.Id)
+                    foreach ($dialog in $roots.FindAll([Windows.Automation.TreeScope]::Children,$pidFilter)) {
+                        if ($dialog.Current.Name -eq 'E_Search 启动失败') { throw '慢首启期间二次 EXE 弹出了启动失败提示' }
+                    }
+                    $server=[IO.Pipes.NamedPipeServerStream]::new($endpoint,[IO.Pipes.PipeDirection]::InOut,1,
+                        [IO.Pipes.PipeTransmissionMode]::Byte,[IO.Pipes.PipeOptions]'Asynchronous,CurrentUserOnly')
+                    [void]$server.WaitForConnectionAsync().WaitAsync([TimeSpan]::FromSeconds(5)).GetAwaiter().GetResult()
+                    $reader=[IO.StreamReader]::new($server,[Text.Encoding]::UTF8,$true,1024,$true)
+                    $writer=[IO.StreamWriter]::new($server,[Text.UTF8Encoding]::new($false),1024,$true)
+                    $request=$reader.ReadLineAsync().WaitAsync([TimeSpan]::FromSeconds(5)).GetAwaiter().GetResult()
+                    Assert-Equal ($request | ConvertFrom-Json) 'shogakukan' '首启就绪后的转发词典'
+                    Assert-Equal $second.HasExited $false '未经确认不得提前返回成功'
+                    $writer.WriteLine('null')
+                    $writer.Flush()
+                }
+                if (!$second.WaitForExit(5000)) { throw "二次启动进程没有结束（模拟首启失败=$ownerFails）" }
+                Assert-Equal $second.ExitCode ([int]$ownerFails) '首启就绪或失败时的真实二次进程退出码'
+            } finally {
+                if ($locked) { $resident.ReleaseMutex() }
+                $resident.Dispose()
+                if ($writer) { $writer.Dispose() }
+                if ($reader) { $reader.Dispose() }
+                if ($server) { $server.Dispose() }
+                if ($second) {
+                    if (!$second.HasExited) { $second.Kill(); $second.WaitForExit() }
+                    $second.Dispose()
+                }
+            }
+        }
+        Write-Output 'PASS 慢首启持锁时二次 EXE 等待正确词典转发；所有者提前退出时得到启动失败'
+    } finally { $env:E_SEARCH_TEST_INSTANCE=$originalScope }
+}
+
+# 桌面专项使用自己的数据库和快捷键，可与用户日常使用的旧版同时运行。
+function Test-WindowInteractions {
+    $searchWindow=$window
+    # 交付的四部词库没有 MDX 重定向记录；从隔离库里实际导入的日语别名核对 WPF 显示。
+    $value.SetValue('hashi')
+    Wait-Desktop { (Control GlossText).Current.Name -ceq '橋（はし） · 桥' } '浮窗未从罗马字通过假名链接找到规范词头'
+    $value.SetValue('')
+    Write-Output 'PASS MDX 假名别名浮窗 hashi → はし → 橋（はし） · 桥'
+    $invoke=[Windows.Automation.InvokePattern]::Pattern
+    $roots=[Windows.Automation.AutomationElement]::RootElement
+    $byProcess=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty,$appProcess.Id)
+    function SettingsWindows { $roots.FindAll([Windows.Automation.TreeScope]::Children,$byProcess) | Where-Object { $_.Current.Name -ceq 'E_Search 设置' } }
+    function Launch-Again {
+        $second=Start-Process -FilePath $gui -PassThru
+        try {
+            if (!$second.WaitForExit(8000)) { throw '再次启动程序产生了第二个常驻进程' }
+            Assert-Equal $second.ExitCode 0 '二次启动返回值'
+        } finally {
+            if (!$second.HasExited) { $second.Kill(); $second.WaitForExit() }
+            $second.Dispose()
+        }
+    }
+    if ((Control StatusText).Current.Name -match '未能注册|已被占用') { throw '搜索框下仍显示快捷键冲突' }
+    (Control SettingsButton).GetCurrentPattern($invoke).Invoke()
+    Wait-Desktop { @(SettingsWindows).Count -eq 1 -and [ESearchDesktop]::FindSearch($appProcess.Id) -eq 0 } '设置打开时应只有设置可见'
+    $window=@(SettingsWindows)[0]
+    $settingsHandle=[IntPtr]::new($window.Current.NativeWindowHandle)
+    (Control HotkeyTab).GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Wait-Desktop { (Control SaveHotkeyButton).Current.IsEnabled } '设置页未就绪'
+    if ((Control HotkeyStatus).Current.Name -notmatch '占用') { throw '默认热键冲突未在快捷键设置内显示' }
+    (Control HotkeyCapture).GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).SetValue('Ctrl + Alt + Shift + F15')
+    (Control SaveHotkeyButton).GetCurrentPattern($invoke).Invoke()
+    Wait-Desktop { (Control CurrentHotkey).Current.Name -match 'F15' } '未注册专项热键'
+    [ESearchDesktop]::ActivateFixture($form.Handle)
+    [ESearchDesktop]::Press($form.Handle,17,18,16,126)
+    Wait-Desktop {
+        [ESearchDesktop]::GetForegroundWindow() -eq $settingsHandle -and [ESearchDesktop]::FindSearch($appProcess.Id) -eq 0
+    } '设置打开时按热键应回到原设置窗口'
+    # 发键、二次启动都须留下原设置页。最小化后再启动还应恢复它。
+    $settingsPattern=$window.GetCurrentPattern([Windows.Automation.WindowPattern]::Pattern)
+    $settingsPattern.SetWindowVisualState([Windows.Automation.WindowVisualState]::Minimized)
+    Launch-Again
+    Wait-Desktop {
+        @(SettingsWindows).Count -eq 1 -and [ESearchDesktop]::FindSearch($appProcess.Id) -eq 0 -and
+        $settingsPattern.Current.WindowVisualState -eq 'Normal' -and [ESearchDesktop]::GetForegroundWindow() -eq $settingsHandle
+    } '重复启动未恢复原设置页，或浮窗挡住设置'
+    $settingsPattern.Close()
+    $window=$searchWindow
+    Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle } '关闭设置后未回到同一搜索窗'
+    $grip=Control DragHandle
+    if (!$grip) { throw '找不到搜索窗的拖动区域' }
+    $start=$window.Current.BoundingRectangle
+    $point=$grip.GetClickablePoint()
+    $area=[Windows.Forms.Screen]::FromHandle($handle).WorkingArea
+    $dx=if ($start.Left-$area.Left -gt $area.Right-$start.Right) {
+        -[Math]::Min(80,[Math]::Floor($start.Left-$area.Left))
+    } else { [Math]::Min(80,[Math]::Floor($area.Right-$start.Right)) }
+    $dy=if ($start.Top-$area.Top -gt $area.Bottom-$start.Bottom) {
+        -[Math]::Min(50,[Math]::Floor($start.Top-$area.Top))
+    } else { [Math]::Min(50,[Math]::Floor($area.Bottom-$start.Bottom)) }
+    [ESearchDesktop]::DragPoint($handle,[int]$point.X,[int]$point.Y,$dx,$dy)
+    Wait-Desktop { $r=$window.Current.BoundingRectangle; [Math]::Abs($r.X-$start.X-$dx) -le 3 -and [Math]::Abs($r.Y-$start.Y-$dy) -le 3 } '鼠标拖动后窗口未随手柄移动'
+    $moved=$window.Current.BoundingRectangle
+    [ESearchDesktop]::Press($handle,17,18,16,126)
+    Wait-Desktop { [ESearchDesktop]::FindSearch($appProcess.Id) -eq 0 } '再次按快捷键未隐藏窗口'
+    function Reopen-Search {
+        # 关闭测试用的浏览器或 Explorer 标签时，系统可能在下一次消息循环才交还前台。
+        Wait-Desktop {
+            [ESearchDesktop]::ActivateFixture($form.Handle)
+            if ([ESearchDesktop]::GetForegroundWindow() -ne $form.Handle) { return $false }
+            try { [ESearchDesktop]::Press($form.Handle,17,18,16,126); return $true }
+            catch { if ([ESearchDesktop]::GetForegroundWindow() -ne $form.Handle) { return $false }; throw }
+        } '测试文本框没有取得发送快捷键所需的前台焦点'
+        Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle } '未重新唤起原搜索窗'
+    }
+    Reopen-Search
+    $shown=$window.Current.BoundingRectangle
+    if ([Math]::Abs($shown.X-$moved.X) -gt 3 -or [Math]::Abs($shown.Y-$moved.Y) -gt 3) { throw '重开后丢失拖动位置' }
+    [ESearchDesktop]::Press($handle,17,18,16,126)
+    Wait-Desktop { [ESearchDesktop]::FindSearch($appProcess.Id) -eq 0 } '未隐藏搜索窗'
+    Launch-Again
+    Wait-Desktop { [ESearchDesktop]::FindSearch($appProcess.Id) -eq $handle } '二次启动未唤起原搜索窗'
+    Write-Output 'PASS 设置窗口复用和层级、重复启动、快捷键显隐、鼠标拖动并恢复位置'
+    if ($FileActionsDesktop) { Test-FileResultActions -Reopen { Reopen-Search } }
+}
+
 function Test-Desktop([string]$Database, [switch]$Files, [switch]$Settings, [switch]$Restarted,[string]$Scenario) {
     Add-Type -AssemblyName System.Windows.Forms, UIAutomationClient, UIAutomationTypes
     if (-not ('ESearchDesktop' -as [type])) {
@@ -795,6 +1218,24 @@ public static class ESearchDesktop {
         if(!SetCursorPos(p[0],p[1]))throw new Exception("无法定位到系统托盘图标");
         mouse_event(8,0,0,0,UIntPtr.Zero);mouse_event(16,0,0,0,UIntPtr.Zero);
     }
+    static void StartClick(IntPtr owner,int x,int y) {
+        if(owner==IntPtr.Zero || GetAncestor(WindowFromPoint(new POINT{x=x,y=y}),2)!=owner || !SetCursorPos(x,y))
+            throw new Exception("目标点不在验收窗口内，停止点击");
+        mouse_event(2,0,0,0,UIntPtr.Zero);
+    }
+    public static void ClickPoint(IntPtr owner,int x,int y) {
+        StartClick(owner,x,y);
+        mouse_event(4,0,0,0,UIntPtr.Zero);
+    }
+    public static void DragPoint(IntPtr owner,int x,int y,int dx,int dy) {
+        StartClick(owner,x,y);
+        try {
+            for(int step=1;step<=8;step++) {
+                System.Threading.Thread.Sleep(30);
+                SetCursorPos(x+dx*step/8,y+dy*step/8);
+            }
+        } finally { mouse_event(4,0,0,0,UIntPtr.Zero); }
+    }
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
@@ -802,6 +1243,18 @@ public static class ESearchDesktop {
     [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int pid);
     [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr window, int id, uint modifiers, uint key);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr window, int id);
+    [StructLayout(LayoutKind.Sequential)] struct ObjectInfo {
+        public uint attributes,access,handles,pointers;
+        [MarshalAs(UnmanagedType.ByValArray,SizeConst=10)] public uint[] reserved;
+    }
+    [DllImport("ntdll.dll")] static extern int NtQueryObject(
+        Microsoft.Win32.SafeHandles.SafeWaitHandle handle,int kind,out ObjectInfo info,int length,out int used);
+    // ObjectBasicInformation 的 HandleCount 让回归在客户端打开测试互斥量后才释放所有者。
+    public static uint HandleCount(Microsoft.Win32.SafeHandles.SafeWaitHandle handle) {
+        int status=NtQueryObject(handle,0,out var info,Marshal.SizeOf<ObjectInfo>(),out _);
+        if(status!=0) throw new InvalidOperationException("无法读取测试互斥量句柄数: "+status);
+        return info.handles;
+    }
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] static extern bool AttachThreadInput(uint caller,uint other,bool attach);
     public static void ActivateFixture(IntPtr window) {
@@ -812,6 +1265,11 @@ public static class ESearchDesktop {
     }
     [DllImport("user32.dll")] static extern int GetKeyboardLayoutList(int count, [Out] IntPtr[] list);
     [DllImport("user32.dll")] static extern bool PostMessage(IntPtr window, int msg, IntPtr w, IntPtr l);
+    public static void ConfirmDialog(IntPtr window,int expectedPid) {
+        if(window==IntPtr.Zero || GetWindowThreadProcessId(window,out var pid)==0 || pid!=(uint)expectedPid ||
+            !PostMessage(window,0x0010,IntPtr.Zero,IntPtr.Zero)) // WM_CLOSE，同用户关闭这个已核验的错误框。
+            throw new InvalidOperationException("无法确认二次启动进程的错误对话框");
+    }
     [DllImport("user32.dll")] static extern uint SendInput(uint count, INPUT[] input, int size);
     [StructLayout(LayoutKind.Sequential)] struct INPUT {
         public uint type; public KEY key;
@@ -907,19 +1365,35 @@ public static class ESearchDesktop {
     $form.Controls.Add($box)
     $oldRoot=$env:DOTNET_ROOT
     $oldDb=$env:E_SEARCH_DB
+    $oldScope=$env:E_SEARCH_TEST_INSTANCE
     $appProcess=$null
+    $occupied=$false
     try {
         $env:DOTNET_ROOT=Split-Path $dotnet
         $env:E_SEARCH_DB=$Database
+        # 含 Launch-Again 在内的所有子进程继承同一 GUID，只能连接本轮常驻端点。
+        $env:E_SEARCH_TEST_INSTANCE=[guid]::NewGuid().ToString('N')
+        $gui=if ($GuiExecutable) { (Resolve-Path -LiteralPath $GuiExecutable).Path } else { Join-Path $PSScriptRoot 'bin/Release/net10.0-windows/E_Search.exe' }
+        # 旧发布包会忽略实例变量。用只打印帮助的入口确认支持后，才能启动任何桌面窗口。
+        $helpText=(& $gui --help 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -or !$helpText.Contains('E_SEARCH_TEST_INSTANCE')) {
+            throw "目标桌面程序不支持隔离的验收实例，请使用已重新构建的程序：$gui"
+        }
         $form.Show()
         $form.Activate()
         [void]$box.Focus()
         [ESearchDesktop]::ActivateFixture($form.Handle)
         Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $form.Handle } '测试原窗口未获得焦点'
-        $gui=if ($GuiExecutable) { (Resolve-Path -LiteralPath $GuiExecutable).Path } else { Join-Path $PSScriptRoot 'bin/Release/net10.0-windows/E_Search.exe' }
-        if ($Scenario -eq 'Tray') {
-            $occupied=[ESearchDesktop]::RegisterHotKey($form.Handle,0x1485,1,32)
-            if (!$occupied) { throw '测试开始前无法预留 Alt+Space' }
+        # 专项只发送自有数据库里的组合键。先确认没有第三方占用，冲突验收则持续保留初始键。
+        $occupied=[ESearchDesktop]::RegisterHotKey($form.Handle,0x1485,7,130) # Ctrl+Alt+Shift+F19
+        if (!$occupied) { throw '专项初始快捷键 Ctrl+Alt+Shift+F19 已被占用' }
+        if ($Scenario -notin 'Tray','Window') {
+            [void][ESearchDesktop]::UnregisterHotKey($form.Handle,0x1485)
+            $occupied=$false
+        }
+        if ($Settings -or $Scenario -eq 'Tray') {
+            if (![ESearchDesktop]::RegisterHotKey($form.Handle,0x1470,3,119)) { throw '专项快捷键 Ctrl+Alt+F8 已被占用' }
+            [void][ESearchDesktop]::UnregisterHotKey($form.Handle,0x1470)
         }
         # 第五阶段通过发布包的用户默认入口启动，同时启用四本词典。
         if ($Scenario -or $Settings) { $appProcess=Start-Process -FilePath $gui -PassThru }
@@ -939,7 +1413,26 @@ public static class ESearchDesktop {
         $window=[Windows.Automation.AutomationElement]::FromHandle($handle)
         $query=Control QueryBox
         $value=$query.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
-        if ((Control StatusText).Current.Name -match '占用') { Write-Warning 'Alt+Space 已占用，重新唤起验收可能需要关闭冲突程序' }
+        if ($Scenario -eq 'RealLookup') {
+            # 固定四部交付词库的人工核对值，独立于 CLI；从 WPF 输入框读取真实显示的首义。
+            $examples=[ordered]@{
+                go='去；走'; get='收到；接到'
+                on='(覆盖、附着)在…上(意指接触物体表面或构成物体表面的一部份)'
+                up='向(或在)较高位置；向上；在上面'; to='向,朝,往,对着(某方向或某处)'
+                ko='击倒'; 'コーヒー'='コーヒー · 咖啡'
+                koohii='コーヒー（コーヒー） · 咖啡'; 'kōhī'='コーヒー（コーヒー） · 咖啡'
+                'ko-hi-'='コーヒー（コーヒー） · 咖啡'; geemu='ゲーム（ゲーム） · 竞技,比赛'
+                gakkou='学校（がっこう） · 学校'; 'gakkō'='学校（がっこう） · 学校'
+                '食べる'='たべる · 吃'; apple='苹果'; '苹果'='apple'
+            }
+            foreach ($example in $examples.GetEnumerator()) {
+                $value.SetValue($example.Key)
+                Wait-Desktop { (Control GlossText).Current.Name -ceq $example.Value } "真实词库浮窗释义有误：$($example.Key)"
+                Write-Output "PASS 真实词库浮窗 $($example.Key) → $($example.Value)"
+            }
+            return
+        }
+        if ($Scenario -eq 'Window') { Test-WindowInteractions; Test-LaunchReadiness; return }
         if ($Settings) { Test-SettingsPage -Restarted:$Restarted; return }
         if ($Files) { Test-FileSearch; return }
         if ($Scenario -eq 'RestartEngine') {
@@ -977,7 +1470,7 @@ public static class ESearchDesktop {
             [ESearchDesktop]::ActivateFixture($form.Handle)
             [ESearchDesktop]::GetForegroundWindow() -eq $form.Handle -and $box.Focused
         } '受控原文本框未就绪'
-        [ESearchDesktop]::Press($form.Handle,18,32)
+        [ESearchDesktop]::Press($form.Handle,17,18,16,130)
         Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle } '未从原文本框唤起搜索'
         $window=[Windows.Automation.AutomationElement]::FromHandle($handle)
         $query=Control QueryBox
@@ -1138,8 +1631,8 @@ public static class ESearchDesktop {
             [ESearchDesktop]::ActivateFixture($form.Handle)
             [ESearchDesktop]::GetForegroundWindow() -eq $form.Handle
         } '测试窗口无法取得快捷键输入焦点'
-        [ESearchDesktop]::Press($form.Handle,18,32)
-        Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle } 'Alt+Space 未唤起浮窗'
+        [ESearchDesktop]::Press($form.Handle,17,18,16,130)
+        Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle } '专项快捷键未唤起浮窗'
         $window=[Windows.Automation.AutomationElement]::FromHandle($handle)
         $query=Control QueryBox
         $value=$query.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
@@ -1152,7 +1645,96 @@ public static class ESearchDesktop {
         $form.Dispose()
         $env:DOTNET_ROOT=$oldRoot
         $env:E_SEARCH_DB=$oldDb
+        $env:E_SEARCH_TEST_INSTANCE=$oldScope
     }
+}
+
+function Initialize-DesktopDatabases([string]$Directory, [Reflection.Assembly]$Assembly, [string]$Source) {
+    # 读取活动词库的一致快照（包括 WAL）；真实桌面用例的快捷键、设置及迁移均写入验收目录。
+    $storeType = $Assembly.GetType('DictionaryStore',$true)
+    $names = @('window.db','tray.db','settings.db')
+    if ($Source) { $names += 'desktop-data.db' }
+    foreach ($name in $names) {
+        $path = Join-Path $Directory $name
+        if ([IO.File]::Exists($path)) { throw "验收目标已存在：$path" }
+        if ($name -eq 'desktop-data.db') {
+            $config = [Microsoft.Data.Sqlite.SqliteConnectionStringBuilder]::new()
+            $config.DataSource = $Source
+            $config.Pooling = $false
+            $config.Mode = [Microsoft.Data.Sqlite.SqliteOpenMode]::ReadOnly
+            $reader = [Microsoft.Data.Sqlite.SqliteConnection]::new($config.ToString())
+            $config.DataSource = $path
+            $config.Mode = [Microsoft.Data.Sqlite.SqliteOpenMode]::ReadWriteCreate
+            $target = [Microsoft.Data.Sqlite.SqliteConnection]::new($config.ToString())
+            try {
+                $reader.Open()
+                $target.Open()
+                $reader.BackupDatabase($target)
+            } finally { $target.Dispose(); $reader.Dispose() }
+        }
+        $store = [Activator]::CreateInstance($storeType, @([string]$path,$false))
+        try {
+            $store.SaveHotkey(7,130) # Ctrl+Alt+Shift+F19
+            if ($name -eq 'window.db') {
+                $aliasMdx=Join-Path $Directory '假名别名.mdx'
+                Write-Mdx $aliasMdx ([ordered]@{'はし'='@@@LINK=橋'; '橋'='桥'})
+                $null=$store.GetType().GetMethod('ImportDictionary').Invoke($store,@([string]$aliasMdx,'ja',$null,$null))
+            }
+        } finally { $store.Dispose() }
+    }
+}
+
+function Test-CliAccess([string]$Directory) {
+    $oldDb = $env:E_SEARCH_DB
+    try {
+        $empty = Join-Path $Directory 'missing-cli-profile'
+        $env:E_SEARCH_DB = Join-Path $empty 'missing.db'
+        foreach ($arguments in @(@('oops'), @('entry','oxford','bad-ordinal'), @('import','unknown','sample.mdx'))) {
+            Invoke-Search $arguments 1 | Out-Null
+            Assert-Equal (Test-Path -LiteralPath $empty) $false '无效参数不得创建数据库目录'
+        }
+        foreach ($arguments in @(@('list'), @('query','word'), @('entry','oxford','1'), @('verify'))) {
+            if ((Invoke-Search $arguments 1 | Out-String) -notmatch '词库不存在') { throw "缺库时没有明确报告：$arguments" }
+            Assert-Equal (Test-Path -LiteralPath $empty) $false '只读命令不得创建缺失的词库'
+        }
+        $env:E_SEARCH_DB = Join-Path $Directory 'legacy-cli.db'
+        $samples = [ordered]@{
+            shogakukan = [ordered]@{'たべる'='たべる<br>【食べる】<br>吃'}
+            sanseido = [ordered]@{'食べる'='eat'}
+            oxford = [ordered]@{'apple'='苹果'}
+            hanying = [ordered]@{'苹果'='apple'}
+        }
+        foreach ($id in $samples.Keys) {
+            $file = Join-Path $Directory "cli-$id.mdx"
+            Write-Mdx $file $samples[$id]
+            Invoke-Search @('import',$id,$file) | Out-Null
+        }
+        $config = [Microsoft.Data.Sqlite.SqliteConnectionStringBuilder]::new()
+        $config.DataSource = $env:E_SEARCH_DB
+        $config.Pooling = $false
+        $db = [Microsoft.Data.Sqlite.SqliteConnection]::new($config.ToString())
+        try {
+            $db.Open()
+            $cmd = $db.CreateCommand()
+            $cmd.CommandText = 'PRAGMA journal_mode=DELETE; ALTER TABLE dictionary_metadata DROP COLUMN parser_id; ALTER TABLE dictionary_metadata DROP COLUMN revision;'
+            [void]$cmd.ExecuteNonQuery()
+            $cmd.Dispose()
+        } finally { $db.Dispose() }
+        # 同一份旧库分别以可写和文件只读属性验收，哈希可捕获任何建表、迁移或日志模式改写。
+        $before = (Get-FileHash -LiteralPath $env:E_SEARCH_DB).Hash
+        $legacy = Get-Item -LiteralPath $env:E_SEARCH_DB
+        try {
+            foreach ($readOnly in $false,$true) {
+                $legacy.IsReadOnly = $readOnly
+                Assert-Equal @(Invoke-Search @('list')).Count 4 '旧库词典清单'
+                Assert-Equal @(Invoke-Search @('query','apple','oxford')).Count 1 '旧库查词'
+                if ((Invoke-Search @('entry','oxford','1') | Out-String) -notmatch '苹果') { throw '旧库词条正文丢失' }
+                Assert-Equal @(Invoke-Search @('verify')).Count 7 '旧库四词典验收'
+                Assert-Equal (Get-FileHash -LiteralPath $legacy.FullName).Hash $before '读取命令改动了旧库'
+            }
+        } finally { $legacy.IsReadOnly = $false }
+        Write-Output 'PASS CLI 先校验参数，缺库不创建，四种只读操作可查询三列旧库且文件哈希不变'
+    } finally { $env:E_SEARCH_DB = $oldDb }
 }
 
 function Test-ReleaseDataLocation {
@@ -1176,13 +1758,20 @@ function Test-ReleaseDataLocation {
         Invoke-Search @('import','oxford',$fixture) | Out-Null
         Set-Location -LiteralPath $second
         Assert-Equal @(Invoke-Search @('query','example','oxford')).Count 1 '更换工作目录后仍能使用个人词库'
-        Assert-Equal (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'E_Search/dictionaries.db')) $true '无种子包的用户数据库'
+        $personal = Join-Path $env:LOCALAPPDATA 'E_Search/dictionaries.db'
+        Assert-Equal (Test-Path -LiteralPath $personal) $true '无种子包的用户数据库'
+        $seedDir = [IO.Directory]::CreateDirectory((Join-Path $install 'Data'))
+        $seed = Join-Path $seedDir.FullName 'dictionaries.db'
+        [IO.File]::Copy($personal,$seed)
+        $env:LOCALAPPDATA = Join-Path $root 'fresh-profile'
+        Assert-Equal @(Invoke-Search @('query','example','oxford')).Count 1 '首次只读查询可以直接读取发布种子'
+        Assert-Equal (Test-Path -LiteralPath $env:LOCALAPPDATA) $false '首次只读查询不得创建用户副本'
     } finally {
         Pop-Location
         $env:E_SEARCH_DB = $oldDb
         $env:LOCALAPPDATA = $oldProfile
     }
-    Write-Output 'PASS 无种子发布版从不同目录启动共用个人词库'
+    Write-Output 'PASS 无种子发布版跨工作目录共用个人词库；首次只读查询直接读取发布种子'
 }
 
 function Test-EntryRevision([string]$Directory, [Reflection.Assembly]$Assembly) {
@@ -1307,11 +1896,14 @@ if ($BackendTestDirectory) {
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
     Test-ImportIdentity $BackendTestDirectory $assembly
     Test-EverythingRecovery $BackendTestDirectory $assembly
+    Test-LookupAudit $BackendTestDirectory $assembly
     Test-JapaneseLookup $BackendTestDirectory $assembly
     Test-EntryRevision $BackendTestDirectory $assembly
+    Test-CliAccess $BackendTestDirectory
     Test-ReleaseDataLocation
     Test-RunningCancellation $assembly
     Test-EngineProbeBinding
+    if ($PrepareDesktop) { Initialize-DesktopDatabases $BackendTestDirectory $assembly $RealDatabase }
     return
 }
 
@@ -1365,8 +1957,19 @@ try {
     $psDll = Join-Path $PSHOME 'pwsh.dll'
     if (!(Test-Path -LiteralPath $psDll)) { $psDll = Join-Path (Split-Path (Get-Command pwsh -ErrorAction Stop).Source) 'pwsh.dll' }
     $config = Join-Path $PSScriptRoot 'bin/Release/net10.0-windows/E_Search.runtimeconfig.json'
-    & $dotnet exec --runtimeconfig $config --depsfile (Join-Path (Split-Path $psDll) 'pwsh.deps.json') $psDll -NoProfile -NonInteractive -File $PSCommandPath -BackendTestDirectory $scratch
+    if (($Desktop -or $FileDesktop) -and !$RealDatabase) { $RealDatabase=(Resolve-Path (Join-Path $PSScriptRoot '.data/dictionaries.db')).Path }
+    $prepareArgs=@()
+    $desktopData=Join-Path $scratch 'desktop-data.db'
+    if ($WindowDesktop -or $FileActionsDesktop -or $SettingsDesktop -or $Desktop -or $FileDesktop -or $AcceptanceDesktop -or $RestartEngine) {
+        $prepareArgs += '-PrepareDesktop'
+        if ($Desktop -or $FileDesktop -or $RestartEngine -or @($AcceptanceDesktop | Where-Object { $_ -and $_ -ne 'Tray' }).Count) {
+            $sourceDb=if ($RealDatabase) { $RealDatabase } else { $env:E_SEARCH_DB }
+            $prepareArgs += @('-RealDatabase',$sourceDb)
+        }
+    }
+    & $dotnet exec --runtimeconfig $config --depsfile (Join-Path (Split-Path $psDll) 'pwsh.deps.json') $psDll -NoProfile -NonInteractive -File $PSCommandPath -BackendTestDirectory $scratch @prepareArgs
     if ($LASTEXITCODE -ne 0) { throw "接口回归退出码 $LASTEXITCODE" }
+    if ($WindowDesktop -or $FileActionsDesktop) { Test-Desktop (Join-Path $scratch 'window.db') -Scenario Window }
     if ($SettingsDesktop) {
         if ($MdxSample) { $MdxSample=(Resolve-Path -LiteralPath $MdxSample).Path }
         $settingsDb = Join-Path $scratch "settings.db"
@@ -1378,12 +1981,14 @@ try {
             Test-Desktop $settingsDb -Settings -Restarted
         } finally { $env:E_SEARCH_EVERYTHING_EXE = $previousEngine }
     }
-    if (($Desktop -or $FileDesktop) -and !$RealDatabase) { $RealDatabase=(Resolve-Path (Join-Path $PSScriptRoot '.data/dictionaries.db')).Path }
     if ($RealDatabase) {
         $env:E_SEARCH_DB = $RealDatabase
         Invoke-Search @('verify')
-        if ($FileDesktop) { Test-Desktop $RealDatabase -Files }
-        if ($Desktop) { Test-Desktop $RealDatabase }
+        if ($FileDesktop) { Test-Desktop $desktopData -Files }
+        if ($Desktop) {
+            Test-Desktop $desktopData -Scenario RealLookup
+            Test-Desktop $desktopData
+        }
     }
     if ($AcceptanceDesktop) {
         if (!$RealDatabase) { throw '第五阶段桌面验收需要显式传入隔离的 -RealDatabase 副本' }
@@ -1391,7 +1996,7 @@ try {
         [void][IO.Directory]::CreateDirectory($stage5Fixtures)
         foreach ($scenarioName in $AcceptanceDesktop) {
             Write-Output "DESKTOP $scenarioName $GuiExecutable"
-            if ($scenarioName -eq 'Tray') { $testDb=Join-Path $scratch 'tray.db' } else { $testDb=$RealDatabase }
+            if ($scenarioName -eq 'Tray') { $testDb=Join-Path $scratch 'tray.db' } else { $testDb=$desktopData }
             Test-Desktop $testDb -Files:($scenarioName -eq 'Files') -Scenario $scenarioName
         }
     }
@@ -1500,8 +2105,7 @@ if ($RestartEngine) {
     $oldEngine = $env:E_SEARCH_EVERYTHING_EXE
     try {
         $env:E_SEARCH_EVERYTHING_EXE = $fixture
-        $database = if ($RealDatabase) { $RealDatabase } else { Join-Path $scratch 'test.db' }
-        Test-Desktop $database -Scenario RestartEngine
+        Test-Desktop $desktopData -Scenario RestartEngine
     } finally {
         $env:E_SEARCH_EVERYTHING_EXE = $oldEngine
     }

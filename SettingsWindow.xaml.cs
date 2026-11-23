@@ -17,13 +17,16 @@ public partial class SettingsWindow : Window
     private string? preparedPath;
     private int previewVersion;
     private bool busy, ready, closed;
+    internal bool IsImporting { get; private set; }
+    private const string NoReading = "不导入读音";
 
-    internal SettingsWindow(string databasePath, Func<uint, uint, string?> applyHotkey, Action onCatalogChanged)
+    internal SettingsWindow(string databasePath, Func<uint, uint, string?> applyHotkey, Action onCatalogChanged, string hotkeyWarning)
     {
         this.databasePath = databasePath;
         this.applyHotkey = applyHotkey;
         this.onCatalogChanged = onCatalogChanged;
         InitializeComponent();
+        if (hotkeyWarning.Length > 0) Message(HotkeyStatus, hotkeyWarning, true);
         MinWidth = Math.Min(MinWidth, SystemParameters.WorkArea.Width);
         MinHeight = Math.Min(MinHeight, SystemParameters.WorkArea.Height);
         Width = Math.Min(Width, SystemParameters.WorkArea.Width);
@@ -224,6 +227,7 @@ public partial class SettingsWindow : Window
     private void BuildTable(bool preserveMapping)
     {
         int head = HeadColumn.SelectedIndex, gloss = GlossColumn.SelectedIndex, reading = ReadingColumn.SelectedIndex;
+        string readingText = ReadingColumn.Text;
         bool header = HasHeader.IsChecked == true;
         var first = sample[0];
         int width = header ? first.Length : sample.Max(row => row.Length);
@@ -239,7 +243,11 @@ public partial class SettingsWindow : Window
         PreviewGrid.ItemsSource = sample.Skip(header ? 1 : 0).ToArray();
         HeadColumn.ItemsSource = names;
         GlossColumn.ItemsSource = names;
-        ReadingColumn.ItemsSource = new[] { "不导入读音" }.Concat(names).ToArray();
+        // 无表头时可直接填写样例之外的读音列。前几行没有可选读音仍是有效的词表。
+        ReadingColumn.IsEditable = !header;
+        ReadingColumnHint.Visibility = header ? Visibility.Collapsed : Visibility.Visible;
+        var readingColumns = header ? names : Enumerable.Range(1, width).Select(i => i.ToString());
+        ReadingColumn.ItemsSource = new[] { NoReading }.Concat(readingColumns).ToArray();
         // 表头识别只用于初始建议，导入始终使用用户最后确认的列号。
         int Column(params string[] labels) => header ? Array.FindIndex(first, field =>
             labels.Contains(field.Trim(), StringComparer.OrdinalIgnoreCase)) : -1;
@@ -249,6 +257,7 @@ public partial class SettingsWindow : Window
         HeadColumn.SelectedIndex = preserveMapping && head >= 0 && head < width ? head : suggestedHead >= 0 ? suggestedHead : 0;
         GlossColumn.SelectedIndex = preserveMapping && gloss >= 0 && gloss < width ? gloss : suggestedGloss >= 0 ? suggestedGloss : HeadColumn.SelectedIndex == 0 ? 1 : 0;
         ReadingColumn.SelectedIndex = preserveMapping && reading >= 0 && reading <= width ? reading : suggestedReading + 1;
+        if (preserveMapping && !header) ReadingColumn.Text = readingText;
     }
 
     private void ImportTargetChanged(object sender, SelectionChangedEventArgs e)
@@ -270,16 +279,29 @@ public partial class SettingsWindow : Window
         TableMapping? mapping = null;
         if (sample.Count > 0)
         {
-            int head = HeadColumn.SelectedIndex, gloss = GlossColumn.SelectedIndex, read = ReadingColumn.SelectedIndex - 1;
-            if (head < 0 || gloss < 0 || head == gloss || read >= 0 && (read == head || read == gloss))
+            int head = HeadColumn.SelectedIndex, gloss = GlossColumn.SelectedIndex;
+            int? read = ReadingColumn.SelectedIndex > 0 ? ReadingColumn.SelectedIndex - 1 : null;
+            if (ReadingColumn.IsEditable)
+            {
+                var text = ReadingColumn.Text.Trim();
+                if (text.Length == 0 || text == NoReading) read = null;
+                else if (int.TryParse(text, out int number) && number > 0) read = number - 1;
+                else
+                {
+                    Message(ImportStatus, "请输入从 1 开始的读音列号，或选择“不导入读音”。", true);
+                    return;
+                }
+            }
+            if (head < 0 || gloss < 0 || head == gloss || read == head || read == gloss)
             {
                 Message(ImportStatus, "词头、释义和可选读音必须映射到不同的列。", true);
                 return;
             }
-            mapping = new TableMapping(head, gloss, read < 0 ? null : read, HasHeader.IsChecked == true);
+            mapping = new TableMapping(head, gloss, read, HasHeader.IsChecked == true);
         }
 
         Busy(true);
+        IsImporting = true;
         Message(ImportStatus, "正在导入词条并建立索引…");
         try
         {
@@ -301,7 +323,7 @@ public partial class SettingsWindow : Window
             // 失败时仍停留在当前词表和映射，可直接改列后重试。
             if (!closed) Message(ImportStatus, $"导入失败。{ex.Message}", true);
         }
-        finally { Busy(false); }
+        finally { IsImporting = false; Busy(false); }
     }
 
     private void CaptureKey(object sender, KeyEventArgs e)

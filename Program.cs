@@ -1,4 +1,10 @@
 using System.Text;
+#if WINDOWS
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text.Json;
+#endif
 
 #if WINDOWS
 // 文件查询工作进程只读写父进程的管道，无需打开数据库或创建桌面窗口。
@@ -16,18 +22,7 @@ if (args.Length == 0 || args[0] == "gui")
             string? id = args.Length > 1 ? args[1] : null;
             if (args.Length > 2)
                 throw new ArgumentException("用法：gui [词典ID]");
-            SQLitePCL.raw.SetProvider(new SQLitePCL.SQLite3Provider_winsqlite3());
-            string databasePath = FindDatabase();
-            if (id != null && !Source.All.Any(s => s.Id == id))
-            {
-                using var catalog = new DictionaryStore(databasePath);
-                if (!catalog.ListDictionaries().Any(d => d.Id == id))
-                    throw new ArgumentException($"未知词典 {id}");
-            }
-            var app = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
-            var window = new ESearch.SearchWindow(databasePath, id);
-            window.StartResident();
-            app.Run();
+            RunDesktop(id);
         }
         catch (Exception ex)
         {
@@ -41,9 +36,129 @@ if (args.Length == 0 || args[0] == "gui")
     return result;
 }
 
+static void RunDesktop(string? id)
+{
+    using var identity = WindowsIdentity.GetCurrent();
+    using var process = System.Diagnostics.Process.GetCurrentProcess();
+    string pipeName = $"E_Search.Desktop.{identity.User!.Value}.{process.SessionId}";
+    if (Environment.GetEnvironmentVariable("E_SEARCH_TEST_INSTANCE") is { Length: > 0 } scope)
+    {
+        // 同一轮验收的首次和后续启动共享独立的互斥量及管道，个人实例沿用原名。
+        if (!Guid.TryParseExact(scope, "N", out var instance) ||
+            !Path.IsPathFullyQualified(Environment.GetEnvironmentVariable("E_SEARCH_DB") ?? ""))
+            throw new ArgumentException("桌面验收实例需要独立的实例 GUID 和绝对词库路径。");
+        pipeName += $".Test.{instance:N}";
+    }
+    // 创建命名对象的同时取得所有权。已打开此对象的二次进程始终走转发路径，
+    // 即使常驻端这时启动失败，也不会误接管。所有句柄关闭后，下次启动重新创建。
+    using var resident = new Mutex(true, pipeName, new NamedWaitHandleOptions(), out bool first);
+    if (!first)
+    {
+        ForwardLaunch(pipeName, resident, id);
+        return;
+    }
+    try
+    {
+        SQLitePCL.raw.SetProvider(new SQLitePCL.SQLite3Provider_winsqlite3());
+        string databasePath = FindDatabase();
+        void ValidateDictionary(string? requested)
+        {
+            if (requested == null || Source.All.Any(s => s.Id == requested)) return;
+            using var catalog = new DictionaryStore(databasePath, readOnly: File.Exists(databasePath));
+            if (!catalog.ListDictionaries().Any(d => d.Id == requested))
+                throw new ArgumentException($"未知词典 {requested}");
+        }
+
+        ValidateDictionary(id);
+        var app = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
+        var window = new ESearch.SearchWindow(databasePath, id);
+        window.StartResident();
+        using var closing = new CancellationTokenSource();
+        var listener = ReceiveLaunchesAsync(pipeName, requested =>
+        {
+            // 按常驻窗口实际使用的词库验证，再在它的 UI 线程切换筛选和焦点。
+            ValidateDictionary(requested);
+            window.Dispatcher.BeginInvoke(() => window.ActivateFromLaunch(requested));
+        }, closing.Token);
+        try { app.Run(); }
+        finally
+        {
+            closing.Cancel();
+            try { listener.GetAwaiter().GetResult(); }
+            catch (OperationCanceledException) when (closing.IsCancellationRequested) { }
+        }
+    }
+    finally { resident.ReleaseMutex(); }
+}
+
+static void ForwardLaunch(string pipeName, Mutex resident, string? id)
+{
+    using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut,
+        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+    // 大词库首启时所有者已持锁，但管道尚未就绪。等端点或所有权释放，不给复制设固定时限。
+    using var cancel = new CancellationTokenSource();
+    var connect = client.ConnectAsync(cancel.Token);
+    using var connected = ((IAsyncResult)connect).AsyncWaitHandle;
+    bool exited;
+    try { exited = WaitHandle.WaitAny([connected, resident]) == 1; }
+    catch (AbandonedMutexException) { exited = true; }
+    if (exited)
+    {
+        resident.ReleaseMutex(); // WaitAny 在所有者正常或异常退出时将锁交给本线程。
+        cancel.Cancel();
+        try { connect.GetAwaiter().GetResult(); }
+        catch (OperationCanceledException) { }
+        throw new IOException("常驻窗口在完成启动前已退出。");
+    }
+    connect.GetAwaiter().GetResult();
+    // 由用户从资源管理器再次启动时，将本次启动的前台权限交给真正持有窗口的进程。
+    if (GetNamedPipeServerProcessId(client.SafePipeHandle, out uint pid)) AllowSetForegroundWindow(pid);
+    using var writer = new StreamWriter(client, leaveOpen: true) { AutoFlush = true };
+    using var reader = new StreamReader(client, leaveOpen: true);
+    writer.WriteLine(JsonSerializer.Serialize(id));
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+    string? reply = reader.ReadLineAsync(timeout.Token).AsTask().GetAwaiter().GetResult();
+    if (reply == null) throw new IOException("常驻窗口在接收启动请求时已退出。");
+    if (JsonSerializer.Deserialize<string>(reply) is string error) throw new ArgumentException(error);
+
+    [DllImport("kernel32.dll")]
+    static extern bool GetNamedPipeServerProcessId(Microsoft.Win32.SafeHandles.SafePipeHandle pipe, out uint processId);
+    [DllImport("user32.dll")]
+    static extern bool AllowSetForegroundWindow(uint processId);
+}
+
+static async Task ReceiveLaunchesAsync(string pipeName, Action<string?> activate, CancellationToken closing)
+{
+    while (!closing.IsCancellationRequested)
+    {
+        // 每次重新创建管道端点，即使客户端刚连接就退出，下一次启动也能继续通信。
+        using var server = new NamedPipeServerStream(pipeName, PipeDirection.InOut,
+            NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+        try
+        {
+            await server.WaitForConnectionAsync(closing).ConfigureAwait(false);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(closing);
+            timeout.CancelAfter(TimeSpan.FromSeconds(10));
+            using var reader = new StreamReader(server, leaveOpen: true);
+            using var writer = new StreamWriter(server, leaveOpen: true);
+            if (await reader.ReadLineAsync(timeout.Token).ConfigureAwait(false) is not string request) continue;
+            string? error = null;
+            try { activate(JsonSerializer.Deserialize<string>(request)); }
+            catch (Exception ex) { error = ex.Message; }
+            await writer.WriteLineAsync(JsonSerializer.Serialize(error).AsMemory(), timeout.Token).ConfigureAwait(false);
+            await writer.FlushAsync(timeout.Token).ConfigureAwait(false);
+            // 等客户端读完答复并关闭连接，再断开管道，以免丢失仍在缓冲区的答复。
+            await reader.ReadLineAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (IOException) { } // 启动进程提前退出，继续接受下一次请求。
+        catch (OperationCanceledException) when (!closing.IsCancellationRequested) { }
+    }
+}
+
 #endif
 
-static string FindDatabase()
+static string FindDatabase(bool readOnly = false)
 {
     var configured = Environment.GetEnvironmentVariable("E_SEARCH_DB");
     if (!string.IsNullOrWhiteSpace(configured)) return Path.GetFullPath(configured);
@@ -61,6 +176,8 @@ static string FindDatabase()
     string directory = Path.Combine(profile, "E_Search");
     string database = Path.Combine(directory, "dictionaries.db");
     if (!hasSeed || File.Exists(database)) return database;
+    // 尚无个人副本时，查询可直接读取随包词库；首次写入才需要复制。
+    if (readOnly) return seed;
     Directory.CreateDirectory(directory);
     string temporary = Path.Combine(directory, $"dictionaries-{Guid.NewGuid():N}.tmp");
     try
@@ -77,7 +194,7 @@ static string FindDatabase()
 }
 
 Console.OutputEncoding = new UTF8Encoding(false);
-if (args.Length == 0 || args[0] is "help" or "--help")
+if (args is [] or ["help"] or ["--help"])
 {
     Console.WriteLine("""
         发布版使用当前用户的 E_Search 词库；开发版使用项目 .data/dictionaries.db。可用 E_SEARCH_DB 指定。
@@ -88,46 +205,69 @@ if (args.Length == 0 || args[0] is "help" or "--help")
         entry <词典ID> <序号>        查看读音依据与 MDX 原始正文
         verify                      对已导入的四本真实词典执行第一阶段验收
         """);
+#if WINDOWS
+    Console.WriteLine("桌面验收可以用 E_SEARCH_TEST_INSTANCE（32 位十六进制 GUID）及独立的 E_SEARCH_DB 路径创建隔离实例。");
+#endif
     return 0;
 }
 try
 {
     SQLitePCL.raw.SetProvider(new SQLitePCL.SQLite3Provider_winsqlite3());
-    using var store = new DictionaryStore(FindDatabase());
+    // 在匹配命令及必填参数后才打开词库，避免错误用法触发创建或迁移。
+    static DictionaryStore OpenReader()
+    {
+        string path = FindDatabase(readOnly: true);
+        if (!File.Exists(path)) throw new FileNotFoundException($"词库不存在：{path}");
+        return new DictionaryStore(path, readOnly: true);
+    }
     Source Resolve(string id) => Source.All.SingleOrDefault(s => s.Id == id)
         ?? throw new ArgumentException($"未知词典 {id}");
-    string LookupId(string id) => Source.All.Any(s => s.Id == id) || store.ListDictionaries().Any(d => d.Id == id)
+    string LookupId(DictionaryStore store, string id) => Source.All.Any(s => s.Id == id) || store.ListDictionaries().Any(d => d.Id == id)
         ? id : throw new ArgumentException($"未知词典 {id}");
-    IReadOnlyList<LookupHit> Search(string input,string? id) => store.Search(input,id);
     switch (args)
     {
         case ["import",var root]:
+        {
+            using var store = new DictionaryStore(FindDatabase());
             foreach (var source in Source.All)
                 store.Import(source,Path.Combine(root,source.RelativePath));
             break;
+        }
         case ["import",var id,var path]:
-            store.Import(Resolve(id),path);
+        {
+            var source = Resolve(id);
+            using var store = new DictionaryStore(FindDatabase());
+            store.Import(source,path);
             break;
+        }
         case ["list"]:
-            store.List();
+            using (var store = OpenReader()) store.List();
             break;
         case ["query",_] or ["query",_,_]:
-            var only=args.Length==3 ? LookupId(args[2]) : null;
-            foreach(var hit in Search(args[1],only))
+        {
+            using var store = OpenReader();
+            var only=args.Length==3 ? LookupId(store,args[2]) : null;
+            foreach(var hit in store.Search(args[1],only))
                 Console.WriteLine($"{hit.Entry.DictionaryId}:{hit.Entry.EntryId}\t{hit.Method}\t{hit.Term}\t{hit.Display}");
             break;
+        }
         case ["entry",var dict,var n] when long.TryParse(n,out var ord):
-            var detail=store.Detail(LookupId(dict),ord);
+        {
+            using var store = OpenReader();
+            var detail=store.Detail(LookupId(store,dict),ord);
             Console.WriteLine(detail.Evidence);
             Console.WriteLine(detail.Raw);
             break;
+        }
         case ["verify"]:
+        {
+            using var store = OpenReader();
             long? expectedId=null;
             foreach(var (input,method,term,display) in new[]{
                 ("食べる","headword","食べる","たべる · 吃"),("たべる","reading","たべる","食べる（たべる）· 吃"),
                 ("taberu","romaji","たべる","食べる（たべる）· 吃"),("食べました","deinflection","食べる","食べる（たべる）· 吃")})
             {
-                var hit=Search(input,"shogakukan").FirstOrDefault() ?? throw new InvalidDataException($"{input} 无命中");
+                var hit=store.Search(input,"shogakukan").FirstOrDefault() ?? throw new InvalidDataException($"{input} 无命中");
                 expectedId ??= hit.Entry.EntryId;
                 var evidence=store.Detail(hit.Entry.DictionaryId,hit.Entry.EntryId).Evidence;
                 if (hit.Entry.EntryId!=expectedId || hit.Entry.Headword!="食べる" || hit.Entry.Reading!="たべる"
@@ -137,12 +277,13 @@ try
             }
             foreach(var (dict,input,gloss) in new[]{("sanseido","食べる","eat"),("oxford","apple","苹果"),("hanying","苹果","apple")})
             {
-                var hit=Search(input,dict).FirstOrDefault() ?? throw new InvalidDataException($"{dict} 未命中 {input}");
+                var hit=store.Search(input,dict).FirstOrDefault() ?? throw new InvalidDataException($"{dict} 未命中 {input}");
                 if (hit.Entry.Gloss != gloss || string.IsNullOrWhiteSpace(store.Detail(dict,hit.Entry.EntryId).Raw))
                     throw new InvalidDataException($"{dict} 词条或首义与样本不符");
                 Console.WriteLine($"PASS\t{input}\t{dict}:{hit.Entry.EntryId}\t{hit.Display}");
             }
             break;
+        }
         default: throw new ArgumentException("参数无效；运行 help 查看用法");
     }
     return 0;

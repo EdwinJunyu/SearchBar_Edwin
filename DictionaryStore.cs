@@ -380,28 +380,44 @@ internal sealed class DictionaryStore : IDisposable
         MetadataSchema schema, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
-        // 仅在原词典内跟随 MDX 重定向；UNION 去重可终止循环引用。
+        // 旧库可能没有元数据或已记录上一个解析器版本。显式的解析器身份优先于词典 ID。
+        var oxfordParser = schema.HasRevision ? "m.parser_id" : "NULL";
+        // 旧库只为假名重定向键建立词头索引。按平、片假名补查这些别名，并沿同书链接传递其读音。
+        // UNION 按词条和起始读音去重，循环引用也会终止。
+        bool kana = Lookup.IsKana(key);
         using var cmd = Command($"""
-            WITH RECURSIVE found(dict,ordinal) AS (
-                SELECT dict,ordinal FROM terms WHERE term=$key AND kind=$kind AND ($only IS NULL OR dict=$only)
+            WITH RECURSIVE found(dict,ordinal,aliasReading) AS (
+                SELECT t.dict,t.ordinal,CASE WHEN $kana AND e.link IS NOT NULL AND d.language='ja'
+                    THEN COALESCE(e.reading,e.head) END
+                FROM terms t JOIN entries e USING(dict,ordinal) JOIN dictionaries d ON d.id=t.dict
+                WHERE ($only IS NULL OR t.dict=$only) AND (
+                    (t.term=$key AND t.kind=$kind) OR
+                    ($fallback AND t.kind=0 AND t.term IN ($key,$katakana) AND e.link IS NOT NULL AND d.language='ja'))
                 UNION
-                SELECT t.dict,t.ordinal FROM found f
+                SELECT t.dict,t.ordinal,f.aliasReading FROM found f
                 JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
                 JOIN terms t ON t.dict=f.dict AND t.term=e.link AND t.kind=0
             )
-            SELECT e.dict,e.ordinal,d.language,d.priority,e.head,e.reading,e.gloss,d.filename,{schema.Revision},
+            SELECT e.dict,e.ordinal,d.language,d.priority,e.head,COALESCE(f.aliasReading,e.reading),e.gloss,d.filename,{schema.Revision},
                 CASE WHEN {(schema.HasRevision ? "m.revision IS NULL AND" : "")} d.filename LIKE '%.mdx'
                     AND (e.dict='shogakukan' OR e.evidence='MDX 正文首行假名')
                     AND (e.reading IS NULL OR replace(replace(e.gloss,'・',''),'－','')=e.reading)
-                    THEN substr(e.raw,1,4096) END
+                    THEN substr(e.raw,1,4096) END,
+                CASE WHEN d.filename LIKE '%.mdx' AND
+                    COALESCE({oxfordParser}, CASE WHEN d.id='oxford' OR d.filename=$oxfordName THEN 'oxford' END)='oxford'
+                    THEN e.raw END
             FROM found f
             JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
             JOIN dictionaries d ON d.id=e.dict {schema.Join} WHERE e.link IS NULL
             {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
             """, snapshot);
         cmd.Parameters.AddWithValue("$key",key);
+        cmd.Parameters.AddWithValue("$kana",kana);
+        cmd.Parameters.AddWithValue("$fallback",reading && kana);
+        cmd.Parameters.AddWithValue("$katakana",reading && kana ? Lookup.ToKatakana(key) : key);
         cmd.Parameters.AddWithValue("$kind",reading ? 1 : 0);
         cmd.Parameters.AddWithValue("$only",(object?)only ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$oxfordName",Path.GetFileName(Source.All.First(s => s.Id == "oxford").RelativePath));
         using var r = cmd.ExecuteReader();
         while (r.Read())
         {
@@ -409,6 +425,7 @@ internal sealed class DictionaryStore : IDisposable
             // 旧索引可能把读音存成首义。只检查本次命中且符合旧版回退特征的正文前缀。
             var gloss = r.GetString(6);
             if (!r.IsDBNull(9)) gloss = EntryParser.RefreshShogakukanGloss(gloss, r.GetString(9));
+            if (!r.IsDBNull(10)) gloss = EntryParser.OxfordGloss(r.GetString(10));
             yield return new LookupEntry(r.GetString(0),r.GetInt64(1),r.GetString(2),r.GetInt32(3),
                 r.GetString(4), r.IsDBNull(5) ? null : r.GetString(5), gloss)
                 { DictionaryName = r.GetString(7), DictionaryRevision = r.GetString(8) };
