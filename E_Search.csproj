@@ -12,8 +12,8 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <!-- 发布目录位于 bin/Release/net10.0-windows/publish，可使用项目私有或系统运行时。 -->
-    <AppHostDotNetSearch>AppRelative;EnvironmentVariable;Global</AppHostDotNetSearch>
-    <AppHostRelativeDotNet>../../../../.tools/dotnet</AppHostRelativeDotNet>
+    <AppHostDotNetSearch Condition="'$(SelfContained)' != 'true'">AppRelative;EnvironmentVariable;Global</AppHostDotNetSearch>
+    <AppHostRelativeDotNet Condition="'$(SelfContained)' != 'true'">../../../../.tools/dotnet</AppHostRelativeDotNet>
   </PropertyGroup>
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0-windows'">
     <Using Remove="System.Windows.Forms;System.Drawing" />
@@ -22,6 +22,9 @@
              Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <Content Include=".tools/everything/Everything-SDK-LICENSE.txt" Link="licenses/Everything-SDK-LICENSE.txt"
              CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <!-- 发布时可传入一致的 SQLite 备份，避免直接复制正在写入的词库。 -->
+    <Content Include="$(DictionarySeed)" Condition="'$(DictionarySeed)' != ''"
+             Link="Data/dictionaries.db" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
   <!-- 下载一次并校验官方 SDK；以后的桌面构建复用缓存，命令行目标不依赖 SDK。 -->
   <Target Name="PrepareEverythingSdk" BeforeTargets="PrepareForBuild" Condition="'$(TargetFramework)' == 'net10.0-windows'">

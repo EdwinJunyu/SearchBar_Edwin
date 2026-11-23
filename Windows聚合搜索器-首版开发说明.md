@@ -3,7 +3,7 @@
 首版供个人在 Windows 上使用。按 `Alt + Space` 唤起一个搜索框，一次输入同时查询本地词典和 Everything。读译义只需看输入框右侧，打开文件只需按回车。词典与文件结果独立返回，任一侧等待期间，另一侧仍可使用。
 
 
-**交接状态。** 工程提供 .NET 10 命令行和 Windows WPF 浮窗两个入口。解决方案为 `E_Search.slnx`，启动项目为 `E_Search.csproj`。四本真实 MDX 已在本机建立 SQLite 索引。文末第 11 节记录了复现命令和查询结果；浮窗见第 12 节，Everything 文件查询见第 13 节，词库与快捷键设置见第 14 节。第 7 节描述各功能的接口约定。
+**交接状态。** 可直接启动的 Windows x64 版本、当前验收结果及复验方法见第 15 节。工程同时保留 .NET 10 命令行和 WPF 入口，解决方案为 `E_Search.slnx`。第 11 至 14 节保存了词典、浮窗、文件搜索和设置页的分阶段记录。
 **第一个任务是交出一条真实词条的查询记录。** 先读第 1 节看四种输入，再读第 4 节看匹配顺序。基本术语可以用同一条记录理解：“词头”是词典收录的写法「食べる」，“读音”是「たべる」，“原形”是从「食べました」还原得到的「食べる」。“条目标识”用来判断四种输入是否真的找到了同一条记录。
 
 | 何时准备 | 开发机上需要什么 | 准备好的标志 |
@@ -330,3 +330,71 @@ pwsh -NoProfile -File .\regressions.ps1 -FileDesktop -Desktop -RealDatabase .dat
 $sample = 'D:\D_Main\JP\日语\文法词汇查阅excel+GoldenDict电子词典+potplayer播放器+honeyview看图器\GoldenDict\辞书\中日\[5《小学馆V2日汉辞典》.mdx'
 pwsh -NoProfile -File .\regressions.ps1 -SettingsDesktop -MdxSample $sample
 ```
+
+## 15. 第五阶段 · Windows x64 交付与整体验收
+
+### 启动与数据
+
+完整解压 `E_Search-win-x64.zip`，双击 `E_Search.exe`。在本项目中可直接运行 `bin/release-delivery/E_Search-win-x64/E_Search.exe`。包内附有 .NET 10.0.15 桌面运行时、Everything SDK 和可直接查询的四库索引。首次启动会将约 827 MiB 的索引初始化到 `%LOCALAPPDATA%\E_Search\dictionaries.db`，后续启动沿用个人词库、顺序和快捷键。默认使用 `Alt + Space` 唤起，方向键选文件，回车打开，Tab 查看词条详情。
+
+文件结果来自本机 Everything。Edwin 电脑安装的是 1.4.1.1024 x64，个人配置使用管理员模式，未安装 Everything 服务。如果文件区持续等待，可从开始菜单打开 Everything，按 Windows 提示确认，待 Everything 自己能搜到文件后再查询。词典查询可独立使用。
+
+### 环境与样本
+
+2026-11-22，Windows 11 23H2 x64（22631.6199），使用微软日语输入法和微软拼音。文件测试运行本机安装程序的同一份 Everything 二进制，使用独立的普通权限索引，范围为项目测试目录。两个父目录各有一个 `笔记.md`，另有 `会议笔记.md`、两份文件名含“报告”的 PDF 及有独立标题的 HTML。回车打开文件后核对关联浏览器的实际文档标题。
+
+四个原始 MDX 在空库中重新全量导入，逐本核对了源文件 SHA-256、条数及实际词条。SQLite 完整性快检返回 `ok`，外键检查为零条异常。
+
+| 真实词典 | 导入条数 | 已核对的样本 |
+|---|---:|---|
+| 小学馆 V2 日汉辞典 | 70,307 | 食べる、たべる、taberu、食べました 均命中 `shogakukan:34165`，读音「たべる」，首义「吃」 |
+| 三省堂超级大辞林第二版 | 520,678 | 食べる → `sanseido:209717`，首义 eat |
+| 牛津高阶学习词典英汉双解第 7 版 | 42,481 | apple → `oxford:1634` → 苹果 |
+| 现代汉英综合大辞典 | 376,636 | 苹果 → `hanying:294547` → apple |
+
+共 1,010,102 条。各书源文件与条目哈希记录在 `.data/stage5-dictionary/`。
+
+### 第 9 节逐项结果
+
+| 场景 | 判定 | 本次实际观察 |
+|---|---|---|
+| 完整文件名与同名文件 | 通过 | Everything 原序为甲/会议笔记.md、乙/笔记.md、甲/笔记.md。浮窗为乙/笔记.md、甲/笔记.md、甲/会议笔记.md。两个父目录可辨，同名项相对顺序一致。 |
+| 原生查询 | 通过 | 输入 `ext:pdf 报告`，浮窗、独立 SDK 探针和 Everything 自身窗口均依次返回甲/进度报告.pdf、乙/验收报告.pdf。 |
+| 查词与文件选择 | 通过 | 输入 `taberu` 同时看到小学馆释义和文件。方向键选第二项，Tab 展开、Esc 收起，回车打开了乙目录的第二个 HTML，浏览器标题与该文件一致。 |
+| 中日文输入法 | 通过，提交文字依输入法而定 | 日语输入 `taberu`，空格转换，第一次回车确认「食べる」并保留浮窗，第二次回车打开对应文件。微软拼音用空格选择「你好」后回车打开「你好」文件。组词时直接回车或用 ↓ 后回车均提交原拼写 `nihao`，浮窗保持打开，再次回车才打开对应文件。原生 Windows 文本框的提交内容相同。 |
+| 多词库 | 通过 | 设置页用不同列序导入 CSV、TSV，空读音行可按词头查。将 CSV 上移，浮窗首义从 TSV 切至 CSV，仍可选择 TSV 候选并展开其正文。重启保留顺序。 |
+| 英日冲突与回退 | 通过 | `sake` 共 11 个候选，牛津精确匹配居首，罗马字候选随后出现。`acclimate` 显示首行，展开可见 `acclimatize` 及名词义项；无命中时右侧留白。 |
+| 异步刷新 | 通过 | 连续编辑和清空后两区正确更新。可控回归截住 `taberu` 的两个真实回调，先提交 `apple` 再释放旧回调，最后仍显示“苹果”，文件列表与选择均保持。引擎冷启动的单次观察中，88 ms 读到释义，329 ms 读到文件。 |
+| 输入变化后立刻回车 | 通过 | A 有有效选择时输入另一个能命中的完整文件名 B，立即按回车，浮窗保持打开。B 返回后再按回车，浏览器打开 B 的唯一文档。 |
+| 启动后接续查询 | 通过 | 引擎退出后只输入一次 `taberu`，就绪后自动出现指定文件。另一轮在“等待 Everything”期间改为 `ext:pdf 报告`，最终只显示两份 PDF。 |
+| 退出与再次唤起 | 通过 | 展开后第一次 Esc 收起，第二次隐藏。原窗口的文本框随即收到实键 `7`，再次按全局热键后搜索框为空。 |
+| 快捷键冲突 | 通过 | 独立进程占用默认 Alt + Space，浮窗提示冲突。隐藏浮窗后，通过 Windows 通知区域实际右键进入设置，保存 Ctrl + Alt + F8 并成功唤起。另行验证换到已占用组合时原键继续有效。 |
+
+### 修复与未验证范围
+
+| 验收时发现的问题 | 修复后的实测 |
+|---|---|
+| 引擎刚由搜索器启动又退出，60 秒内再次查询会等到超时。 | 在引擎就绪后结束本轮启动冷却。同一搜索器进程中连续两次冷启动，两个不同的 Everything 进程均返回 9 个文件。 |
+| 词典候选的读屏名称含内部记录字段。 | 下拉项使用可见的词头、词典名和释义作为名称。通过 Windows 自动化再次读取，下拉项可直接辨认小学馆和三省堂。 |
+| 从只读介质初始化个人词库时会继承只读属性。 | 首启按内容复制种子库，完整复制后才发布个人数据库。只读种子的个人副本可以修改；两进程同时首次启动均读到完整词库。 |
+
+**最终状态。** 第 9 节 11 项均已在上述环境执行，表中无遗留失败项。另用坏 CSV 和截短正文块的真实牛津 MDX 测试了失败重导。CSV 中途写入的数据回滚，牛津旧书全部词条和索引的摘要与失败前相同。
+
+**未验证范围。** 个人管理员模式 Everything 启动时的 UAC 交互、个人 C/D/E 三卷的全盘结果，以及其他中文输入法用回车直接上屏汉字的行为。本机微软拼音用空格上屏汉字。第 13 节记载的有道词典偶发取焦仍是本机环境因素，本轮最终回归实际观察到了原文本框收到输入。
+
+### 证据与复验
+
+项目内 `.data/stage5-desktop/` 保存文件、键盘、设置、托盘及换词冷启动的记录。两张 `everything-*.png` 是实际 Everything 搜索窗口。乱序验证见 `.data/stage5-out-of-order-final.txt`，连续两次冷启动的修复前后记录为 `.data/stage5-restart-before.txt` 和 `.data/stage5-restart-after.txt`。发布包内应用程序集 `E_Search.dll` 的 SHA-256 为 `2E5B05477B0F97CA63582BFBBC9130F7113C26851E182D8643AAC2E103AC450C`。
+
+在本机项目目录、交互式 PowerShell 7 中可按场景复验。桌面用例写入专用词库副本。文件场景要求普通权限的独立 Everything 验收实例已索引 `.data/regressions`。冷启动场景须从该实例已退出的状态分别开始。
+
+```powershell
+$gui = (Resolve-Path .\bin\release-delivery\E_Search-win-x64\E_Search.exe).Path
+$db = (Resolve-Path .\.data\stage5-desktop\dictionaries.db).Path
+$env:E_SEARCH_EVERYTHING_EXE = (Resolve-Path .\.tools\everything\fixture\Everything.exe).Path
+.\regressions.ps1 -GuiExecutable $gui -RealDatabase $db -AcceptanceDesktop Files -ColdStartFile .data/regressions/taberu-冷启动验收.txt
+.\regressions.ps1 -GuiExecutable $gui -RealDatabase $db -AcceptanceDesktop Keyboard,Tray
+.\regressions.ps1 -GuiExecutable $gui -RealDatabase $db -OutOfOrder
+```
+
+单独复验冷启动换词时使用 `-AcceptanceDesktop ColdEdit`；在验收实例已退出时，使用 `-RestartEngine` 验证同一进程连续启动两次。设置页用例沿用第 14 节的 `-SettingsDesktop -MdxSample` 参数，并可加上 `-GuiExecutable $gui` 指向交付程序。

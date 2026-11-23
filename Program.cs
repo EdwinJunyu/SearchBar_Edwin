@@ -37,23 +37,51 @@ if (args.Length == 0 || args[0] == "gui")
     return result;
 }
 
+#endif
+
 static string FindDatabase()
 {
     var configured = Environment.GetEnvironmentVariable("E_SEARCH_DB");
     if (!string.IsNullOrWhiteSpace(configured)) return Path.GetFullPath(configured);
-    // 从资源管理器或其他工作目录启动时，从程序位置寻找项目内已导入的索引。
+    string seed = Path.Combine(AppContext.BaseDirectory, "Data", "dictionaries.db");
+    if (File.Exists(seed))
+    {
+        // 安装目录可以只读。首启用完整快照初始化个人词库，后续发布也保留已导入的词典及热键。
+        string profile = Environment.GetEnvironmentVariable("LOCALAPPDATA") ??
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string directory = Path.Combine(profile, "E_Search");
+        string database = Path.Combine(directory, "dictionaries.db");
+        if (File.Exists(database)) return database;
+        Directory.CreateDirectory(directory);
+        string temporary = Path.Combine(directory, $"dictionaries-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            // 只复制内容，避免把安装介质的只读文件属性带入个人词库。
+            using (var source = File.OpenRead(seed))
+            using (var target = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                source.CopyTo(target);
+            // 同时启动的另一个进程只能看见已经复制完整的数据库。
+            try { File.Move(temporary, database); }
+            catch (IOException) when (File.Exists(database)) { }
+        }
+        finally
+        {
+            File.Delete(temporary);
+        }
+        return database;
+    }
+    // 开发构建继续使用项目内已导入的词库。
     for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
         if (File.Exists(Path.Combine(dir.FullName, "E_Search.csproj")))
             return Path.Combine(dir.FullName, ".data", "dictionaries.db");
     return Path.GetFullPath(".data/dictionaries.db");
 }
-#endif
 
 Console.OutputEncoding = new UTF8Encoding(false);
 if (args.Length == 0 || args[0] is "help" or "--help")
 {
     Console.WriteLine("""
-        从项目根目录运行 E_Search。默认数据库 .data/dictionaries.db，可用 E_SEARCH_DB 指定。
+        发布版使用当前用户的 E_Search 词库；开发版使用项目 .data/dictionaries.db。可用 E_SEARCH_DB 指定。
         import <辞书根目录>          导入四本指定词典
         import <词典ID> <MDX路径>    单独导入或替换
         list                        查看词典标识、语言、条数、哈希与文件名
@@ -66,7 +94,7 @@ if (args.Length == 0 || args[0] is "help" or "--help")
 try
 {
     SQLitePCL.raw.SetProvider(new SQLitePCL.SQLite3Provider_winsqlite3());
-    using var store = new DictionaryStore(Environment.GetEnvironmentVariable("E_SEARCH_DB") ?? ".data/dictionaries.db");
+    using var store = new DictionaryStore(FindDatabase());
     Source Resolve(string id) => Source.All.SingleOrDefault(s => s.Id == id)
         ?? throw new ArgumentException($"未知词典 {id}");
     string LookupId(string id) => Source.All.Any(s => s.Id == id) || store.ListDictionaries().Any(d => d.Id == id)

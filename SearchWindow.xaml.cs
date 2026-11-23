@@ -566,6 +566,8 @@ public partial class SearchWindow : Window
     private sealed record Candidate(LookupHit Hit)
     {
         public string Label => $"{Hit.Entry.Headword} · {Hit.Entry.DictionaryName ?? Hit.Entry.DictionaryId} · {Hit.Entry.Gloss}";
+        // WPF 候选项的自动化名称也使用面向用户的标签，读屏时可直接辨认来源。
+        public override string ToString() => Label;
     }
 
     private delegate void ForegroundCallback(nint hook, uint evt, nint window, int objectId, int child, uint thread, uint time);
@@ -589,7 +591,7 @@ internal sealed class EverythingSearch
     private const uint PageSize = 256;
     // SDK 的搜索串、偏移和返回指针均为进程共享状态，直到路径复制完毕才允许下一次查询。
     private static readonly SemaphoreSlim SdkGate = new(1);
-    private static long lastStartupTick = -60_000;
+    private static long? lastStartupTick;
 
     internal async Task<IReadOnlyList<FileHit>> SearchAsync(string input, Action<string> status, CancellationToken token)
     {
@@ -601,6 +603,8 @@ internal sealed class EverythingSearch
                 try
                 {
                     await EnsureReadyAsync(status, token).ConfigureAwait(false);
+                    // 已连接表示这一轮启动结束。若用户随后退出引擎，下次输入应能立刻重新启动。
+                    lastStartupTick = null;
                     token.ThrowIfCancellationRequested();
                     return Search(input, token);
                 }
@@ -623,7 +627,7 @@ internal sealed class EverythingSearch
         {
             var executable = LocateEverything() ?? throw new FileNotFoundException("尚未找到 Everything。");
             // 连续输入可能数次取消等待；启动冷却由所有查询共用，避免重复启动或弹出权限提示。
-            if (Environment.TickCount64 - lastStartupTick >= 60_000)
+            if (lastStartupTick is not long previous || Environment.TickCount64 - previous >= 60_000)
             {
                 lastStartupTick = Environment.TickCount64;
                 var start = new System.Diagnostics.ProcessStartInfo(executable, "-startup") {
@@ -642,7 +646,10 @@ internal sealed class EverythingSearch
         {
             // 大型个人索引可能加载数分钟。能连接到引擎时继续等待，输入变化仍可取消。
             if (watch.Elapsed >= TimeSpan.FromSeconds(35) && Native.Everything_GetMajorVersion() == 0)
+            {
+                lastStartupTick = null;
                 throw new IOException("Everything 尚未就绪。请确认普通版已运行且索引可用，然后重新查询。");
+            }
             await Task.Delay(200, token).ConfigureAwait(false);
         }
     }
