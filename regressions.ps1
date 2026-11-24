@@ -4,8 +4,9 @@ param([string] $RealDatabase, [switch] $Desktop, [switch] $FileDesktop, [string]
       [ValidateSet('Files','Keyboard','ColdEdit','Tray')][string[]] $AcceptanceDesktop,
       [string] $BackendTestDirectory, [switch] $PrepareDesktop, [switch] $WindowDesktop, [switch] $FileActionsDesktop, [string] $FileFixtureRoot,
       [string] $PackageSeed, [string] $VerifyReleaseZip, [string] $IndexedMdxTestDirectory, [string] $CompareIndexedDatabase,
-      [string] $MergedTestDirectory, [switch] $MergedAudio, [string] $WpfRenderDirectory, [switch] $WpfRenderHost,
-      [ValidateSet('Warm','Cold','Image')] [string] $WpfRenderMode = 'Warm', [int] $WpfColdTrials = 20,
+      [string] $MergedTestDirectory, [switch] $MergedAudio, [string] $WpfRenderDirectory, [switch] $WpfRenderHost, [switch] $RequireDetailFrames, [switch] $WpfIdleGuard,
+      [ValidateSet('Warm','Cold','Image','Rich','Discovery')] [string] $WpfRenderMode = 'Warm', [int] $WpfColdTrials = 20,
+      [ValidateSet('Apple','Image','Long','Multi')][string[]] $RichFirst = @('Apple','Image','Long','Multi'), [string]$CompareGuiExecutable,
       [string] $MergeSampleInventory, [string] $MergeAuditDirectory, [string] $MergedDatabase, [switch]$MergeAuditHost)
 $ErrorActionPreference = 'Stop'
 # 失败重导本身也是验收项，命令退出码由 Invoke-Search 明确检查。
@@ -289,6 +290,105 @@ function Write-MdxLayout([string]$Path, [string[]]$Names, [int[]]$Offsets, [byte
 }
 function Assert-Equal($Actual, $Expected, $Scenario) {
     if ($Actual -cne $Expected) { throw "$Scenario 预期「$Expected」，实际「$Actual」" }
+}
+
+function Test-PrefixSuggestions([string]$Directory,[Reflection.Assembly]$Assembly) {
+    $path=Join-Path $Directory 'prefix.db'
+    $ctor=$Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool]))
+    $store=$ctor.Invoke(@([string]$path,$false))
+    $db=[Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$path;Pooling=False")
+    $db.Open()
+    $sql=$db.CreateCommand()
+    $all=[Management.Automation.Language.NullString]::Value
+    $none=[Threading.CancellationToken]::None
+    try {
+        $sql.CommandText=@'
+INSERT INTO dictionaries VALUES ('oxford','en',3,'english.tsv','1',20),('hanying','zh',2,'chinese.tsv','2',20),('shogakukan','ja',1,'japanese.tsv','3',20);
+INSERT INTO dictionary_metadata(id,enabled) VALUES ('hanying',0);
+INSERT INTO entries VALUES ('oxford',1,'app',NULL,NULL,'应用','',NULL),('oxford',2,'Apple',NULL,NULL,'苹果','',NULL),
+ ('oxford',3,'Apple',NULL,NULL,'苹果公司','',NULL),('oxford',4,'apply',NULL,NULL,'申请','',NULL),
+ ('oxford',5,'application',NULL,NULL,'申请表','',NULL),('oxford',6,'app alias',NULL,NULL,'','','apple'),
+ ('oxford',7,'app broken',NULL,NULL,'','','absent'),('oxford',8,'Café',NULL,NULL,'咖啡馆','',NULL),
+ ('oxford',9,'co‐operate',NULL,NULL,'合作','',NULL),('shogakukan',1,'食べる','たべる',NULL,'吃','',NULL),
+ ('shogakukan',2,'食べ物','たべもの',NULL,'食物','',NULL),('shogakukan',3,'タベルス',NULL,NULL,'','','食べる'),
+ ('shogakukan',4,'試験','たべa',NULL,'自定义读音','',NULL);
+WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<80)
+ INSERT INTO entries SELECT 'oxford',100+x,printf('car accessory %03d',x),NULL,NULL,'配件','',NULL FROM n;
+INSERT INTO entries VALUES ('oxford',200,'cart',NULL,NULL,'推车','',NULL);
+WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x+1 FROM n WHERE x<39)
+ INSERT INTO entries SELECT 'oxford',300+x,'cowa'||substr('''‘’ʼ',1+(x%4),1)||'archive'||(x/4),NULL,NULL,'旧书别名','',NULL FROM n;
+INSERT INTO entries VALUES ('oxford',340,'cowx',NULL,NULL,'短词','',NULL);
+WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<12)
+ INSERT INTO entries SELECT 'oxford',200+x,printf('tabe%02d',x),NULL,NULL,'测例','',NULL FROM n;
+INSERT INTO terms SELECT dict,ordinal,0,lower(head) FROM entries;
+UPDATE terms SET term='café' WHERE dict='oxford' AND ordinal=8;
+INSERT INTO terms SELECT dict,ordinal,1,reading FROM entries WHERE reading IS NOT NULL;
+WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100)
+ INSERT INTO entries SELECT 'hanying',x,printf('app%03d',x),NULL,NULL,'停用来源','',NULL FROM n;
+INSERT INTO terms SELECT dict,ordinal,0,head FROM entries WHERE dict='hanying';
+'@
+        [void]$sql.ExecuteNonQuery()
+        $max=[char]::ConvertFromUtf32(0x10ffff)
+        $astral=[char]::ConvertFromUtf32(0x20000)
+        $edge=[string][char]0xd7ff
+        $edgeWords=@("${astral}日","${astral}月","${edge}甲",([string][char]0xe000+'乙'),("${max}${max}末"),"${max}首","漢${max}乙","漢${max}甲",'漣外','海水','海洋')
+        $wordId=20
+        foreach ($word in $edgeWords) {
+            $sql.CommandText='INSERT INTO entries VALUES (''oxford'',$id,$word,NULL,NULL,''字'','''',NULL); INSERT INTO terms VALUES (''oxford'',$id,0,$word)'
+            $sql.Parameters.Clear(); [void]$sql.Parameters.AddWithValue('$id',(++$wordId)); [void]$sql.Parameters.AddWithValue('$word',$word)
+            [void]$sql.ExecuteNonQuery()
+        }
+        $english=@($store.PrefixSuggestions('ＡＰＰ','zh-en',$none))
+        Assert-Equal ($english -join '|') 'app|apple|apply|app alias|application' '全角规范化、等长稳定排序、可用别名以及停用来源先于截断'
+        Assert-Equal $store.PrefixSuggestions('car','oxford',$none)[0] 'cart' '密集长词组之后的短英文补全仍能进入首位'
+        Assert-Equal $store.PrefixSuggestions('cow','oxford',$none)[0] 'cowx' '多条旧物理键折叠为同一规范词时仍按原始窗口判断是否补查'
+        $cn=$store.GetType().GetField('db',[Reflection.BindingFlags]'Instance,NonPublic').GetValue($store)
+        $queries=[Collections.Generic.List[string]]::new()
+        $trace=[SQLitePCL.strdelegate_trace]{param($state,$statement) $state.Add($statement)}
+        $traceMethod=[SQLitePCL.raw].GetMethod('sqlite3_trace',[type[]]@([SQLitePCL.sqlite3],[SQLitePCL.strdelegate_trace],[object]))
+        try {
+            [SQLitePCL.raw]::sqlite3_trace($cn.Handle,$trace,$queries)
+            $null=$store.PrefixSuggestions('apple','oxford',$none)
+            Assert-Equal @($queries|Where-Object { $_ -match 'FROM terms t INDEXED BY terms_lookup' }).Count 1 '词头区间已穷尽的完整输入只需一次候选索引查询'
+        } finally { $null=$traceMethod.Invoke($null,[object[]]@($cn.Handle,$null,$null)) }
+        Assert-Equal $store.Search('apple','oxford',$none).Count 2 '选择一个建议后两个同形词条都可打开'
+        Assert-Equal @($store.PrefixSuggestions('app','zh-ja',$none)).Count 0 '按卷过滤'
+        Assert-Equal @($store.PrefixSuggestions('',$all,$none)).Count 0 '空前缀'
+        Assert-Equal @($store.PrefixSuggestions('zzzzz',$all,$none)).Count 0 '无后继'
+        Assert-Equal ($store.PrefixSuggestions("cafe$([char]0x301)",'oxford',$none) -join '|') 'café' '组合字符与 NFC 词头共用键'
+        Assert-Equal ($store.PrefixSuggestions('co-o','oxford',$none) -join '|') 'co-operate' '兼容仅存旧拉丁连接符的索引'
+        Assert-Equal ($store.PrefixSuggestions('たべ','zh-ja',$none) -join '|') 'たべる|たべもの|たべるす' '读音键及旧片假名链接的同源补全'
+        Assert-Equal ($store.PrefixSuggestions('tabe','zh-ja',$none) -join '|') 'たべる|たべもの|たべるす' '罗马字按照同一读音表检索'
+        Assert-Equal ($store.PrefixSuggestions('tabe',$all,$none) -contains 'たべる') $true '拉丁词头较多时仍保留短的罗马字补全'
+        Assert-Equal ($store.PrefixSuggestions($astral,$all,$none) -join '|') ("${astral}日|${astral}月") '补充平面'
+        Assert-Equal ($store.PrefixSuggestions($edge,$all,$none) -join '|') "${edge}甲" '上界跨 UTF-16 代理区'
+        Assert-Equal ($store.PrefixSuggestions($max,$all,$none) -join '|') ("${max}首|${max}${max}末") '最大 Unicode 标量开头且没有有限上界'
+        foreach ($needle in $astral,$edge,$max,("${max}${max}"),"漢${max}",'海','海水','漣') {
+            $expected=@($edgeWords.Where({$_.StartsWith($needle,[StringComparison]::Ordinal)}) | Sort-Object)
+            $actual=@($store.PrefixSuggestions($needle,'oxford',$none) | Sort-Object)
+            Assert-Equal ($actual -join '|') ($expected -join '|') "与逐词 starts-with 参考集一致：$needle"
+        }
+        $cts=[Threading.CancellationTokenSource]::new(); $cancelled=$false
+        $progress=[SQLitePCL.delegate_progress]{param($state) $state.Cancel(); return 0}
+        [SQLitePCL.raw]::sqlite3_progress_handler($cn.Handle,500,$progress,$cts)
+        try { $null=$store.PrefixSuggestions('app',$all,$cts.Token) }
+        catch {
+            $cause=$_.Exception
+            while ($cause -and $cause -isnot [OperationCanceledException]) { $cause=$cause.InnerException }
+            if (!$cause) { throw }
+            $cancelled=$true
+        }
+        finally { [SQLitePCL.raw]::sqlite3_progress_handler($cn.Handle,0,$null,$null); $cts.Dispose() }
+        Assert-Equal $cancelled $true '前缀 SQL 执行中响应取消，后续查询还能复用连接'
+        $sql.CommandText="UPDATE dictionary_metadata SET enabled=1 WHERE id='hanying'"
+        [void]$sql.ExecuteNonQuery()
+        Assert-Equal $store.PrefixSuggestions('app','hanying',$none).Count 8 '重启来源后单字前缀仍限八条'
+        $sql.CommandText='DROP TABLE dictionary_metadata'; [void]$sql.ExecuteNonQuery()
+        $legacy=$ctor.Invoke(@([string]$path,$true))
+        try { Assert-Equal ($legacy.PrefixSuggestions('app','oxford',$none) -join '|') ($english -join '|') '无元数据的旧库按限定来源只读联想' }
+        finally { $legacy.Dispose() }
+    } finally { $sql.Dispose(); $db.Dispose(); $store.Dispose() }
+    Write-Output 'PASS 前缀联想的词头、读音、旧库、来源、Unicode 边界、去重及取消'
 }
 
 function Test-IndexedLiveRepair([string]$Directory, [Reflection.Assembly]$Assembly) {
@@ -582,6 +682,7 @@ function Test-IndexedMdx([string]$Directory, [Reflection.Assembly]$Assembly) {
         Test-CustomStorageFallback $scratch
         Test-IndexedColdIntegrity $scratch
         Test-IndexedBlockCache $scratch
+        Test-PrefixSuggestions $scratch $Assembly
         Test-IndexedLiveRepair $scratch $Assembly
         Test-IndexedReimportMode $scratch $Assembly
         Test-IndexedCompaction $scratch
@@ -595,7 +696,7 @@ function Test-IndexedMdx([string]$Directory, [Reflection.Assembly]$Assembly) {
     Write-Output 'PASS 索引导入、按块详情、换版及旧库兼容'
 }
 
-function Test-MergedAudioPlayback([string]$Database,[string]$UiDir) {
+function Test-MergedAudioPlayback([string]$Database,[string]$UiDir,[switch]$BrokenResource) {
     Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
     foreach($name in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','Microsoft.Web.WebView2.Core','E_Search'){
         $null=[Reflection.Assembly]::LoadFrom((Join-Path $UiDir "$name.dll"))
@@ -603,7 +704,10 @@ function Test-MergedAudioPlayback([string]$Database,[string]$UiDir) {
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
     $arch=[Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
     $loader=if(Test-Path -LiteralPath (Join-Path $UiDir 'WebView2Loader.dll')){$UiDir}else{Join-Path $UiDir "runtimes/win-$arch/native"}
-    [Microsoft.Web.WebView2.Core.CoreWebView2Environment]::SetLoaderDllFolderPath($loader)
+    if (!$script:audioLoaderInitialized) {
+        [Microsoft.Web.WebView2.Core.CoreWebView2Environment]::SetLoaderDllFolderPath($loader)
+        $script:audioLoaderInitialized=$true
+    }
     $previousContext=[Threading.SynchronizationContext]::Current
     $previousProfile=$env:WEBVIEW2_USER_DATA_FOLDER
     $env:WEBVIEW2_USER_DATA_FOLDER=Join-Path ([IO.Path]::GetDirectoryName($Database)) 'audio-webview'
@@ -635,6 +739,14 @@ function Test-MergedAudioPlayback([string]$Database,[string]$UiDir) {
         $w.FindName('QueryBox').Text='test'
         Wait-Audio { $w.FindName('CandidatePicker').Items.Count -gt 0 } '显示测试词条'
         $w.FindName('DetailsButton').RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+        if ($BrokenResource) {
+            Wait-Audio { $w.FindName('StatusText').Text -like '*本来源原文*' } '缺失的 MDD 退回纯文本'
+            Assert-Equal $w.FindName('DetailScroll').IsVisible $true '缺少归档后来源正文仍在视口内'
+            Assert-Equal ($w.FindName('EntryText').Text.Contains('食べる')) $true '失败回退显示已选来源的正文'
+            Assert-Equal $w.FindName('MergedDetail').IsHitTestVisible $false '失败的排版不能拦截文本层输入'
+            Write-Output 'PASS 缺失的隔离 MDD 回退到可见的来源原文'
+            return
+        }
         Wait-Audio { $w.FindName('MergedWebHost').Content.CoreWebView2 } '创建词条 WebView2'
         $browser=$w.FindName('MergedWebHost').Content.CoreWebView2
         $browser.IsMuted=$true
@@ -722,12 +834,20 @@ function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, 
         $manifest.files['E_search-zh-ja.mdd'] = (Get-FileHash -LiteralPath $mdd).Hash
         $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestFile -Encoding utf8
         Invoke-Search @('import-merged',$dir) | Out-Null
-        if ($Audio) { Test-MergedAudioPlayback $env:E_SEARCH_DB (Join-Path $PSScriptRoot 'bin/Release/net10.0-windows') }
+        $testUiDir = if ($GuiExecutable) { Split-Path -Parent (Resolve-Path -LiteralPath $GuiExecutable).Path } else { Join-Path $PSScriptRoot 'bin/Release/net10.0-windows' }
+        if ($Audio) { Test-MergedAudioPlayback $env:E_SEARCH_DB $testUiDir }
         $volumes = @(Get-ChildItem -LiteralPath ($env:E_SEARCH_DB + '.sources') -Filter '*.mdx' -File)
         Assert-Equal $volumes.Count 2 '双卷完整正文按需从两份托管 MDX 打开'
         Assert-Equal (@(Invoke-Search @('merged-resources')) -join '|') (Get-FileHash -LiteralPath $mdd).Hash '发布只收录活动卷引用的 MDD'
         # 同版重导须修复托管资源；源包仍保持完整，用它模拟用户重新指定已验证副本。
         $managedArchive = Join-Path $dir ("merged-resources/" + $manifest.files['E_search-zh-ja.mdd'] + ".mdd")
+        if ($Audio) {
+            # 仅移动本次生成的测试归档；同一个可搬移的索引仍包含来源正文。另开窗口清除先前的内存资源缓存。
+            $heldMdd = Join-Path $dir 'missing-resource.saved'
+            [IO.File]::Move($managedArchive,$heldMdd)
+            try { Test-MergedAudioPlayback $env:E_SEARCH_DB $testUiDir -BrokenResource }
+            finally { [IO.File]::Move($heldMdd,$managedArchive) }
+        }
         [IO.File]::WriteAllBytes($managedArchive,[byte[]](17,23,31))
         Invoke-Search @('import-merged',$dir) | Out-Null
         Assert-Equal (Get-FileHash -LiteralPath $managedArchive).Hash $manifest.files['E_search-zh-ja.mdd'] '同版重导修复受损 MDD'
@@ -1249,6 +1369,231 @@ function Test-Calculation([Reflection.Assembly]$Assembly) {
     Write-Output 'PASS 四则运算、幂与科学函数、角度制及普通搜索识别'
 }
 
+function Test-FileNameCompletions([string]$Scratch, [Reflection.Assembly]$Assembly) {
+    $window = [ESearch.SearchWindow]::new((Join-Path $Scratch 'completion.db'),$null)
+    $flags = [Reflection.BindingFlags]'Instance,NonPublic'
+    $type = $window.GetType()
+    $query = $window.FindName('QueryBox')
+    $choices = $window.FindName('FileCompletionChoices')
+    Assert-Equal ($null -ne $choices) $true '文件区具有独立补全控件'
+    $update = $type.GetMethod('UpdateFileCompletions',$flags)
+    $fileQuery = $type.GetMethod('GetFileQuery',$flags)
+    $revision = $type.GetField('revision',$flags)
+    $completed = $type.GetField('fileRevision',$flags)
+    $composing = $type.GetField('composing',$flags)
+    $hitType = $Assembly.GetType('ESearch.FileHit')
+    function Set-Page([string]$prefix, [string[]]$names) {
+        $query.Text = $prefix
+        $rows = [Array]::CreateInstance($hitType,$names.Length)
+        for ($i=0; $i -lt $names.Length; $i++) {
+            $folder = "C:\test\$i"
+            $rows[$i] = [Activator]::CreateInstance($hitType,@($names[$i],$folder,[IO.Path]::Combine($folder,$names[$i])))
+        }
+        $completed.SetValue($window,$revision.GetValue($window))
+        [void]$update.Invoke($window,@($prefix,$rows))
+    }
+    function Click-Choice([string]$name) {
+        $button = $choices.ItemTemplate.LoadContent()
+        $button.DataContext = $name
+        Assert-Equal ($button.Focusable -and $button.IsTabStop) $true '文件补全支持标准按钮的键盘访问'
+        $button.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+    }
+    $rows = @('plan','Plan 2026 final.txt','plan-b.txt','PLAN-B.TXT','not-plan.txt','plan-a.txt','plan-c.txt')
+    Set-Page 'p' $rows
+    Assert-Equal ($choices.Items -join '|') 'plan|plan-b.txt|plan-a.txt' '单字母前缀去重并按短后缀和原结果顺序限三条'
+    Set-Page 'plan' $rows
+    Assert-Equal ($choices.Items -join '|') 'plan-b.txt|plan-a.txt|plan-c.txt' '整名本身不占用候选'
+    $type.GetMethod('AcceptDictionaryText',$flags).Invoke($window,@('Plan'))
+    $dictionaryChoices = $window.FindName('PrefixChoices')
+    $dictionaryChoices.ItemsSource = @('planet')
+    Set-Page 'Plan' $rows
+    Assert-Equal $choices.Items.Count 3 '采纳普通词典词头后仍有独立文件补全'
+    Assert-Equal ($dictionaryChoices.Items -join '|') 'planet' '文件补全不覆盖词典联想'
+    Set-Page 'Plan 2026 fi' $rows
+    Assert-Equal ($choices.Items -join '|') 'Plan 2026 final.txt' '多词长前缀补全'
+    Assert-Equal $query.Text 'Plan 2026 fi' '显示补全不改输入'
+    $query.Text = 'next'
+    Assert-Equal $choices.Items.Count 0 '编辑立即清掉上页候选'
+    Click-Choice 'Plan 2026 final.txt'
+    Assert-Equal $query.Text 'next' '不能采纳上轮结果'
+    foreach ($special in 'ext:pdf','!skip','x|y','<x>','x*','"x','C:\docs','ai prompt','6+7','反查日语 枕') {
+        Set-Page $special @("$special.txt")
+        Assert-Equal $choices.Items.Count 0 "特殊输入不参与文件补全 $special"
+        Assert-Equal ($fileQuery.Invoke($window,@($special))) $special "手输保留原输入 $special"
+    }
+    $composing.SetValue($window,$true)
+    Set-Page '報' @('報告.txt')
+    Assert-Equal $choices.Items.Count 0 'IME 选字期间不生成补全'
+    $composing.SetValue($window,$false)
+    foreach ($case in @(@('報','報告 !案(1).txt'),@('ai','ai prompt.txt'),@('6','6+7'),@('反','反查日语 枕'))) {
+        Set-Page $case[0] @($case[1])
+        Click-Choice $case[1]
+        Assert-Equal $query.Text $case[1] '点击写回实际大小写和符号'
+        Assert-Equal $query.CaretIndex $query.Text.Length '光标置于采纳的文件名末尾'
+        Assert-Equal ($fileQuery.Invoke($window,@($query.Text))) ('file:wfn:"'+$case[1]+'"') '采纳后使用整名字面查询'
+        foreach ($route in 'InChatGptMode','IsReverseInput','ShowCalculation') {
+            Assert-Equal ($type.GetMethod($route,$flags).Invoke($window,@($query.Text))) $false '采纳文件名后仍进入文件查询'
+        }
+        $query.Text += 'a'
+        Assert-Equal ($fileQuery.Invoke($window,@($query.Text))) $query.Text '手动改动立即恢复普通查询'
+    }
+    Write-Output 'PASS 文件补全独立控件、候选顺序、采纳、原生查询和输入模式'
+}
+
+function Test-FileRefind([string]$Scratch, [Reflection.Assembly]$Assembly) {
+    $root = [IO.Directory]::CreateDirectory((Join-Path $Scratch ('refind-' + [guid]::NewGuid().ToString('N')))).FullName
+    $historyType = $Assembly.GetType('ESearch.FileRefindHistory',$true)
+    $hitType = $Assembly.GetType('ESearch.FileHit',$true)
+    function New-History([string]$id) { [Activator]::CreateInstance($historyType,@([IO.Path]::Combine($root,$id))) }
+    function Connection([string]$id) {
+        [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$(Join-Path $root $id).file-refind.sqlite;Pooling=False")
+    }
+    function Scalar([string]$id,[string]$sql) {
+        $db = Connection $id
+        try { $db.Open(); $cmd = $db.CreateCommand(); $cmd.CommandText = $sql; $cmd.ExecuteScalar() } finally { $db.Dispose() }
+    }
+    $sdk = [Array]::CreateInstance($hitType,100)
+    for ($i=0;$i -lt 100;$i++) {
+        $name = "memo-$($i+1).exe"
+        $sdk[$i] = [Activator]::CreateInstance($hitType,@($name,$root,[IO.Path]::Combine($root,$name)))
+    }
+    $physical = New-History 'shell'
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $physical.RecordShellOpen($sdk[79].FullPath,$now)
+    Assert-Equal $physical.GetPreferences().Item1 0 '文件重找默认关闭'
+    Assert-Equal ([IO.File]::Exists((Join-Path $root 'shell.file-refind.sqlite'))) $false '默认不创建个人打开记录'
+    $null = $physical.SetMode(1)
+
+    # 控制任务使用隔离的无窗口可执行文件，每次交给 Shell 后核对该进程写下的真实完整路径。
+    $source = Join-Path $root 'fixture.cs'
+    $exe = Join-Path $root 'fixture.exe'
+    [IO.File]::WriteAllText($source,'class Fixture { static void Main() { string p=System.Reflection.Assembly.GetExecutingAssembly().Location; System.IO.File.WriteAllText(p+".tmp", p); System.IO.File.Move(p+".tmp",p+".ok"); } }')
+    $csc = @('Framework64','Framework' | ForEach-Object { Join-Path $env:windir "Microsoft.NET/$_/v4.0.30319/csc.exe" } | Where-Object { Test-Path -LiteralPath $_ })[0]
+    & $csc /nologo /target:winexe "/out:$exe" $source
+    if ($LASTEXITCODE -ne 0) { throw '无法构建无窗口的文件打开验收夹具' }
+    $window = [ESearch.SearchWindow]::new((Join-Path $root 'shell'),$null)
+    $flags = [Reflection.BindingFlags]'Instance,NonPublic'
+    $start = $window.GetType().GetMethod('OpenWithShell',$flags)
+    $action = [Enum]::Parse($start.GetParameters()[1].ParameterType.GenericTypeArguments[0],'Open')
+    $pendingWrite = $window.GetType().GetField('pendingFileWrite',$flags)
+    $profiles = [ordered]@{SDK=(New-History 'sdk'); Recent=(New-History 'recent'); Decay=(New-History 'decay')}
+    $null=$profiles.Recent.SetMode(1); $null=$profiles.Decay.SetMode(2)
+    $stats = @{}; $previous = @{}; $seen = @{}
+    $tasks = @(80,80,80,20,40,60,70,90,80,20,3,80,90,101)
+    # 目标预先给定；在记录本轮打开之前排名。101 不在提供的前 100 项，不产生反馈。
+    try {
+        foreach ($target in $tasks) {
+            $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            $group = if ($seen.ContainsKey($target)) { 'repeat' } else { 'first' }
+            foreach ($policy in $profiles.Keys) {
+                $ranked = $profiles[$policy].Rank('memo',$sdk,$now)
+                $rank = if ($target -le $sdk.Count) { [Array]::IndexOf($ranked.FullPath,$sdk[$target-1].FullPath)+1 } else { 0 }
+                $bucket = "$policy/$group"
+                if (!$stats.ContainsKey($bucket)) { $stats[$bucket] = @{n=0;covered=0;top5=0;jump=0;pairs=0} }
+                $s = $stats[$bucket]; $s.n++
+                if ($rank -gt 0) {
+                    $s.covered++
+                    if ($rank -le 5) { $s.top5++ }
+                    $key = "$policy/$target"
+                    if ($previous.ContainsKey($key)) { $s.jump += [Math]::Abs($rank-$previous[$key]); $s.pairs++ }
+                    $previous[$key]=$rank
+                }
+            }
+            $before = Scalar 'shell' 'SELECT total(weight) FROM opens'
+            if ($target -gt $sdk.Count) {
+                [void]$start.Invoke($window,@([IO.Path]::Combine($root,'missing.exe'),$action,$false))
+                Assert-Equal (Scalar 'shell' 'SELECT total(weight) FROM opens') $before '失败打开不写历史'
+                continue
+            }
+            $path = $sdk[$target-1].FullPath
+            if (![IO.File]::Exists($path)) { [IO.File]::Copy($exe,$path) }
+            $list = $window.FindName('FileList')
+            $list.ItemsSource = $sdk; $list.SelectedItem = $sdk[$target-1]
+            Assert-Equal (Scalar 'shell' 'SELECT total(weight) FROM opens') $before '默认选择或切换选择不写历史'
+            if ([IO.File]::Exists("$path.ok")) { [IO.File]::Move("$path.ok",("$path." + [guid]::NewGuid().ToString('N') + '.ok')) }
+            [void]$start.Invoke($window,@($path,$action,$false))
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            while (![IO.File]::Exists("$path.ok") -and $watch.Elapsed.TotalSeconds -lt 6) { Start-Sleep -Milliseconds 10 }
+            Assert-Equal ([IO.File]::ReadAllText("$path.ok")) $path 'Shell 进程实际运行目标文件'
+            $null=$pendingWrite.GetValue($window).GetAwaiter().GetResult()
+            if ((Scalar 'shell' 'SELECT total(weight) FROM opens') -le $before) { throw '成功 Shell 打开未计入记录' }
+            $seen[$target] = $true
+            foreach ($policy in 'Recent','Decay') { $profiles[$policy].RecordShellOpen($path,[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) }
+        }
+        # 使用独享锁让排名读取实际等待；Dispatcher 上应立即返回未完成的 Task，输入变更则作废旧任务。
+        $list=$window.FindName('FileList')
+        $present=$window.GetType().GetMethod('PresentFileRows',$flags)
+        $pick=$window.GetType().GetField('userPickedFile',$flags)
+        $query=$window.FindName('QueryBox'); $query.Text='memo'
+        $rev=$window.GetType().GetField('revision',$flags).GetValue($window)
+        $window.GetType().GetField('fileRevision',$flags).SetValue($window,$rev)
+        $window.GetType().GetField('sdkQuery',$flags).SetValue($window,'memo')
+        $window.GetType().GetField('sdkFiles',$flags).SetValue($window,$sdk)
+        [void]$present.Invoke($window,(,$sdk))
+        $list.SelectedIndex=9; $pick.SetValue($window,$true)
+        $reversed=[Array]::CreateInstance($hitType,100); [Array]::Copy($sdk,$reversed,100); [Array]::Reverse($reversed)
+        [void]$present.Invoke($window,(,$reversed))
+        Assert-Equal $list.SelectedItem.FullPath $sdk[9].FullPath '重排后保留主动选择的路径'
+        $pick.SetValue($window,$false); [void]$present.Invoke($window,(,$sdk))
+        Assert-Equal $list.SelectedItem.FullPath $sdk[0].FullPath '默认选择跟随当前第一行'
+        $lock=Connection 'shell'; $lock.Open()
+        try {
+            $lockCmd=$lock.CreateCommand(); $lockCmd.CommandText='BEGIN EXCLUSIVE'; [void]$lockCmd.ExecuteNonQuery()
+            $timer=[Diagnostics.Stopwatch]::StartNew()
+            $ranking=$window.GetType().GetMethod('RankRememberedFilesAsync',$flags).Invoke($window,@())
+            if ($timer.ElapsedMilliseconds -ge 750 -or $ranking.IsCompleted) { throw "排序锁占用 UI：$($timer.ElapsedMilliseconds) ms" }
+            $query.Text='edited'
+            Assert-Equal $list.Items.Count 0 '输入改变立即撤销受锁旧页'
+            $lockCmd.CommandText='ROLLBACK'; [void]$lockCmd.ExecuteNonQuery()
+        } finally { $lock.Dispose() }
+        $watch=[Diagnostics.Stopwatch]::StartNew()
+        while (!$ranking.IsCompleted -and $watch.Elapsed.TotalSeconds -lt 4) {
+            $frame=[Windows.Threading.DispatcherFrame]::new()
+            [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background,[Action]{$frame.Continue=$false})
+            [Windows.Threading.Dispatcher]::PushFrame($frame)
+        }
+        Assert-Equal $ranking.IsCompleted $true '后台排名取消后结束'
+        Assert-Equal $list.Items.Count 0 '受锁旧结果不会覆盖新输入'
+    } finally {
+        $window.GetType().GetField('exiting',$flags).SetValue($window,$true)
+        $window.Close()
+    }
+    foreach ($policy in $profiles.Keys) { foreach ($group in 'first','repeat') {
+        $s = $stats["$policy/$group"]
+        $jump = if ($s.pairs) { [Math]::Round($s.jump/$s.pairs,2) } else { 'n/a' }
+        Write-Output "REFIND $policy $group top100=$($s.covered)/$($s.n) top5=$($s.top5)/$($s.n) mean-rank-jump=$jump pairs=$($s.pairs)"
+        Assert-Equal $s.covered $stats["SDK/$group"].covered '重排不改变当前候选覆盖'
+    } }
+    Assert-Equal $stats['SDK/first'].covered 7 '8 个首找目标中有 7 个落入候选'
+    Assert-Equal $stats['Recent/repeat'].top5 4 '时间回放近因优先的前五命中数'
+    Assert-Equal $stats['Decay/repeat'].top5 5 '时间回放衰减频次的前五命中数'
+    $control = New-History 'control'
+    $consent=$control.SetMode(2)
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); $day=[long]86400000
+    foreach ($unused in 1..3) { $control.RecordShellOpen($sdk[2].FullPath.ToUpperInvariant(),$now-42*$day) }
+    $control.RecordShellOpen($sdk[5].FullPath,$now)
+    Assert-Equal $control.Rank('memo',$sdk,$now)[0].Name $sdk[5].Name '三次旧打开经过三个半衰期后低于新近一次打开'
+    Assert-Equal $control.Rank('memo',$sdk,$now)[1].Name $sdk[2].Name '大小写路径变体共享记录'
+    Assert-Equal $control.Rank($sdk[1].Name,$sdk,$now)[0].Name $sdk[1].Name '整名精确组在重找前面'
+    Assert-Equal $control.Rank('ext:exe memo',$sdk,$now)[0].Name $sdk[0].Name 'Everything 原生表达式保序'
+    Assert-Equal $control.Rank('memo',$sdk,($now+91*$day))[0].Name $sdk[0].Name '过期记录无排序权重'
+    Assert-Equal (New-History 'control').GetPreferences().Item1 2 '新实例恢复实验方式'
+    $null=$control.SetMode(0); $control.RecordShellOpen($sdk[7].FullPath,$now+1)
+    Assert-Equal (Scalar 'control' 'SELECT count(*) FROM opens') 2 '关闭立即停止采集'
+    Assert-Equal (($control.Rank('memo',$sdk,$now).Name) -join '|') ($sdk.Name -join '|') '关闭立即恢复整页 SDK 原序'
+    $null=$control.SetMode(1)
+    $control.RecordShellOpen($sdk[7].FullPath,$now+1,$consent.Item2)
+    Assert-Equal (Scalar 'control' 'SELECT count(*) FROM opens') 2 '关闭又开启不能接收旧的排队写入'
+    $consent=$control.GetPreferences(); $null=$control.Clear()
+    $control.RecordShellOpen($sdk[7].FullPath,$now+1,$consent.Item2)
+    Assert-Equal (Scalar 'control' 'SELECT count(*) FROM opens') 0 '清除全部持久记录并撤销旧写入'
+    foreach ($i in 0..256) { $control.RecordShellOpen((Join-Path $root "$i.txt"),$now+$i) }
+    Assert-Equal (Scalar 'control' 'SELECT count(*) FROM opens') 256 '历史最多 256 个文件'
+    $control.RecordShellOpen($sdk[0].FullPath,($now+91*$day))
+    Assert-Equal (Scalar 'control' 'SELECT count(*) FROM opens') 1 '新打开会清理所有超期记录'
+    Write-Output 'PASS 文件重找的实际 Shell 交接、回放、异步锁竞争、排序、停用及容量边界'
+}
+
 function Test-EverythingRecovery([string]$Scratch, [Reflection.Assembly]$Assembly) {
     # 使用独立管道对端模拟「收到请求但不返回」。不连接或停止用户的 Everything。
     $marker = Join-Path $Scratch 'sdk-worker-accepted.txt'
@@ -1571,6 +1916,97 @@ function Summon-Fixture {
     [ESearchDesktop]::Press($form.Handle,17,18,16,130)
     Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle -and $value.Current.Value -eq '' } '快捷键打开后不是空白查询框'
 }
+function Test-FileDisplayPaths([Reflection.Assembly]$Assembly) {
+    $type=$Assembly.GetType('ESearch.FileHit',$true)
+    $display=$type.GetMethod('WithDisplayPaths',[Reflection.BindingFlags]'Public,NonPublic,Static')
+    Assert-Equal ($null -ne $display) $true '文件页生成可辨目录'
+    $long=('深层资料' * 45)
+    # 每行依次为文件名、真实父目录、该页应显示的最短目录。相同对象也可能被另一页复用。
+    $cases=@(
+        @('笔记.md','C:\项目\甲\run','甲\run'), @('笔记.MD','C:\项目\乙\run','乙\run'),
+        @('笔记.md','C:\项目\有效','有效'), @('单项.md','C:\项目\有效','C:\项目\有效'),
+        @('盘.txt','D:\logs\out','D:\logs\out'), @('盘.txt','C:\logs\out','C:\logs\out'),
+        @('UNC.txt','\\serverA\share\out','\\serverA\share\out'), @('UNC.txt','\\serverB\share\out','\\serverB\share\out'),
+        @('UNC.txt','\\serverA\share2\out','\\serverA\share2\out'),
+        @('根.txt','C:\','C:\'), @('根.txt','D:\','D:\'),
+        @('后缀.txt','C:\run','C:\run'), @('后缀.txt','C:\甲\run','甲\run'),
+        @('重复.txt','C:\one','C:\one'), @('重复.TXT','c:\ONE','c:\ONE'),
+        @('同一路径.txt','C:\base\甲','甲'), @('同一路径.TXT','c:\BASE\甲','甲'), @('同一路径.txt','C:\base\乙','乙'),
+        @('长.txt',"C:\$long\$long\甲\end",'甲\end'), @('长.txt',"C:\$long\$long\乙\end",'乙\end')
+    )
+    $hits=[Array]::CreateInstance($type,$cases.Count)
+    $ctor=$type.GetConstructors()[0]
+    for ($i=0; $i -lt $cases.Count; $i++) {
+        $name,$parent,$expected=$cases[$i]
+        $hits[$i]=$ctor.Invoke(@($name,$parent,[IO.Path]::Combine($parent,$name)))
+    }
+    $shown=$display.Invoke($null,[object[]](,$hits))
+    Assert-Equal $shown.Count $hits.Count '目录辨识保留所有结果'
+    for ($i=0; $i -lt $cases.Count; $i++) {
+        Assert-Equal $shown[$i].FullPath $hits[$i].FullPath "完整路径和顺序 $i"
+        Assert-Equal $shown[$i].Parent $hits[$i].Parent "真实父目录 $i"
+        Assert-Equal $shown[$i].DisplayParent $cases[$i][2] "目录后缀 $i"
+    }
+    $single=[Array]::CreateInstance($type,1)
+    $single[0]=$shown[0]
+    Assert-Equal ($display.Invoke($null,[object[]](,$single)))[0].DisplayParent $single[0].Parent '缩小结果页后恢复完整父目录'
+    $empty=[Array]::CreateInstance($type,0)
+    Assert-Equal ($display.Invoke($null,[object[]](,$empty))).Count 0 '空文件页'
+    Write-Output 'PASS 同名目录后缀、跨盘、UNC、超长路径、相同文件、缩小结果页与顺序'
+}
+
+function Test-FileDisplayLayout([Reflection.Assembly]$Assembly,[string]$Directory) {
+    Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
+    foreach ($library in 'Microsoft.Web.WebView2.Core','Microsoft.Web.WebView2.Wpf') {
+        $null=[Reflection.Assembly]::LoadFrom((Join-Path (Split-Path $Assembly.Location) "$library.dll"))
+    }
+    $type=$Assembly.GetType('ESearch.FileHit',$true)
+    $hits=[Array]::CreateInstance($type,2)
+    $stem='共同项目资料'*4
+    foreach ($i in 0,1) {
+        $part=$stem+@('甲','乙')[$i]
+        $parentDir=[IO.Directory]::CreateDirectory((Join-Path $Directory "$part\run")).FullName
+        $path=Join-Path $parentDir '待确认.md'
+        [IO.File]::WriteAllText($path,"$part 布局样本")
+        $hits[$i]=$type.GetConstructors()[0].Invoke(@('待确认.md',[string]$parentDir,[string]$path))
+    }
+    $rows=$type.GetMethod('WithDisplayPaths',[Reflection.BindingFlags]'Static,NonPublic').Invoke($null,[object[]](,$hits))
+    function Find-FileLabel($element,[string]$text) {
+        if ($element -is [Windows.Controls.TextBlock] -and $element.Text -ceq $text) {return $element}
+        for ($j=0; $j -lt [Windows.Media.VisualTreeHelper]::GetChildrenCount($element); $j++) {
+            $match=Find-FileLabel ([Windows.Media.VisualTreeHelper]::GetChild($element,$j)) $text
+            if ($match) {return $match}
+        }
+    }
+    # 离屏测量完整窗口的实际模板。两目录仅长组件末字不同，窄窗裁掉该字就无法选择。
+    $w=[ESearch.SearchWindow]::new((Join-Path $Directory 'file-layout.db'),$null)
+    try {
+        $w.FindName('FilePanel').Visibility='Visible'
+        $list=$w.FindName('FileList')
+        $list.Visibility='Visible'
+        $list.ItemsSource=$rows
+        foreach ($width in 736,360) {
+            $layout=$w.Content
+            $layout.Measure([Windows.Size]::new($width,[double]::PositiveInfinity))
+            $layout.Arrange([Windows.Rect]::new(0,0,$width,$layout.DesiredSize.Height))
+            $layout.UpdateLayout()
+            foreach ($i in 0,1) {
+                $row=$list.ItemContainerGenerator.ContainerFromIndex($i)
+                $label=Find-FileLabel $row ($stem+@('甲','乙')[$i]+'\run')
+                Assert-Equal ($null -ne $label) $true "宽度 $width 同名行 $i 的可见目录"
+                Assert-Equal ([string]$label.TextWrapping) 'Wrap' "宽度 $width 的长目录换行"
+                Assert-Equal ([string]$label.TextTrimming) 'None' "宽度 $width 的可辨后缀不截断"
+                Assert-Equal ($label.ActualWidth -gt 0 -and $label.ActualWidth -lt $width-96 -and
+                    $label.ActualHeight+1 -ge $label.DesiredSize.Height) $true "宽度 $width 的标签实际布局"
+            }
+        }
+        Write-Output 'PASS WPF 文件行在 736/360 DIP 显示完整可辨目录'
+    } finally {
+        $w.GetType().GetField('exiting',[Reflection.BindingFlags]'NonPublic,Instance').SetValue($w,$true)
+        $w.Close()
+    }
+}
+
 function Test-FileResultActions([int]$Hotkey = 130) {
     $tag='ESearchClick' + [Guid]::NewGuid().ToString('N').Substring(0,10)
     $name="$tag 样本,文件.html"
@@ -1601,6 +2037,13 @@ function Test-FileResultActions([int]$Hotkey = 130) {
         $rows.Count -eq 2 -and $markers.ContainsKey($rows[0].Current.Name) -and
             $markers.ContainsKey($rows[1].Current.Name) -and (SelectedPath) -ceq $rows[0].Current.Name
     } '没有显示两个同名结果并默认选中第一项'
+    $openFilter=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::AutomationIdProperty,'OpenFileButton')
+    foreach ($row in FileRows) {
+        $open=$row.FindFirst([Windows.Automation.TreeScope]::Descendants,$openFilter)
+        $full=$row.Current.Name
+        Assert-Equal $open.Current.ItemStatus ([IO.Path]::GetFileName([IO.Path]::GetDirectoryName($full))) '同名行显示最短父目录'
+        Assert-Equal $open.Current.Name "打开 $full" '辅助名称保留完整路径'
+    }
     $target=@(FileRows)[1].Current.Name
     $paths=PathsOnScreen
     function Confirm-SearchSession {
@@ -2443,6 +2886,318 @@ function Test-SanseidoSummary([string]$Scratch, [Reflection.Assembly]$Assembly) 
     } finally { $env:E_SEARCH_DB = $previous }
 }
 
+function Test-ShinseikiReverseSenses([Reflection.Assembly]$Assembly) {
+    $parse=$Assembly.GetType('EntryParser').GetMethod('ShinseikiReverseSenses',[Reflection.BindingFlags]'Static,NonPublic')
+    Assert-Equal ($null -ne $parse) $true '新世纪提供中文主释义及其原书位置'
+    $divider='<span class="divide-imgs"><img src="sense.png"/></span>'
+    $first='<span>日本語の説明</span>' + $divider + '<span>量測 H<sub>2</sub>O &amp; 水。</span>'
+    $example='<div class="unit-example"><p><span class="example-source">例文</span><span>译例专用文字</span></p></div>'
+    $nested='<p class="phrase-wrap"><span>慣用句</span>' + $divider + '<span>不属于主词头</span></p>'
+    $body='<ul class="ncdata-sense-wrap"><li>'+$first+$example+'</li><li><span>のみ</span>'+$example+'</li><li><span>二</span>'+$divider+'<span>第二个词义。</span></li></ul>'+$nested
+    $senses=@($parse.Invoke($null,@($body,'用具')) | ForEach-Object { $_ })
+    Assert-Equal (($senses | ForEach-Object Item1) -join '|') '量測 H2O & 水。|第二个词义。' '中文反查只抽本义，支持繁体、实体、下标和同段多个义项'
+    Assert-Equal $body.Substring($senses[0].Item2.Start.Value,$senses[0].Item2.End.Value-$senses[0].Item2.Start.Value) '量測 H<sub>2</sub>O &amp; 水。' '原始锚点保留嵌套标签和实体的实际长度'
+    $pair=foreach ($row in @(@('合う','互相符合。'),@('会う·逢う','相见。'),@('遭う','遭遇。'))) {
+        '<div class="wrap-switch"><div class="ncdata-header"><h1><span class="word">あ·う</span><span>【<span>'+$row[0]+'</span>】</span></h1></div><ul class="ncdata-sense-wrap"><li><span>日本語</span>'+$divider+'<span>'+$row[1]+'</span></li></ul></div>'
+    }
+    foreach ($entry in @(@('合う','互相符合。'),@('会う','相见。'),@('逢う','相见。'),@('遭う','遭遇。'),@('あ·う',''),@('未知',''))) {
+        $actual=@($parse.Invoke($null,@(($pair -join ''),$entry[0])) | ForEach-Object { $_.Item1 }) -join '|'
+        Assert-Equal $actual $entry[1] "同音合收记录按当前物理词头选义 $($entry[0])"
+    }
+    $display=$Assembly.GetType('EntryParser').GetMethod('ShinseikiReverseHeadword',[Reflection.BindingFlags]'Static,NonPublic')
+    Assert-Equal ($null -ne $display) $true '新世纪反查按原书核实外来语日语词头'
+    foreach($row in @(
+        @('<h1><span class="word">ランドセル</span><span>【<span>オランダ ransel</span>】</span></h1>','オランダ ransel','ランドセル'),
+        @('<h1><span class="word">リュックサック</span><!-- -->[<span>ド Rucksack</span>]</h1>','リュックサック[ド Rucksack]','リュックサック'),
+        @('<h1><span class="word">ビーがた</span><span>【<span>B型</span>】</span></h1>','B型','B型'),
+        @('<h1><span class="word">アイピーアドレス</span><span>【<span>IPアイピーアドレス</span>】</span></h1>','IPアイピーアドレス','IPアイピーアドレス'),
+        @('<h1><span class="word">リュックサック</span><!-- -->[<span>ド Rucksack</span>]</h1>','別名[ド Rucksack]','別名[ド Rucksack]')
+    )) { Assert-Equal $display.Invoke($null,@($row[0],$row[1])) $row[2] "真实词头与外文词源分离 $($row[1])" }
+}
+
+function Test-JapaneseLexicalCatalogue([string]$Scratch) {
+    $previousDb=$env:E_SEARCH_DB
+    $previousCache=$env:E_SEARCH_REVERSE_CACHE
+    $env:E_SEARCH_DB=Join-Path $Scratch 'japanese-reverse.db'
+    $env:E_SEARCH_REVERSE_CACHE=Join-Path $Scratch 'japanese-lexical-cache'
+    try {
+        $source=Join-Path $Scratch 'japanese-lexical.mdx'
+        $body='<ul class="ncdata-sense-wrap"><li><span>頭にあてるもの</span><span class="divide-imgs"><img/></span><span>睡觉时垫在头下的东西。</span></li></ul>'
+        $title='<h1><span class="word">まくら</span><span>【<span>枕</span>】</span></h1>'
+        Write-Mdx $source ([ordered]@{'枕'=$title+$body;'傘'=$body.Replace('睡觉时垫在头下的东西','挡雨的工具')
+            'みみ'=$body.Replace('睡觉时垫在头下的东西','听声音的器官')})
+        Invoke-Search @('import','shinseiki',$source) | Out-Null
+        $argsLex=@('reverse-lexical','睡觉时垫在头下的东西','shinseiki')
+        $first=@(Invoke-Search $argsLex) -join '|'
+        Assert-Equal ($first -match 'reverse\s+枕') $true '首次词语反查能定位新世纪原书枕义'
+        Assert-Equal $first.Contains('枕（まくら） · 睡觉时垫在头下的东西。') $true '日文反查显示原书标题证实的假名读音'
+        Assert-Equal ((@(Invoke-Search @('reverse-lexical','听声音的器官','shinseiki')) -join '|').Contains('みみ（みみ）')) $false '纯假名词头与读音相同不重复展示'
+        $side=@(Get-ChildItem -LiteralPath $env:E_SEARCH_REVERSE_CACHE -Filter '*.vec.catalog' -ErrorAction SilentlyContinue)
+        Assert-Equal $side.Count 1 '无模型词语反查持久保存新世纪已验证的义项目录'
+        Assert-Equal @(Get-ChildItem -LiteralPath $env:E_SEARCH_REVERSE_CACHE -Filter '*.vec').Count 0 '普通查词不编码语义向量'
+        $catalog=$side[0].FullName
+        $time=[IO.File]::GetLastWriteTimeUtc($catalog)
+        $bytes=[IO.File]::ReadAllBytes($catalog)
+        Assert-Equal (@(Invoke-Search $argsLex) -join '|') $first '重启后用已存义项目录重现词头及排序'
+        Assert-Equal ([IO.File]::GetLastWriteTimeUtc($catalog)) $time '只读复用时不重写义项目录'
+        # 受控目录保留正确的摘要，但把第一项指向不存在的序号。新进程必须读到该目录并回原书拒绝错位义项。
+        $moved=[byte[]]$bytes.Clone()
+        [Array]::Copy([BitConverter]::GetBytes([long]9999),0,$moved,76,8)
+        $digest=[Security.Cryptography.SHA256]::HashData([byte[]]$moved[76..($moved.Length-1)])
+        [Array]::Copy($digest,0,$moved,44,$digest.Length)
+        [IO.File]::WriteAllBytes($catalog,$moved)
+        Assert-Equal ((@(Invoke-Search $argsLex) -join '|') -match 'reverse\s+枕') $false '新进程从目录恢复索引后回读来源，拒绝错位原文'
+        $wrongHead=[byte[]]$bytes.Clone()
+        Assert-Equal ([Text.Encoding]::UTF8.GetString($wrongHead,94,3)) '枕' '测试首行是预期的真实物理词头'
+        [Array]::Copy([Text.Encoding]::UTF8.GetBytes('床'),0,$wrongHead,94,3)
+        $digest=[Security.Cryptography.SHA256]::HashData([byte[]]$wrongHead[76..($wrongHead.Length-1)])
+        [Array]::Copy($digest,0,$wrongHead,44,$digest.Length)
+        [IO.File]::WriteAllBytes($catalog,$wrongHead)
+        Assert-Equal ((@(Invoke-Search $argsLex) -join '|') -match 'reverse\s+床') $false '义项和序号吻合仍须核对原词头'
+        $broken=[byte[]]$bytes.Clone()
+        $broken[-1]=$broken[-1] -bxor 0x80
+        [IO.File]::WriteAllBytes($catalog,$broken)
+        $lock=[IO.File]::Open([IO.Path]::ChangeExtension($catalog,'lock'),'OpenOrCreate','ReadWrite','None')
+        try {
+            $start=[Diagnostics.ProcessStartInfo]::new($dotnet)
+            $start.UseShellExecute=$false
+            $start.RedirectStandardOutput=$true
+            foreach($arg in @($app)+$argsLex) { $start.ArgumentList.Add($arg) }
+            $child=[Diagnostics.Process]::Start($start)
+            try {
+                if(!$child.WaitForExit(8000)) { $child.Kill(); throw '普通反查等待了另一进程的模型写锁' }
+                Assert-Equal $child.ExitCode 0 '模型写锁不妨碍独立进程的词语反查'
+                Assert-Equal (($child.StandardOutput.ReadToEnd().Trim() -split '\r?\n') -join '|') $first '目录正在重建时立即使用原书结果'
+            } finally { $child.Dispose() }
+        } finally { $lock.Dispose() }
+        Assert-Equal (@(Invoke-Search $argsLex) -join '|') $first '损坏目录回退后从原书恢复义项'
+        Assert-Equal ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($catalog)))) ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))) '损坏目录自动修复到相同内容'
+        $env:E_SEARCH_REVERSE_CACHE=Join-Path $Scratch 'not-a-cache-directory'
+        [IO.File]::WriteAllBytes($env:E_SEARCH_REVERSE_CACHE,[byte[]]@(0))
+        Assert-Equal (@(Invoke-Search $argsLex) -join '|') $first '缓存不可写仍交付原书词语结果'
+    } finally {
+        $env:E_SEARCH_DB=$previousDb
+        $env:E_SEARCH_REVERSE_CACHE=$previousCache
+    }
+}
+
+function Test-ReverseLookup([string]$Scratch, [Reflection.Assembly]$Assembly) {
+    Test-JapaneseLexicalCatalogue $Scratch
+    Test-ShinseikiReverseSenses $Assembly
+    $prior=$env:E_SEARCH_DB
+    $env:E_SEARCH_DB=Join-Path $Scratch 'reverse-oxford.db'
+    try {
+        $source=Join-Path $Scratch 'reverse-oxford.mdx'
+        $entries=[ordered]@{bank='<font color=#FF5000>金融机构</font><font color=#FF5000>河岸；河边的土地</font>'; coast='<font color=#FF5000>海岸</font>'; loaner='<font color=#FF5000>临时借给别人使用的代用品</font>'; other='<font color=#FF5000>不相关的词条</font>'}
+        $entries['canopy']='<font color=#FF5000>顶篷</font><br><font style="color:#039;font-size:90%">帐篷顶上可以遮雨。</font><font color=#FF5000>树冠</font><br><font style="color:#039;font-size:90%">在密林树梢遥望。</font>【IDIOMS】<font style="color:#039;font-size:90%">无关短语的例子。</font>'
+        $entries['device']='<font color=#FF5000>机器</font>'
+        $entries['contraption']='a curious device or some machinery<br><font color=#FF5000>小器械</font>'
+        $entries['dust']='<font color=#FF5000>灰尘</font>'
+        $entries['filter']='a part of a device that keeps out dust<br><font color=#FF5000>滤网</font>'
+        Write-Mdx $source $entries
+        Invoke-Search @('import','oxford',$source) | Out-Null
+        $japanese=Join-Path $Scratch 'reverse-japanese.mdx'
+        Write-Mdx $japanese ([ordered]@{
+            '枕'='<ul class="ncdata-sense-wrap"><li><span>寝るときに頭を支える寝具。</span><span class="divide-imgs"></span><span>枕头。就寝时垫头的寝具。</span></li></ul>'
+            '時計'='<ul class="ncdata-sense-wrap"><li><span>時刻を示す。</span><span class="divide-imgs"></span><span>钟，表。可以计时、显示时刻的机械。</span></li></ul>'
+            '膝当て'='<ul class="ncdata-sense-wrap"><li><span>膝を守る。</span><span class="divide-imgs"></span><span>护具。垫膝，保护关节。</span></li></ul>'
+        })
+        Invoke-Search @('import','shinseiki',$japanese) | Out-Null
+        Assert-Equal ((@(Invoke-Search @('reverse-lexical','显示时刻的机械','shinseiki')) -join '|') -split "`t")[2] '時計' '中文描述可直接查已启用的新世纪日语原书'
+        Assert-Equal ((@(Invoke-Search @('reverse-lexical','放在膝盖下面的东西','shinseiki')) -join '|') -split "`t")[2] '膝当て' '空间关系与被支撑的部位参与释义检索'
+        Assert-Equal (@(Invoke-Search @('reverse-lexical','显示时刻的机械','oxford')) -match 'shinseiki:').Count 0 '限定英语来源不会出现日语候选'
+        $type=$Assembly.GetType('DictionaryStore')
+        $ctor=$type.GetConstructor([type[]]@([string],[bool]))
+        $store=$ctor.Invoke([object[]]@($env:E_SEARCH_DB,$true))
+        $token=[Threading.CancellationToken]::None
+        try {
+            Assert-Equal ($null -ne $type.GetMethod('ReverseLookup')) $true '词典提供独立的中文释义反查'
+            Assert-Equal ($null -ne $type.GetMethod('PrepareReverseModel',[Reflection.BindingFlags]'NonPublic,Instance')) $true '本地模型支持显式准备并复用持久化义项索引'
+            $hits=$store.ReverseLookup('河边可以站人的那片土地','oxford',$token)
+            Assert-Equal $hits[0].Entry.Headword bank '改写描述能选出正确英文词头'
+            Assert-Equal $hits[0].Entry.Gloss '河岸；河边的土地' '选择同一词头的第二个原书义项'
+            $anchor=$hits[0].Entry.GetType().GetProperty('Anchor',[Reflection.BindingFlags]'Instance,NonPublic').GetValue($hits[0].Entry)
+            $raw=$store.CurrentBody($hits[0].Entry)
+            Assert-Equal $raw.Substring($anchor.Sense.Start.Value,$anchor.Sense.End.Value-$anchor.Sense.Start.Value) '河岸；河边的土地' '原始锚点落在第二义'
+            Assert-Equal $hits[0].Method reverse '反查与常规查词有独立原因'
+            $context=$store.ReverseLookup('密林里抬头看到的树梢','oxford',$token)
+            Assert-Equal $context[0].Entry.Gloss '树冠' '原书同一义项的中文例句可补充独立改写的证据'
+            Assert-Equal $store.ReverseLookup('无关短语的例子','oxford',$token).Count 0 '后续习语例句不能作为主词义'
+            $bridged=@($store.ReverseLookup('机器上用来挡住灰尘的部件','oxford',$token) | Where-Object { $_.Entry.Gloss -eq '滤网' })
+            Assert-Equal $bridged.Count 1 '用同一本词典的中英词义对应和英文定义找回字面没有重叠的义项'
+            Assert-Equal $store.ReverseLookup('机器','oxford',$token)[0].Entry.Headword device '直接复述原书义项应优先原本词头'
+            Assert-Equal $store.ReverseLookup('临时借用的代用品','zh-en',$token)[0].Entry.Headword loaner '卷内可按意思查到目标'
+            foreach ($scope in 'shogakukan','zh-ja') { Assert-Equal $store.ReverseLookup('河边的土地',$scope,$token).Count 0 '按词典与卷限制反查范围' }
+            foreach ($query in 'abc','123',' ','的') { Assert-Equal $store.ReverseLookup($query,'oxford',$token).Count 0 '非描述输入无反查结果' }
+            $cancel=[Threading.CancellationToken]::new($true)
+            try { $null=$store.ReverseLookup('河边的土地','oxford',$cancel); throw '反查未响应取消' }
+            catch { if ($_.Exception.GetBaseException() -isnot [OperationCanceledException]) { throw } }
+        } finally { $store.Dispose() }
+        $editor=$ctor.Invoke([object[]]@($env:E_SEARCH_DB,$false))
+        try {
+            $editor.SetDictionaryEnabled('oxford',$false)
+            Assert-Equal $editor.ReverseLookup('河边的土地','oxford',$token).Count 0 '停用后不使用旧缓存'
+            Assert-Equal ($null -eq $editor.CurrentBody($hits[0].Entry)) $true '停用后旧反查候选不能打开'
+            $editor.SetDictionaryEnabled('oxford',$true)
+            # 旧写入器会改内容散列和来源路径，却保留旧版 metadata.revision。
+            $db=[Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$env:E_SEARCH_DB")
+            try {
+                $db.Open()
+                $cmd=$db.CreateCommand()
+                $cmd.CommandText="UPDATE dictionaries SET sha256='OLD-WRITER-NEW-CONTENT' WHERE id='oxford'; UPDATE dictionary_metadata SET source_path=source_path WHERE id='oxford'; UPDATE entries SET raw='<font color=#FF5000>信贷服务</font>',gloss='信贷服务' WHERE dict='oxford' AND head='bank';"
+                [void]$cmd.ExecuteNonQuery()
+            } finally { $db.Dispose() }
+            Assert-Equal ($null -eq $editor.CurrentBody($hits[0].Entry)) $true '旧写入器换版后原始义项锚点失效'
+            Assert-Equal $editor.ReverseLookup('信贷服务','oxford',$token)[0].Entry.Headword bank '旧写入器更换正文后反查索引按散列更新'
+            $entries.bank='<font color=#FF5000>金融机构</font>'
+            Write-Mdx $source $entries
+            Invoke-Search @('import','oxford',$source) | Out-Null
+            Assert-Equal (@($editor.ReverseLookup('河边的土地','oxford',$token) | Where-Object { $_.Entry.Headword -eq 'bank' }).Count) 0 '换版后不返回旧义'
+            # 同名原书从另一目录导入时保留独立来源 ID，反查前五按可打开的不同词头计数。
+            Write-Mdx $source ([ordered]@{Shared='<font color=#FF5000>临时代用品</font><font color=#FF5000>不透水的布罩</font>'})
+            Invoke-Search @('import','oxford',$source) | Out-Null
+            $spec=$Assembly.GetType('Source').GetField('All').GetValue($null) | Where-Object Id -eq oxford
+            $copy=[IO.Path]::Combine($Scratch,[IO.Path]::GetFileName($spec.RelativePath))
+            $more=[ordered]@{shared='<font color=#FF5000>临时代用品</font><font color=#FF5000>不透水的罩子</font>'}
+            foreach ($head in 'alpha','beta','gamma','delta') { $more[$head]='<font color=#FF5000>临时代用品</font>' }
+            Write-Mdx $copy $more
+            $other=$type.GetMethod('ImportDictionary').Invoke($editor,@($copy,'en',$null,$null))
+            $editor.SaveDictionaryOrder([string[]]@('oxford',$other.Id,'shinseiki'))
+            $all=[Management.Automation.Language.NullString]::Value
+            $tied=$editor.ReverseLookup('临时代用品',$all,$token)
+            Assert-Equal (($tied | ForEach-Object {$_.Entry.Headword.ToLowerInvariant()}) -join '|') 'shared|alpha|beta|gamma|delta' '同一反查词头跨来源只占一项并补足余下名额'
+            Assert-Equal $tied[0].Entry.DictionaryId oxford '同分同词头采用用户靠前的来源'
+            $winner=$editor.ReverseLookup('不透水的罩子',$all,$token)[0].Entry
+            Assert-Equal $winner.DictionaryId $other.Id '低优先级来源的精确词义胜过同词头的较弱释义'
+            $anchor=$winner.GetType().GetProperty('Anchor',[Reflection.BindingFlags]'Instance,NonPublic').GetValue($winner)
+            Assert-Equal $editor.CurrentBody($winner).Substring($anchor.Sense.Start.Value,$anchor.Sense.End.Value-$anchor.Sense.Start.Value) '不透水的罩子' '合并后的词头保留胜出来源的第二义原书锚点'
+            Assert-Equal $editor.ReverseLookup('不透水的罩子','oxford',$token)[0].Entry.Gloss '不透水的布罩' '指定来源仍可单独打开该书的原义'
+        } finally { $editor.Dispose() }
+        if ($env:E_SEARCH_TEST_REVERSE_MODEL) { Test-ReverseModel $Scratch $Assembly }
+        Write-Output 'PASS 中文描述反查、改写、同形多义定位、卷过滤、取消及词库换版'
+    } finally { $env:E_SEARCH_DB=$prior }
+}
+
+function Test-ReverseModel([string]$Scratch,[Reflection.Assembly]$Assembly) {
+    $previous=$env:E_SEARCH_DB
+    $env:E_SEARCH_DB=Join-Path $Scratch 'reverse-vector.db'
+    $cache=[IO.Path]::Combine($Scratch,'reverse-vectors')
+    $source=Join-Path $Scratch 'vector.mdx'
+    try {
+        $entries=[ordered]@{receipt='<font color=#FF5000>收据；收条</font>'; umbrella='<font color=#FF5000>雨伞；阳伞</font>'}
+        foreach ($i in 1..68) { $entries["fixture$i"]="<font color=#FF5000>钠盐矿物样本$i</font>" }
+        Write-Mdx $source $entries
+        Invoke-Search @('import','oxford',$source) | Out-Null
+        Initialize-ReverseModelRuntime $Assembly
+        $model=$Assembly.GetType('ReverseEncoder').GetMethod('Open').Invoke($null,@($env:E_SEARCH_TEST_REVERSE_MODEL))
+        $type=$Assembly.GetType('DictionaryStore')
+        $store=$type.GetConstructor([type[]]@([string],[bool])).Invoke([object[]]@($env:E_SEARCH_DB,$true))
+        $flags=[Reflection.BindingFlags]'NonPublic,Instance'
+        $prepare=$type.GetMethod('PrepareReverseModel',$flags)
+        $ready=$type.GetMethod('HasPreparedReverseModel',$flags)
+        $lookup=$type.GetMethod('ReverseLookup',$flags)
+        $token=[Threading.CancellationToken]::None
+        try {
+            $cts=[Threading.CancellationTokenSource]::new()
+            try {
+                $cut=[Action[int,int]]{param($n,$total) if($n -gt 0 -and $n -lt $total){$cts.Cancel()}}
+                try { $null=$prepare.Invoke($store,@('oxford',$model,$cache,$cts.Token,$cut)); throw '准备没有按批次取消' }
+                catch { if ($_.Exception.GetBaseException() -isnot [OperationCanceledException]) { throw } }
+            } finally { $cts.Dispose() }
+            Assert-Equal $ready.Invoke($store,@('oxford',$model,$cache,$token)) $false '部分生成的向量不可查询'
+            $observed=[Collections.Generic.List[int]]::new()
+            $trace=[Action[int,int]]{param($n,$total) $observed.Add($n)}
+            Assert-Equal $prepare.Invoke($store,@('oxford',$model,$cache,$token,$trace)) 70 '从未完成批次恢复到完整义项数'
+            Assert-Equal ($observed.Contains(64)) $true '从磁盘已校验的第一批继续编码'
+            Assert-Equal $ready.Invoke($store,@('oxford',$model,$cache,$token)) $true '完全写入后发布当前来源的向量'
+            $wordCache=$type.GetField('reverseCache',[Reflection.BindingFlags]'Static,NonPublic').GetValue($null)
+            $wordCache.Clear()
+            $result=$lookup.Invoke($store,@('下雨的时候举着遮雨的东西','oxford',$token,$model,$cache))
+            Assert-Equal $wordCache.Count 0 '已准备的语义目录可独立冷开，无须再构建全书词片倒排'
+            Assert-Equal $result[0].Entry.Headword umbrella '真实模型按意思匹配到正确词义'
+            Assert-Equal $result[0].Entry.Gloss '雨伞；阳伞' '真实模型保持同一原书义项'
+            $used=$result[0].GetType().GetProperty('UsedSemanticIndex',[Reflection.BindingFlags]'Instance,NonPublic')
+            Assert-Equal $used.GetValue($result[0]) $true '有效索引提示真实语义检索'
+            $file=(Get-ChildItem -LiteralPath $cache -Filter '*.vec').FullName
+            # 在同一进程轮流打开两本真实可查询的词典。必须复用已校验的物理对象，仅成绩相同不足以发现重读。
+            $otherDir=[IO.Directory]::CreateDirectory((Join-Path $Scratch 'reverse-model-peer')).FullName
+            $spec=$Assembly.GetType('Source').GetField('All').GetValue($null) | Where-Object Id -eq oxford
+            $peerFile=[IO.Path]::Combine($otherDir,[IO.Path]::GetFileName($spec.RelativePath))
+            Write-Mdx $peerFile ([ordered]@{pencil='<font color=#FF5000>铅笔</font>'; knife='<font color=#FF5000>刀子</font>'})
+            $writer=$type.GetConstructor([type[]]@([string],[bool])).Invoke([object[]]@($env:E_SEARCH_DB,$false))
+            try { $peer=$type.GetMethod('ImportDictionary').Invoke($writer,@($peerFile,'en',$null,$null)) } finally { $writer.Dispose() }
+            $null=$prepare.Invoke($store,@($peer.Id,$model,$cache,$token,$null))
+            $secondFile=(Get-ChildItem -LiteralPath $cache -Filter '*.vec' | Where-Object FullName -ne $file).FullName
+            $peerJa=Join-Path $otherDir 'japanese-umbrella.mdx'
+            # 五个语义相近的动词或状态会占满向量名额；再用不同的支撑部位独立核对原书依据。
+            $jaSenses=[ordered]@{'傘'='雨伞。'; '枕'='枕头。就寝时垫头的寝具。'; '寝首'='睡首。睡着了的人的头。'
+                '横'='〔以「横になる」的形式〕睡觉，躺下。'; '寝かせる'='使睡觉，使躺下。'; '枕する'='枕着睡。以某物作枕头睡觉。'
+                '枕上'='枕头上，枕边。躺下时的枕头处。'; '敷板'='脚垫。垫桌脚用的板件。'; '揺れる'='桌子失去平衡而晃动。'
+                '置く'='放在桌脚下。'; '揺らす'='晃动桌脚。'; '傾ける'='使桌脚不平。'; '座りが悪い'='由于桌脚不平而晃动。'}
+            $jaPages=[ordered]@{}
+            foreach($key in $jaSenses.Keys) {
+                $jaPages[$key]='<ul class="ncdata-sense-wrap"><li><span>用語の定義。</span><span class="divide-imgs"></span><span>'+$jaSenses[$key]+'</span></li></ul>'
+            }
+            Write-Mdx $peerJa $jaPages
+            Invoke-Search @('import','shinseiki',$peerJa) | Out-Null
+            $both=$type.GetMethod('ReverseByLanguage',$flags).Invoke($store,@('雨伞',$null,$null,$token,$model,$cache))
+            $english=$both | Where-Object { $_.Entry.Headword -eq 'umbrella' }
+            $japanese=$both | Where-Object { $_.Entry.Headword -ceq '傘' }
+            Assert-Equal $english.GetType().GetProperty('UsedSemanticIndex',$flags).GetValue($english) $true '双语结果保留已经准备的英语语义索引'
+            Assert-Equal $japanese.GetType().GetProperty('UsedSemanticIndex',$flags).GetValue($japanese) $false '同屏日语来源可用原书词语匹配'
+            $prepareJa=$type.GetMethod('PrepareReverseLanguages',$flags)
+            $null=$prepareJa.Invoke($store,@('shinseiki',$model,$cache,$token,$null,'ja'))
+            foreach($case in @(@('放在头下睡觉的东西','枕'),@('放在桌脚下面防止晃动的东西','敷板'))) {
+                $hits=$type.GetMethod('ReverseByLanguage',$flags).Invoke($store,@($case[0],'shinseiki','ja',$token,$model,$cache))
+                $target=@($hits | Where-Object { $_.Entry.Headword -ceq $case[1] })
+                Assert-Equal $target.Count 1 "语义模型在相近动作中保留原书可证的器物 $($case[1])"
+                Assert-Equal $target[0].GetType().GetProperty('UsedSemanticIndex',$flags).GetValue($target[0]) $true '确实查询已经准备的日语模型'
+                $entry=$target[0].Entry
+                $anchor=$entry.GetType().GetProperty('Anchor',$flags).GetValue($entry).Sense
+                Assert-Equal $store.CurrentBody($entry).Substring($anchor.Start.Value,$anchor.End.Value-$anchor.Start.Value) $jaSenses[$case[1]] '空间关系命中定位到物理词条原义'
+            }
+            $static=[Reflection.BindingFlags]'Static,NonPublic'
+            $openCatalogue=$type.GetNestedType('ReverseCatalogue','NonPublic').GetMethod('Open',$static)
+            $openVectors=$type.GetNestedType('ReverseVectors','NonPublic').GetMethod('Open',$static)
+            $catalogA=$openCatalogue.Invoke($null,@($file,$token))
+            $matrixA=$openVectors.Invoke($null,@($file,512,70,$token))
+            $catalogB=$openCatalogue.Invoke($null,@($secondFile,$token))
+            $matrixB=$openVectors.Invoke($null,@($secondFile,512,2,$token))
+            Assert-Equal $catalogB.Count 2 '第二本物理词典有自己的义项目录'
+            Assert-Equal ($null -ne $matrixB) $true '第二本物理词典有可用的向量矩阵'
+            Assert-Equal ([object]::ReferenceEquals($catalogA,$openCatalogue.Invoke($null,@($file,$token)))) $true '交替反查两本书时复用第一本的已校验目录'
+            Assert-Equal ([object]::ReferenceEquals($matrixA,$openVectors.Invoke($null,@($file,512,70,$token)))) $true '交替反查两本书时复用第一本的已校验向量'
+            $bytes=[IO.File]::ReadAllBytes($file); $bytes[-1]=$bytes[-1] -bxor 0x7f
+            [IO.File]::WriteAllBytes($file,$bytes)
+            $actual=$lookup.Invoke($store,@('收据；收条','oxford',$token,$model,$cache))
+            Assert-Equal $actual[0].Entry.Headword receipt '破损索引自动回到原书释义检索'
+            Assert-Equal $used.GetValue($actual[0]) $false '回退后不再标为语义检索'
+            Assert-Equal $ready.Invoke($store,@('oxford',$model,$cache,$token)) $false '校验失败后界面可提供重新准备'
+            $null=$prepare.Invoke($store,@('oxford',$model,$cache,$token,$null))
+            $fixed=[IO.File]::ReadAllBytes($file)
+            Assert-Equal ($fixed[-1] -ne $bytes[-1]) $true '显式准备恢复损坏索引'
+            $vectorTime=[IO.File]::GetLastWriteTimeUtc($file)
+            $catalog=$file+'.catalog'
+            $saved=[IO.File]::ReadAllBytes($catalog)
+            $saved[-1]=$saved[-1] -bxor 0x40
+            [IO.File]::WriteAllBytes($catalog,$saved)
+            $actual=$lookup.Invoke($store,@('收据；收条','oxford',$token,$model,$cache))
+            Assert-Equal $used.GetValue($actual[0]) $false '损坏的义项目录不能定位模型结果'
+            Assert-Equal $ready.Invoke($store,@('oxford',$model,$cache,$token)) $false '已发现损坏的目录可重新准备'
+            $null=$prepare.Invoke($store,@('oxford',$model,$cache,$token,$null))
+            Assert-Equal ([IO.File]::GetLastWriteTimeUtc($file)) $vectorTime '单独重建义项目录保留已经完成的向量文件'
+            Assert-Equal $ready.Invoke($store,@('oxford',$model,$cache,$token)) $true '目录重新通过校验'
+            Assert-Equal ([object]::ReferenceEquals($catalogB,$openCatalogue.Invoke($null,@($secondFile,$token)))) $true '修复首本的损坏目录保留另一来源的目录'
+            Assert-Equal ([object]::ReferenceEquals($matrixB,$openVectors.Invoke($null,@($secondFile,512,2,$token)))) $true '修复首本的损坏向量保留另一来源的矩阵'
+            $entries.receipt='<font color=#FF5000>付款记录</font>'
+            Write-Mdx $source $entries
+            Invoke-Search @('import','oxford',$source) | Out-Null
+            Assert-Equal $ready.Invoke($store,@('oxford',$model,$cache,$token)) $false '词库换版必须准备新的向量'
+        } finally { $store.Dispose() }
+        Write-Output 'PASS 离线模型检索、分批取消恢复、向量完整性及新词库失效'
+    } finally { $env:E_SEARCH_DB=$previous }
+}
+
 function Test-OxfordSummary([string]$Scratch, [Reflection.Assembly]$Assembly) {
     $previous = $env:E_SEARCH_DB
     $env:E_SEARCH_DB = Join-Path $Scratch 'oxford-summary.db'
@@ -2630,11 +3385,17 @@ function Test-SentencePhrases([string]$Scratch) {
             $mark + "turn sth↔'off</SPAN><br><font color=#FF5000>关掉设备</font>"
         $stand='<span style="color:red;margin-top:15"><b>【PHR V】</b></span>' + $mark + 'stand aside</SPAN><font color=#FF5000>让开</font>'
         $forms=[ordered]@{turn=$turn;stand=$stand; 'traffic light'='信号灯'; 'look after'='照顾'; 'pick sth up'='捡起'}
+        $forms['day trip']='一日游'
+        $forms['look']='<div><b>【PHR V】</b></div>' + $mark + 'look up</SPAN><font color=#FF5000>好转</font>'
+        $forms['take']='<div><b>【PHR V】</b></div>' + $mark + "take sb∽'off</SPAN><font color=#FF5000>模仿某人</font>" +
+            $mark + "take sth∽'off</SPAN><font color=#FF5000>脱下衣服</font>"
         $forms['lift']='<div><b>【PHR V】</b></div>' + $mark + "lift sb∽'up</SPAN><font color=#FF5000>接人</font>" +
             $mark + "lift sb / sth∽'up</SPAN><font color=#FF5000>举起</font>"
         Write-Mdx $en $forms
         Invoke-Search @('import','oxford',$en) | Out-Null
         Assert-Equal (@(Invoke-Search @('query','Please stand aside.'))[0] -split "`t")[3] 'stand aside · 让开' 'SPAN 版牛津短语动词标题和 aside 小品词'
+        $quoted=@(Invoke-Search @('query','I looked up “day trip” today.'))
+        Assert-Equal (($quoted | ForEach-Object { ($_ -split "`t")[3] }) -join '|') 'day trip · 一日游' '同长的普通连续牛津小节不能覆盖或挤入独立词头结果'
         foreach ($text in 'turn the bright light off','turn it off','turned it off','turn the light off','turn the traffic light off','turn off the light') {
             $items=@(Invoke-Search @('query',"Could you $text please?"))
             Assert-Equal $items.Count 1 '可分动词只显示与宾语相符的最长义项'
@@ -2650,14 +3411,46 @@ function Test-SentencePhrases([string]$Scratch) {
         Assert-Equal (@(Invoke-Search @('query','lift it up'))[0] -split "`t")[3] 'lift it up → lift up · 举起' '双占位的物义'
         Assert-Equal @(Invoke-Search @('query','lift them up')).Count 2 '同一双占位标题同时适用人或物只出现一次'
         Assert-Equal @(Invoke-Search @('query','turn them off')).Count 2 'them 的两种对象含义均可检查'
+        foreach ($phrase in 'turn the very bright lights off','turned my two old desk lamps off','TURN  the very bright living room lights OFF',
+                 'turn off the very bright living room lights') {
+            $rows=@(Invoke-Search @('query',"Could you $phrase immediately?"))
+            Assert-Equal $rows.Count 1 "四至六词宾语的物义仅出现一次 $phrase"
+            $fields=$rows[0] -split "`t"
+            Assert-Equal $fields[2] $phrase '保留原片段的大小写和间距，排除末尾副词'
+            Assert-Equal $fields[3] "$phrase → turn off · 关掉设备" '长宾语对应真实的物义小节'
+        }
+        $coat=@(Invoke-Search @('query','take my coat off'))
+        Assert-Equal (($coat | ForEach-Object { ($_ -split "`t")[3] }) -join '|') 'take my coat off → take off · 脱下衣服|take my coat off → take off · 模仿某人' '衣物优先显示物义，另一原书标题仍可选择'
+        $paired=@(Invoke-Search @('query','Please TURN  it off and take it off.'))
+        Assert-Equal (($paired | ForEach-Object { ($_ -split "`t")[2] }) -join '|') 'TURN  it off|take it off' '同句两处等长命中保留各自原文和位置顺序'
+        $repeat=@(Invoke-Search @('query','She turned the light off and turned the fan off.'))
+        Assert-Equal (($repeat | ForEach-Object { ($_ -split "`t")[2] }) -join '|') 'turned the light off|turned the fan off' '同一模板出现在两个位置时分别保留'
+        $mixed=@(Invoke-Search @('query','We took my coat off and took the floom off.'))
+        Assert-Equal (($mixed | ForEach-Object { ($_ -split "`t")[3] }) -join '|') 'took my coat off → take off · 脱下衣服|took my coat off → take off · 模仿某人|took the floom off → take off · 模仿某人|took the floom off → take off · 脱下衣服' '每处原输入独立判定物义倾向和原书义序'
+        Assert-Equal (@(Invoke-Search @('query','turn off the light immediately'))[0] -split "`t")[2] 'turn off the light' '副词不属于后置宾语'
+        Assert-Equal (@(Invoke-Search @('query','turn off the light then the fan'))[0] -split "`t")[2] 'turn off the light' '先后两个宾语不合并为长片段'
+        Assert-Equal (@(Invoke-Search @('query','turn off the very very bright living room lights'))[0] -split "`t")[2] 'turn off' '后置宾语超出窗口时不能把前两个修饰词当作完整宾语'
+        Assert-Equal (@(Invoke-Search @('query','Turn off the light blue living room floor lamp.'))[0] -split "`t")[2] 'Turn off' '七词宾语里的 light 修饰颜色，不能截成关灯义'
+        Assert-Equal (@(Invoke-Search @('query','Turn off the light blue floor lamp.'))[0] -split "`t")[2] 'Turn off the light blue floor lamp' '五词宾语以 lamp 为中心词，保留整个颜色和物件'
         Assert-Equal (@(Invoke-Search @('query','pick it up'))[0] -split "`t")[3] 'pick it up → pick up · 捡起' '独立词头可显式标明中间宾语'
-        foreach ($text in 'look it after','turn it, off') {
+        foreach ($order in @(
+            @('Please pick it up and turn it off.','pick it up → pick up · 捡起|turn it off → turn off · 关掉设备'),
+            @('Please turn it off and pick it up.','turn it off → turn off · 关掉设备|pick it up → pick up · 捡起')
+        )) {
+            $both=@(Invoke-Search @('query',$order[0]))
+            Assert-Equal (($both | ForEach-Object { ($_ -split "`t")[3] }) -join '|') $order[1] '等长独立词头及另一处内嵌模板按原文顺序共同返回'
+        }
+        foreach ($text in 'look it after','turn it, off','turn the tall lamps but lights off','turn the tall lamps and lights off',
+                 "turn the tall lamps`noff",'turn the tall lamps. Off','turn the very very bright living room lights off') {
             Assert-Equal @(Invoke-Search @('query',$text)).Count 0 "不可分及标点禁止越界 $text"
         }
         $forms['turn the light off']='该独立表达'
         Write-Mdx $en $forms
         Invoke-Search @('import','oxford',$en) | Out-Null
-        Assert-Equal (@(Invoke-Search @('query','Please turn the light off.'))[0] -split "`t")[3] 'turn the light off · 该独立表达' '同长度时独立词头优先'
+        $same=@(Invoke-Search @('query','Please turn the light off.'))
+        Assert-Equal (($same | ForEach-Object { ($_ -split "`t")[3] }) -join '|') 'turn the light off · 该独立表达' '同位置等长独立词头优先'
+        $different=@(Invoke-Search @('query','Please turn the light off and pick it up.'))
+        Assert-Equal (($different | ForEach-Object { ($_ -split "`t")[2] }) -join '|') 'turn the light off' '全句已有更长的独立词头时仍舍弃较短片段'
         Write-Output 'PASS 英日句中最长短语、活用、原文、边界和词库筛选'
     } finally { $env:E_SEARCH_DB=$previous }
 }
@@ -2712,7 +3505,10 @@ function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly
             $title + 'run out </SPAN><br><font color=#FF5000>到期</font>' +
             $title + '<i>run</i> out (of sth) </SPAN><br>definition<br><font color=#FF5000>用完 &amp; 耗尽</font>' +
             '<br>剩余例句'
-        Write-Mdx $book ([ordered]@{run=$body})
+        $takeBody='脱下衣服 · 模仿某人<br><div><b>【PHR V】</b></div>' +
+            $title + "take <i>sb</i>∽'off</SPAN><font color=#FF5000>模仿某人</font>" +
+            $title + "take <i>sth</i>∽'off</SPAN><font color=#FF5000>脱下衣服</font>"
+        Write-Mdx $book ([ordered]@{run=$body;take=$takeBody})
         Invoke-Search @('import','oxford',$book) | Out-Null
         $ctor=$Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool]))
         $reader=$ctor.Invoke([object[]]@($env:E_SEARCH_DB,$true))
@@ -2739,6 +3535,38 @@ function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly
             Assert-Equal $view.Text.Substring($titleRange.Item1,$titleRange.Item2).Trim() 'run out (of sth)' '窗口标题高亮跨越嵌套标签'
             Assert-Equal $view.Text.Substring($senseRange.Item1,$senseRange.Item2) '用完 & 耗尽' '窗口义项高亮包含解码后的实体'
             Assert-Equal ($titleRange.Item1 -gt $view.Text.IndexOf('【PHR V】')) $true '同文只突出短语动词区对应小节'
+            # 另一来源含相同正文，只有物理序号对应的小节可以提供排版锚点。
+            $highlight=$Assembly.GetType('ESearch.SearchWindow').GetMethod('HighlightMergedPhrase',[Reflection.BindingFlags]'Static,NonPublic')
+            $article=$Assembly.GetType('MergedArticle').GetConstructor([type[]]@([string],[string],[string],[string]))
+            $prefix='<div class="es-source es-hanying"><a name="es-hanying-1"></a>'+$raw+'</div>'
+            $source='<div class="es-source es-oxford"><a name="es-oxford-1"></a>'
+            $html=$prefix+$source+$raw+'</div>'
+            $page=$article.Invoke(@('zh-en','run',$html,$null))
+            $mapped=$highlight.Invoke($null,@($page,$entry,$raw))
+            Assert-Equal $mapped.Html.StartsWith($prefix) $true '另一来源里的相同正文保持完整'
+            Assert-Equal ($mapped.Html.Contains('<mark id="es-selected-phrase"> <i>run</i> out (of sth) </mark>')) $true '排版标题保留原书嵌套格式及空白'
+            Assert-Equal ($mapped.Html.Contains('<mark data-es-sense>用完 &amp; 耗尽</mark>')) $true '选中义项的实体和原书位置正确'
+            $html=$prefix+$source+$raw.Replace('用完 &amp; 耗尽','另一个义项')+'</div>'
+            $changed=$article.Invoke(@('zh-en','run',$html,$null))
+            Assert-Equal ($null -eq $highlight.Invoke($null,@($changed,$entry,$raw))) $true '无法核对的小节交还已定位的来源原文'
+            $coat=$reader.Search('I TOOK  my coat off.','oxford',[Threading.CancellationToken]::None)
+            Assert-Equal $coat.Count 2 '可分表达的两种已收录标题均能打开'
+            $expectedTitles=@("take sth∽'off","take sb∽'off")
+            $expectedGlosses=@('脱下衣服','模仿某人')
+            for ($i=0; $i -lt $coat.Count; $i++) {
+                $hit=$coat[$i]
+                Assert-Equal $hit.Term 'TOOK  my coat off' '还原后的义项保留原输入片段'
+                $raw=$reader.CurrentBody($hit.Entry)
+                $view=$format.Invoke($null,@($raw,$property.GetValue($hit.Entry)))
+                $titleRange=$view.Anchor.Title.GetOffsetAndLength($view.Text.Length)
+                $senseRange=$view.Anchor.Sense.GetOffsetAndLength($view.Text.Length)
+                Assert-Equal $view.Text.Substring($titleRange.Item1,$titleRange.Item2).Trim() $expectedTitles[$i] '选择不同义项时标题高亮随之切换'
+                Assert-Equal $view.Text.Substring($senseRange.Item1,$senseRange.Item2) $expectedGlosses[$i] '仅高亮所选标题下的原释义'
+                Assert-Equal ($senseRange.Item1 -gt $titleRange.Item1) $true '跳过词条开头的同文重复'
+            }
+            $twice=$reader.Search('I took it off and took it off.','oxford',[Threading.CancellationToken]::None)
+            $offset=$twice[0].GetType().GetProperty('SourceOffset',[Reflection.BindingFlags]'Instance,NonPublic')
+            Assert-Equal (($twice | ForEach-Object { $offset.GetValue($_) }) -join '|') '2|18' '表面串和原书锚点完全相同的两处片段仍能区分输入偏移'
             Write-Mdx $book ([ordered]@{run='新词条'})
             Invoke-Search @('import','oxford',$book) | Out-Null
             Assert-Equal ($null -eq $reader.CurrentBody($entry)) $true '过期的正文位置不得套用在新版本'
@@ -2832,11 +3660,32 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
     $env:E_SEARCH_DB = Join-Path $Scratch 'spelling.db'
     try {
         $en = Join-Path $Scratch 'spelling.mdx'
-        Write-Mdx $en ([ordered]@{receive='收到'; study='学习'; book='书'; boot='靴'; boom='繁荣'; boon='益处'; 'ai study'='同名词条'; '6*7'='同名算式'})
+        Write-Mdx $en ([ordered]@{receive='<font color=#FF5000>收到</font>'; study='学习'; book='书'; boot='靴'; boom='繁荣'; boon='益处'; 'ai study'='同名词条'; '6*7'='同名算式'
+            environment='环境'; flat='平坦'; flit='轻快移动'; ten='十'; tin='锡'; ton='吨'; sushiX='寿司的误拼近邻'; booklet='小册子'
+            pillow='<font color=#FF5000>睡觉时垫在头下的东西</font>'; '用来查词的工具箱'='精确词头'; '反查词'='命令同名词头'
+            'pick up'='拿起来'; gripper='<font color=#FF5000>用来 pick up 东西的工具</font>'})
         Invoke-Search @('import','oxford',$en) | Out-Null
         foreach ($typo in 'recieve','receiv','receivee','receivx') {
             Assert-Equal (Invoke-Search @('query',$typo)) "oxford:1`tspelling`treceive`treceive · 收到" "拼写建议 $typo"
         }
+        foreach ($queryWord in 'enviorment','xnvironmant') {
+            $results = @(Invoke-Search @('query',$queryWord,'oxford'))
+            Assert-Equal (($results -join '|') -split "`t")[2] 'environment' "两次独立错误仍找到词头 $queryWord"
+        }
+        Assert-Equal (((@(Invoke-Search @('query','flot')) | ForEach-Object { ($_ -split "`t")[2] }) -join ',')) 'flit,flat' '同位置替换优先相邻键'
+        $ambiguous = @(Invoke-Search @('query','txn'))
+        Assert-Equal $ambiguous.Count 0 '三个字母有多个同类替换时不猜词'
+        foreach ($excluded in 'ev','envior-ment','envior9ment','envior ment',('x' * 41),'zzzzzzzzzzzz') {
+            Assert-Equal @(Invoke-Search @('query',$excluded) | Where-Object { ($_ -split "`t")[1] -eq 'spelling' }).Count 0 "不产生拼写建议 $excluded"
+        }
+        Assert-Equal @(Invoke-Search @('query','enviorment','shogakukan')).Count 0 '两步检索遵守限定来源'
+        $ja = Join-Path $Scratch 'spelling-romaji.mdx'
+        Write-Mdx $ja ([ordered]@{'すし'='@@@LINK=寿司';'寿司'='寿司'})
+        Invoke-Search @('import','shogakukan',$ja) | Out-Null
+        $bilingual=Join-Path $Scratch 'spelling-reverse-ja.mdx'
+        Write-Mdx $bilingual ([ordered]@{'受け取る'='<ul class="ncdata-sense-wrap"><li><span>手に入れる。</span><span class="divide-imgs"></span><span>收到</span></li></ul>'})
+        Invoke-Search @('import','shinseiki',$bilingual) | Out-Null
+        Assert-Equal (((@(Invoke-Search @('query','sushi'))[0]) -split "`t")[1]) 'romaji' '日语罗马字命中优先'
         $shortlist = @(Invoke-Search @('query','boop'))
         Assert-Equal $shortlist.Count 3 '最多三个拼写候选'
         Assert-Equal @($shortlist | Sort-Object -Unique).Count 3 '拼写候选互不重复'
@@ -2857,7 +3706,7 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
         $gloss = $window.FindName('GlossText')
         $choices = $window.FindName('SpellingChoices')
         $status = $window.FindName('StatusText')
-        function Wait-ModeUi([scriptblock]$Ready) {
+        function Wait-ModeUi([scriptblock]$Ready, [int]$TimeoutSeconds=6) {
             $watch = [Diagnostics.Stopwatch]::StartNew()
             do {
                 $frame = [Windows.Threading.DispatcherFrame]::new()
@@ -2865,7 +3714,7 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
                 [Windows.Threading.Dispatcher]::PushFrame($frame)
                 if (& $Ready) { return }
                 Start-Sleep -Milliseconds 10
-            } while ($watch.Elapsed.TotalSeconds -lt 6)
+            } while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds)
             throw "等待窗口状态超时：$Ready，当前释义「$($gloss.Text)」，状态「$($status.Text)」"
         }
         try {
@@ -2878,6 +3727,74 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
             $window.Show()
             Assert-Equal ($null -eq $window.FindName('MergedWebHost').Content) $true '普通旧库窗口不创建双卷浏览器'
             [Threading.SynchronizationContext]::SetSynchronizationContext([Windows.Threading.DispatcherSynchronizationContext]::new($window.Dispatcher))
+            $description='睡觉时垫在头下的东西'
+            $autoChoices=$window.FindName('ReverseChoices')
+            $autoLabel=$window.FindName('AutomaticReverseLabel')
+            $progress=@{seen=$false; filePanel=$false; status=$null; edited=$false}
+            # 小样本可能在两次绘制之间完成，直接观察可见性变化，核对实际控件而非依赖定时抽样。
+            $onLoading=[Windows.DependencyPropertyChangedEventHandler]{
+                param($label,$eventArgs)
+                if ($label.IsVisible -and $label.Text -eq '正在按意思联想…') {
+                    $progress.seen=$true
+                    $progress.filePanel=$window.FindName('FilePanel').IsVisible
+                    $progress.status=$status.Text
+                }
+            }
+            $autoLabel.add_IsVisibleChanged($onLoading)
+            try {
+                $query.Text=$description
+                Wait-ModeUi { $autoChoices.Items.Count -gt 0 }
+            } finally { $autoLabel.remove_IsVisibleChanged($onLoading) }
+            Assert-Equal $progress.seen $true '开始无前缀反查时在联想区显示等待文字'
+            Assert-Equal $progress.filePanel $true '自动联想等待期间继续展示文件区'
+            Assert-Equal $progress.status '' '自动联想等待提示独立于主状态栏'
+            Assert-Equal $autoLabel.Text '按意思联想' '结果到达后撤下等待文字'
+            Assert-Equal $autoChoices.Items[0].Hit.Entry.Headword 'pillow' '普通中文描述直接给出真实词头'
+            Assert-Equal $query.Text $description '自动联想保留原始输入'
+            Assert-Equal $window.FindName('FilePanel').IsVisible $true '普通描述仍可查文件'
+            $window.UpdateLayout()
+            $suggested=$autoChoices.ItemContainerGenerator.ContainerFromIndex(0)
+            ([Windows.Media.VisualTreeHelper]::GetChild($suggested,0)).RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+            Wait-ModeUi { $window.FindName('DetailsPanel').IsVisible -and
+                @($window.FindName('EntryText').Inlines | Where-Object { $_.Background -and $_.Text.Contains('垫在头下') }).Count -gt 0 }
+            Assert-Equal $window.FindName('CandidatePicker').SelectedItem.Hit.Entry.Headword 'pillow' '从无前缀联想打开原词条'
+            $query.Text='用来 pick up 东西的工具'
+            Wait-ModeUi { $autoChoices.Items.Count -gt 0 -and $autoChoices.Items[0].Hit.Entry.Headword -eq 'gripper' }
+            Assert-Equal $window.FindName('CandidatePicker').SelectedItem.Hit.Term 'pick up' '显示释义联想时保留句中短语'
+            Assert-Equal $window.FindName('CandidatePicker').SelectedItem.Hit.Method phrase '句中短语仍占普通查词首位'
+            $looksLike=$type.GetMethod('LooksLikeChineseDescription',[Reflection.BindingFlags]'Static,NonPublic')
+            foreach ($phrase in '显示时刻的机械','夹在书里提醒我上次读到哪一页的小片','用它测量屋内有多热','拿它可以判断朝向','保护眼睛的透明片') {
+                Assert-Equal ($looksLike.Invoke($null,@($phrase))) $true "用途或动作定语可触发释义联想 $phrase"
+            }
+            foreach ($excluded in '枕头','我整理的会议记录','上周发给同事的项目报告','北京大学的校园','用来查词的笔记.txt','D:\用来查词的东西','ext:pdf 用来查词的笔记','ai 用来查词的东西','寝るときに使うもの') {
+                Assert-Equal ($looksLike.Invoke($null,@($excluded))) $false "文件、短词和其他模式不启动中文释义反查 $excluded"
+            }
+            foreach ($word in '用来查词的工具箱','用来查词的工具') {
+                $query.Text=$word
+                $timer.Stop()
+                $refresh.Invoke($window,$null)
+                $settle=[Diagnostics.Stopwatch]::StartNew()
+                Wait-ModeUi { $settle.ElapsedMilliseconds -ge 600 }
+                if ($word.EndsWith('箱')) { Assert-Equal $gloss.Text '精确词头' '描述形词头仍精确命中' }
+                else { Assert-Equal $window.FindName('PrefixChoices').Items.Contains('用来查词的工具箱') $true '已收录的前缀仍可直接补全' }
+                Assert-Equal $autoChoices.Items.Count 0 '精确词和已收录前缀优先于按意思联想'
+            }
+            $interruptLoading=[Windows.DependencyPropertyChangedEventHandler]{
+                param($label,$eventArgs)
+                if ($label.IsVisible -and $label.Text -eq '正在按意思联想…' -and !$progress.edited) {
+                    $progress.edited=$true
+                    $query.Text='book'
+                }
+            }
+            $autoLabel.add_IsVisibleChanged($interruptLoading)
+            try {
+                $query.Text=$description
+                Wait-ModeUi { $progress.edited -and $gloss.Text -ceq '书' }
+            } finally { $autoLabel.remove_IsVisibleChanged($interruptLoading) }
+            $settle=[Diagnostics.Stopwatch]::StartNew()
+            Wait-ModeUi { $settle.ElapsedMilliseconds -ge 650 -and $gloss.Text -ceq '书' }
+            Assert-Equal $autoChoices.Items.Count 0 '快速改词丢弃上一描述的自动反查'
+            Assert-Equal $autoLabel.IsVisible $false '等待中改查普通词后收起提示，迟到的回调不会重显'
             foreach ($inputWord in 'receive','recieve') {
                 $query.Text = $inputWord
                 Assert-Equal $timer.IsEnabled $true "普通输入触发搜索 $inputWord"
@@ -2887,6 +3804,23 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
                 Wait-ModeUi { $gloss.Text -ceq $expected }
             }
             Assert-Equal $choices.Items[0].Entry.Headword 'receive' '离屏窗口给出可选的正确拼写'
+            Assert-Equal $query.Text 'recieve' '展示建议后等待用户选择，不替换原拼写'
+            $priorRevision = $type.GetField('revision',$flags).GetValue($window)
+            $window.UpdateLayout()
+            $presenter = $choices.ItemContainerGenerator.ContainerFromIndex(0)
+            $button = [Windows.Media.VisualTreeHelper]::GetChild($presenter,0)
+            $button.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+            Assert-Equal $query.Text 'receive' '点击绑定的拼写建议按钮后才替换输入'
+            $timer.Stop()
+            $refresh.Invoke($window,$null)
+            Wait-ModeUi { $gloss.Text -ceq '收到' }
+            # 模拟旧拼写请求在新结果显示后才完成，即使取消未抢先中止，界面也必须保留新结果。
+            $oldResult = $type.GetMethod('SearchDictionaryAsync',$flags).Invoke($window,
+                @('recieve',$priorRevision,[Threading.CancellationToken]::None))
+            Wait-ModeUi { $oldResult.IsCompleted }
+            [void]$oldResult.GetAwaiter().GetResult()
+            Assert-Equal $choices.Items.Count 0 '迟到的旧拼写结果不重新显示建议'
+            Assert-Equal $gloss.Text '收到' '迟到的旧请求不覆盖新输入的词义'
             foreach ($special in '6*7','ai study') {
                 $query.Text = $special
                 if ($special -eq '6*7') {
@@ -2912,6 +3846,161 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
             Wait-ModeUi { $gloss.Text -ceq '学习' }
             Assert-Equal $status.Text '' '退出 AI 后清除提示'
             Assert-Equal $window.FindName('DetailsButton').IsVisible $true '退出 AI 后恢复词条详情'
+            $query.Text='book'
+            $timer.Stop()
+            $refresh.Invoke($window,$null)
+            $prefixes=$window.FindName('PrefixChoices')
+            Wait-ModeUi { $gloss.Text -ceq '书' }
+            Assert-Equal ($null -ne $prefixes) $true '有独立的可操作词典联想区'
+            Wait-ModeUi { $prefixes.Items.Contains('booklet') }
+            Assert-Equal $query.Text 'book' '显示联想时保留精确输入'
+            Assert-Equal $choices.Items.Count 0 '词典联想与拼写建议分别展示'
+            $prefixRevision=$type.GetField('revision',$flags).GetValue($window)
+            $prefixCatalog=$type.GetField('catalogRevision',$flags).GetValue($window)
+            $window.UpdateLayout()
+            $cell=$prefixes.ItemContainerGenerator.ContainerFromItem('booklet')
+            $action=[Windows.Media.VisualTreeHelper]::GetChild($cell,0)
+            $action.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+            Assert-Equal $query.Text 'booklet' '使用联想才补全词头'
+            $timer.Stop()
+            $refresh.Invoke($window,$null)
+            Wait-ModeUi { $gloss.Text -ceq '小册子' }
+            $query.Text='反查'
+            Assert-Equal $timer.IsEnabled $false '只输入反查即进入模式并等待描述'
+            Assert-Equal ($null -eq $window.FindName('ReverseModeButton')) $true '搜索栏移除反查入口按钮'
+            foreach ($typed in '反查收到','反查 收到','反查　收到','反查英语收到') {
+                $query.Text=$typed
+                Wait-ModeUi { $window.FindName('DetailsButton').IsVisible -and $gloss.Text.Contains('receive') }
+                Assert-Equal $window.FindName('CandidatePicker').SelectedItem.Hit.Method 'reverse' "中文描述打开牛津英文候选 $typed"
+                Assert-Equal $query.Text $typed '反查保留原始描述和空白'
+            }
+            $parser=$type.GetMethod('TryReverseInput',$flags)
+            foreach ($case in @(@('反查日语　睡觉时放在头下面的东西','睡觉时放在头下面的东西','ja'),@('反查英语','', 'en'),@('反查 日语老师','日语老师',$null))) {
+                $values=[object[]]@($case[0],$null,$null)
+                Assert-Equal ($parser.Invoke($window,$values)) $true '显式反查支持指定目标语言'
+                Assert-Equal $values[1] $case[1] '保留有效的描述'
+                Assert-Equal $values[2] $case[2] '目标语言与普通描述可区分'
+            }
+            Assert-Equal $window.FindName('FilePanel').IsVisible $false '反查描述只交给词典'
+            $query.Text='反查日语收到'
+            Wait-ModeUi { $status.Text.Contains('没有匹配') }
+            Assert-Equal $window.FindName('CandidatePicker').Items.Count 0 '日语目标与只选牛津的范围取交集'
+            # 测试宿主在同一窗口更改范围并刷新，真实的查询、取消和控件绑定照常执行。
+            $scopeField=$type.GetField('dictionaryId',$flags)
+            $scopeField.SetValue($window,$null)
+            $refresh.Invoke($window,$null)
+            Wait-ModeUi { $gloss.Text.Contains('受け取る') -and $status.Text.Contains('新世纪') }
+            Assert-Equal $window.FindName('CandidatePicker').SelectedItem.Hit.Entry.Language 'ja' '指定日语命令只返回日词'
+            $query.Text='反查收到'
+            Wait-ModeUi { $status.Text.Contains('牛津') -and $status.Text.Contains('新世纪') }
+            $scopeField.SetValue($window,'oxford')
+            $refresh.Invoke($window,$null)
+            $query.Text='反查英语收到'
+            Wait-ModeUi { $gloss.Text.Contains('receive') -and $status.Text.Contains('牛津英语词典') }
+            $stale=$type.GetMethod('SearchPrefixesAsync',$flags).Invoke($window,
+                @('book','oxford',$prefixRevision,$prefixCatalog,[Threading.CancellationToken]::None))
+            Wait-ModeUi { $stale.IsCompleted }
+            [void]$stale.GetAwaiter().GetResult()
+            Assert-Equal $prefixes.Items.Count 0 '反查期间清空前缀候选'
+            $query.Text='反查 '
+            Assert-Equal $timer.IsEnabled $false '空反查在输入描述前等待'
+            Assert-Equal $window.FindName('DetailsButton').IsVisible $false '空反查撤销旧详情'
+            Assert-Equal ($status.Text.Contains('中文')) $true '提示输入中文描述'
+            $query.Text='book'
+            $composition=[Windows.Input.TextComposition]::new([Windows.Input.InputManager]::Current,$query,'')
+            $ime=[Windows.Input.TextCompositionEventArgs]::new([Windows.Input.Keyboard]::PrimaryDevice,$composition)
+            $ime.RoutedEvent=[Windows.Input.TextCompositionManager]::PreviewTextInputStartEvent
+            $query.RaiseEvent($ime)
+            $refresh.Invoke($window,$null)
+            Assert-Equal $timer.IsEnabled $false '输入法组字期间暂停查询'
+            Assert-Equal $prefixes.Items.Count 0 '组字期间清除旧联想'
+            $done=[Windows.Input.TextCompositionEventArgs]::new([Windows.Input.Keyboard]::PrimaryDevice,$composition)
+            $done.RoutedEvent=[Windows.Input.TextCompositionManager]::TextInputEvent
+            $query.RaiseEvent($done)
+            Wait-ModeUi { $prefixes.Items.Contains('booklet') }
+            foreach ($reserved in @(@('AI stu','ai study','同名词条'),@('6*','6*7','同名算式'),@('反','反查词','命令同名词头'))) {
+                $query.Text=$reserved[0]
+                $timer.Stop()
+                $refresh.Invoke($window,$null)
+                Wait-ModeUi { $prefixes.Items.Contains($reserved[1]) }
+                $window.UpdateLayout()
+                $cell=$prefixes.ItemContainerGenerator.ContainerFromItem($reserved[1])
+                $button=[Windows.Media.VisualTreeHelper]::GetChild($cell,0)
+                $button.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+                Assert-Equal ($status.Text.Contains('ChatGPT')) $false '选择已收录的 AI 词头后仍处于查词模式'
+                $timer.Stop()
+                $refresh.Invoke($window,$null)
+                Wait-ModeUi { $gloss.Text -ceq $reserved[2] }
+            }
+            $query.Text='ai study'
+            Assert-Equal ($status.Text.Contains('ChatGPT')) $true '编辑后普通 AI 前缀恢复'
+            $savedModel=$env:E_SEARCH_REVERSE_MODEL
+            try {
+                $badModel=[IO.Directory]::CreateDirectory((Join-Path $Scratch 'incomplete-local-model')).FullName
+                foreach ($name in 'model.onnx','vocab.txt') { [IO.File]::WriteAllBytes((Join-Path $badModel $name),[byte[]]@(0)) }
+                $env:E_SEARCH_REVERSE_MODEL=$badModel
+                $query.Text='反查 收到'
+                Wait-ModeUi { $gloss.Text.Contains('receive') -and $status.Text.Contains('原书词语匹配') }
+                Assert-Equal $window.FindName('ReverseModelButton').Content '选择本地模型' '模型损坏后可以重新选择目录'
+                $fallback=@(Invoke-Search @('reverse','收到','oxford') | Where-Object { $_ -match '^oxford:1\s+reverse\s+receive' })
+                Assert-Equal $fallback.Count 1 '命令行遇到不完整模型仍返回真实词义'
+            } finally { $env:E_SEARCH_REVERSE_MODEL=$savedModel }
+            if ($env:E_SEARCH_TEST_REVERSE_MODEL) {
+                $savedCache=$env:E_SEARCH_REVERSE_CACHE
+                try {
+                    $env:E_SEARCH_REVERSE_MODEL=$env:E_SEARCH_TEST_REVERSE_MODEL
+                    $env:E_SEARCH_REVERSE_CACHE=Join-Path $Scratch 'window-reverse-index'
+                    $query.Text='反查 '
+                    $query.Text='反查 收到'
+                    Wait-ModeUi { $gloss.Text.Contains('receive') -and $window.FindName('ReverseModelButton').Content -eq '准备语义索引' }
+                    $window.FindName('ReverseModelButton').RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+                    # 此处首次准备会真正建立 ONNX 本机环境，其余窗口操作继续使用短时限。
+                    Wait-ModeUi { $gloss.Text.Contains('receive') -and $status.Text.Contains('本地语义模型') } 30
+                    $modeButton=$window.FindName('ReverseModelButton')
+                    Assert-Equal $modeButton.Content '用词语匹配' '准备完成后仍可选择另一种检索方式'
+                    $modeButton.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+                    Wait-ModeUi { $gloss.Text.Contains('receive') -and $status.Text.Contains('原书词语匹配') }
+                    Assert-Equal $modeButton.Content '用语义模型' '关闭模型后可直接重新启用'
+                    $modeButton.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+                    Wait-ModeUi { $gloss.Text.Contains('receive') -and $status.Text.Contains('本地语义模型') }
+                    Assert-Equal @(Get-ChildItem -LiteralPath $env:E_SEARCH_REVERSE_CACHE -Filter '*.vec').Count 1 '窗口发布单本词典的真实向量缓存'
+                    # 相同权重使用独立模型目录，已有索引仍有效，而新编码器尚未建立推理会话。
+                    $coldDir=[IO.Directory]::CreateDirectory((Join-Path $Scratch 'window-cold-encoder')).FullName
+                    foreach ($name in 'model.onnx','vocab.txt') {
+                        [IO.File]::Copy((Join-Path $env:E_SEARCH_TEST_REVERSE_MODEL $name),(Join-Path $coldDir $name),$true)
+                    }
+                    $env:E_SEARCH_REVERSE_MODEL=$coldDir
+                    $ui=@{ notices=0; clicked=$false; label=''; hint='' }
+                    $property=[ComponentModel.DependencyPropertyDescriptor]::FromProperty([Windows.Controls.TextBlock]::TextProperty,[Windows.Controls.TextBlock])
+                    $observer=[EventHandler]{
+                        if ($status.Text -ne '正在载入本地语义模型…') { return }
+                        $ui.notices++
+                        if (!$ui.clicked) {
+                            $ui.clicked=$true; $ui.label=$modeButton.Content; $ui.hint=[string]$modeButton.ToolTip
+                            $modeButton.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+                        }
+                    }
+                    $property.AddValueChanged($status,$observer)
+                    try {
+                        $query.Text='反查 '; $query.Text='反查 收到'
+                        $timer.Stop()
+                        $original=$type.GetMethod('SearchAsync',$flags).Invoke($window,$null)
+                        Wait-ModeUi { $ui.clicked -and $original.IsCompleted -and $gloss.Text.Contains('receive') -and $status.Text.Contains('原书词语匹配') }
+                        Assert-Equal $ui.label '用词语匹配' '模型仍在载入时可立即切换'
+                        Assert-Equal $ui.hint.Contains('词语匹配') $true '操作提示对应当前的切换方式'
+                        Assert-Equal $modeButton.Content '用语义模型' '过期冷查询没有覆盖已选择的词语模式'
+                        $modeButton.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+                        Wait-ModeUi { $status.Text.Contains('按意思反查 · 本地语义模型') } 30
+                        $notices=$ui.notices
+                        $query.Text='反查 '; $query.Text='反查 收到'
+                        Wait-ModeUi { $gloss.Text.Contains('receive') -and $status.Text.Contains('按意思反查 · 本地语义模型') }
+                        Assert-Equal $ui.notices $notices '热查询不再闪现模型载入提示'
+                    } finally { $property.RemoveValueChanged($status,$observer) }
+                } finally { $env:E_SEARCH_REVERSE_CACHE=$savedCache; $env:E_SEARCH_REVERSE_MODEL=$savedModel }
+            }
+            Assert-Equal ((Invoke-Search @('prefix','book','oxford')) -contains 'booklet') $true 'CLI 可补全为真实词头'
+            Assert-Equal (((Invoke-Search @('reverse','收到','oxford')) -split "`t")[2]) 'receive' 'CLI 在所选来源按中文义项反查'
+            Write-Output 'PASS 窗口前缀候选、手动补全、独立反查和空描述'
             Write-Output 'PASS 同一离屏窗口依次查词、拼写、计算、AI、查词，两种特殊模式均通过设置刷新'
         } finally {
             $type.GetField('exiting',$flags).SetValue($window,$true)
@@ -2920,8 +4009,22 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
         }
         $ctor = $Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool]))
         $writer = $ctor.Invoke([object[]]@($env:E_SEARCH_DB,$false))
-        try { $writer.SetDictionaryEnabled('oxford',$false) } finally { $writer.Dispose() }
+        try {
+            # 常见开头可能包含大量复合词。应尝试较长的已保留片段，再决定是否放弃密集区间。
+            $connection = $writer.GetType().GetField('db',$flags).GetValue($writer)
+            $fill = $connection.CreateCommand()
+            $fill.CommandText = @'
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<500)
+INSERT INTO entries(dict,ordinal,head,gloss,raw) SELECT 'oxford',1000+i,'environa article ' || i,'密集前缀','密集前缀' FROM n;
+INSERT INTO terms SELECT dict,ordinal,0,head FROM entries WHERE dict='oxford' AND ordinal>1000;
+'@
+            try { [void]$fill.ExecuteNonQuery() } finally { $fill.Dispose() }
+            $uncancelled = [Threading.CancellationToken]::None
+            Assert-Equal ($writer.Search('xnvironmant','oxford',$uncancelled)[0].Term) 'environment' '首字母和词中各错一次，九字母前缀不匹配且七字母前缀拥挤时能查八字母区间'
+            $writer.SetDictionaryEnabled('oxford',$false)
+        } finally { $writer.Dispose() }
         Assert-Equal @(Invoke-Search @('query','recieve')).Count 0 '停用词典后不再推荐其中的单词'
+        Assert-Equal @(Invoke-Search @('query','enviorment')).Count 0 '停用词典后两步检索也无候选'
         Write-Output 'PASS 拼写建议的四种单步编辑、数量限制和精确查询优先'
     } finally { $env:E_SEARCH_DB = $previous }
 }
@@ -3022,9 +4125,17 @@ function Test-JapaneseAuxiliaries([string]$Scratch) {
             '話す' = 'はなす<br>【話す】<br>说'; '話される' = 'はなされる<br>【話される】<br>被说'
             '話されました' = 'はなされました<br>【話されました】<br>原词记录'
             '話しといた' = 'はなしといた<br>【話しといた】<br>口语原词记录'
+            '加工' = 'かこう<br>【加工】<br>加工'; '河口' = 'かこう<br>【河口】<br>河口'
+            '核' = 'かく<br>【核】<br>核'; '繰る' = 'くる<br>【繰る】<br>卷绕'
         })
         Invoke-Search @('import','shogakukan',$mdx) | Out-Null
-        foreach ($pair in @(@('食べられませんでした','食べる'), @('読んでいます','読む'), @('読んでいなかった','読む'),
+        foreach ($pair in @(@('食べたい','食べる'), @('食べろ','食べる'), @('書こう','書く'),
+                             @('読みたい','読む'), @('読め','読む'), @('食べよう','食べる'),
+                             @('勉強しろ','勉強する'), @('勉強しよう','勉強する'), @('かけ','書く'),
+                             @('きろ','着る'), @('きよう','着る'), @('きれ','切る'), @('きろう','切る'),
+                             @('くろう','繰る'),
+                             @('来たい','来る'), @('来い','来る'), @('来よう','来る'),
+                             @('タベタイ','食べる'), @('食べられませんでした','食べる'), @('読んでいます','読む'), @('読んでいなかった','読む'),
                              @('書かれました','書く'), @('書かせた','書く'),
                              @('読ませられていました','読む'), @('勉強させなかった','勉強する'), @('来られました','来る'),
                              @('ヨンデイマス','読む'), @('読んでしまった','読む'), @('書いておいた','書く'),
@@ -3050,6 +4161,12 @@ function Test-JapaneseAuxiliaries([string]$Scratch) {
         Assert-Equal @(Invoke-Search @('query','書いじゃった','shogakukan')).Count 0 '清浊音不符时不还原成書く'
         $ambiguous = @(Invoke-Search @('query','きられません','shogakukan'))
         Assert-Equal $ambiguous.Count 2 '相同读音的两个已收录原形均保留'
+        $homophones = @(Invoke-Search @('query','かこう','shogakukan') | ForEach-Object { ($_ -split "`t")[3] })
+        Assert-Equal ($homophones -join '|') '加工（かこう） · 加工|河口（かこう） · 河口' '已有同音读音维持原序，不追加意志形猜测'
+        $shortStem = @(Invoke-Search @('query','きたい','shogakukan') | ForEach-Object { (($_ -split "`t")[3] -split '（')[0] })
+        Assert-Equal ($shortStem -join '|') '着る|来る' 'きたい 只还原着る和来る，不混入切る或繰る'
+        $oldPhrase = @(Invoke-Search @('query','勉強したい','shogakukan'))
+        Assert-Equal (($oldPhrase[0] -split "`t")[1..2] -join '|') 'phrase|勉強した' '已有片段查词结果优先于新增的整词回退'
         $sentence = @(Invoke-Search @('query','本を読んでいませんでした。','shogakukan'))
         Assert-Equal (($sentence[0] -split "`t")[2]) '読んでいませんでした' '句中完整活用片段优先于较短的て形'
         $spoken = @(Invoke-Search @('query','本を読んじゃった。','shogakukan'))
@@ -3060,7 +4177,7 @@ function Test-JapaneseAuxiliaries([string]$Scratch) {
         $potentialSentence = @(Invoke-Search @('query','彼は書けませんでした。','shogakukan'))
         Assert-Equal ($potentialSentence[0].Contains('書けませんでした → 書く')) $true '句内缺少直接候选时保留可能态还原'
         Assert-Equal @(Invoke-Search @('query','飛ばされませんでした','shogakukan')).Count 0 '未收录的原形不展示'
-        Write-Output 'PASS 日语礼貌、否定、体及可能被动使役组合与句中还原'
+        Write-Output 'PASS 日语愿望、命令、意志形、同音保护及原有多步和句中还原'
     } finally { $env:E_SEARCH_DB = $savedDb }
 }
 
@@ -4379,6 +5496,84 @@ $cmd.CommandText="UPDATE dictionaries SET sha256='uncommitted' WHERE id='oxford'
     Write-Output 'PASS 跨进程旧快照、共享源、回滚保留期与中断后的源归档'
 }
 
+function Initialize-ReverseModelRuntime([Reflection.Assembly]$Assembly) {
+    $dir=[IO.Path]::GetDirectoryName($Assembly.Location)
+    $arch=[Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
+    $native=Join-Path $dir "runtimes/win-$arch/native/onnxruntime.dll"
+    if (!(Test-Path -LiteralPath $native)) { $native=Join-Path $dir 'onnxruntime.dll' }
+    $tensors=Join-Path $dir 'System.Numerics.Tensors.dll'
+    if (Test-Path -LiteralPath $tensors) { $null=[Reflection.Assembly]::LoadFrom($tensors) }
+    $ort=[Reflection.Assembly]::LoadFrom((Join-Path $dir 'Microsoft.ML.OnnxRuntime.dll'))
+    # 自定义 PowerShell 宿主不读取应用 deps.json；纯托管委托可在 GUI 工作线程调用且不依赖 PowerShell Runspace。
+    if (!('ESearchTestOrtResolver' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Reflection;
+using System.Runtime.InteropServices;
+public static class ESearchTestOrtResolver {
+    private static Assembly bound;
+    public static void Bind(Assembly assembly, string path) {
+        if (bound == assembly) return;
+        IntPtr handle = NativeLibrary.Load(path);
+        try {
+            NativeLibrary.SetDllImportResolver(assembly, (name, source, search) =>
+                name == "onnxruntime" || name == "onnxruntime.dll" ? handle : IntPtr.Zero);
+            bound = assembly;
+        } catch { NativeLibrary.Free(handle); throw; }
+    }
+}
+'@
+    }
+    [ESearchTestOrtResolver]::Bind($ort,$native)
+}
+
+function Test-ReverseEncoderReference([Reflection.Assembly]$Assembly) {
+    $path=$env:E_SEARCH_TEST_REVERSE_MODEL
+    if (!$path) { $path=$env:E_SEARCH_REVERSE_MODEL }
+    if (!$path) {
+        $path=Join-Path (Split-Path -Parent $Assembly.Location) 'models/bge-small-zh-v1.5'
+        if (!(Test-Path -LiteralPath (Join-Path $path 'model.onnx'))) { return }
+    }
+    Initialize-ReverseModelRuntime $Assembly
+    $type=$Assembly.GetType('ReverseEncoder',$true)
+    $encoder=$type.GetMethod('Open').Invoke($null,@((Resolve-Path -LiteralPath $path).Path))
+    $tokenize=$type.GetMethod('TokenIds',[Reflection.BindingFlags]'Instance,NonPublic')
+    # 独立答案来自同款 tokenizer.json、Hugging Face tokenizers 0.22.1。特殊符、大小写与全角字符保留原本的编号。
+    foreach ($case in @(
+        @('借来临时替代原件的东西','101,955,3341,707,3198,3296,807,1333,816,4638,691,6205,102'),
+        @('AI Café co-op ＡＢＣ１２３','101,100,100,8792,118,10208,100,102'),
+        @('𠀀猫，雨伞！','101,100,4344,8024,7433,835,8013,102'),
+        @("HELLO world`t123×４，图书馆。",'101,100,8572,8604,9569,9484,8024,1745,741,7667,511,102'),
+        @('[MASK] 上海','101,103,677,3862,102')
+    )) {
+        Assert-Equal ($tokenize.Invoke($encoder,@($case[0])) -join ',') $case[1] "官方词元：$($case[0])"
+    }
+    $cancel=[Threading.CancellationTokenSource]::new()
+    try {
+        $cancel.Cancel()
+        $cancelled=$false
+        try { $null=$encoder.Encode([string[]]@('已取消的查询'),$true,$cancel.Token) }
+        catch { if ($_.Exception.GetBaseException() -isnot [OperationCanceledException]) { throw }; $cancelled=$true }
+        Assert-Equal $cancelled $true '显式取消查询不会产生向量'
+    } finally { $cancel.Dispose() }
+    $vectors=@()
+    foreach ($sample in @(@('能挡住雨的随身用具',$true),@('雨伞，防雨或遮阳的便携式用具',$false),@('冰箱，用来低温保存食物的电器',$false))) {
+        $vec=$encoder.Encode([string[]]@($sample[0]),$sample[1],[Threading.CancellationToken]::None)[0]
+        Assert-Equal $vec.Length 512 'CPU 模型输出维数'
+        $sum=0.0
+        foreach ($x in $vec) { $sum += [double]$x*$x }
+        Assert-Equal ([Math]::Abs($sum-1) -lt .0001) $true '义项与查询向量均已归一'
+        $vectors+=,$vec
+    }
+    # 参考值以 Python ORT 1.23.2 的 CPU 单条推理产生。动态量化下单条与填充批次需分开比较。
+    foreach ($reference in @(@(1,.66876442),@(2,.36936132))) {
+        $dot=0.0
+        for ($i=0;$i -lt 512;$i++) { $dot += [double]$vectors[0][$i]*$vectors[$reference[0]][$i] }
+        Assert-Equal ([Math]::Abs($dot-$reference[1]) -lt .003) $true "与独立 CLS 向量参考的余弦 $($reference[1])"
+    }
+    Write-Output 'PASS 真实 BGE 分词、查询指令、512 维归一向量、官方参考余弦与显式取消'
+}
+
 function Test-EngineProbeBinding {
     # 为三个目标生成实际探针并检查编译后的导入表；当前架构另外执行一次本地 SDK 调用。
     foreach ($arch in 'X86','X64','Arm64') {
@@ -4404,15 +5599,29 @@ if ($WpfRenderDirectory) {
     if (!$WpfRenderHost) {
         $run = [IO.Directory]::CreateDirectory((Join-Path $WpfRenderDirectory ('run-' + [guid]::NewGuid().ToString('N')))).FullName
         $exe = Join-Path $PSHOME 'pwsh.exe'
-        function Start-RenderTrial($mode,$database,$variant) {
+        function Start-RenderTrial($mode,$database,$variant,$firstPage) {
             $folder = [IO.Directory]::CreateDirectory((Join-Path $run $variant)).FullName
             $hostArgs = @('-WpfRenderHost','-WpfRenderMode',$mode,'-WpfRenderDirectory',$folder,'-RealDatabase',$database)
-            if ($GuiExecutable) { $hostArgs += @('-GuiExecutable',(Resolve-Path -LiteralPath $GuiExecutable).Path) }
+            $binary=if($variant -eq 'candidate' -and $CompareGuiExecutable){$CompareGuiExecutable}else{$GuiExecutable}
+            if ($binary) { $hostArgs += @('-GuiExecutable',(Resolve-Path -LiteralPath $binary).Path) }
+            if ($firstPage -eq 'IdleGuard') { $hostArgs += '-WpfIdleGuard' }
+            elseif ($firstPage) { $hostArgs += @('-RichFirst',$firstPage) }
+            if ($RequireDetailFrames -and (!$CompareGuiExecutable -or $variant -eq 'candidate')) { $hostArgs += '-RequireDetailFrames' }
             & $exe -NoLogo -NoProfile -NonInteractive -STA -File $PSCommandPath @hostArgs
             if ($LASTEXITCODE) { throw "WPF $mode 验收失败，原始记录位于 $run" }
         }
+        if ($WpfRenderMode -eq 'Discovery') {
+            Start-RenderTrial Discovery $RealDatabase candidate
+            Write-Output "词典联想与反查的逐次窗口测量：$run"
+            return
+        }
         $variants = @('baseline')
         $databases = @{baseline=$RealDatabase}
+        if ($CompareGuiExecutable) {
+            if ($CompareIndexedDatabase -or $WpfRenderMode -ne 'Rich' -or !$GuiExecutable) { throw '对照两个程序时请指定 Rich、同一真实库、-GuiExecutable（旧）和 -CompareGuiExecutable（新）。' }
+            $variants += 'candidate'
+            $databases.candidate=$RealDatabase
+        }
         $illustrated = @{}
         if ($MergedDatabase) { $illustrated.baseline=(Resolve-Path -LiteralPath $MergedDatabase).Path }
         if ($CompareIndexedDatabase) {
@@ -4422,10 +5631,17 @@ if ($WpfRenderDirectory) {
             if (!$MergedDatabase) { $illustrated.baseline=$RealDatabase }
             $illustrated.indexed=$databases.indexed
         }
-        foreach ($variant in $variants) { Start-RenderTrial Warm $databases[$variant] $variant }
+        if ($WpfRenderMode -eq 'Rich') { foreach ($variant in $variants) { Start-RenderTrial Rich $databases[$variant] $variant IdleGuard } }
+        else { foreach ($variant in $variants) { Start-RenderTrial Warm $databases[$variant] $variant } }
         foreach ($i in 1..$WpfColdTrials) {
             $order = @($variants)
             if ($i % 2 -eq 0) { [Array]::Reverse($order) }
+            if ($WpfRenderMode -eq 'Rich') {
+                foreach ($page in $RichFirst) {
+                    foreach ($variant in $order) { Start-RenderTrial Rich $databases[$variant] $variant $page }
+                }
+                continue
+            }
             foreach ($variant in $order) {
                 Start-RenderTrial Cold $databases[$variant] $variant
                 if ($illustrated[$variant]) { Start-RenderTrial Image $illustrated[$variant] $variant }
@@ -4437,11 +5653,13 @@ if ($WpfRenderDirectory) {
                 $row | Add-Member -NotePropertyName variant -NotePropertyValue $variant -PassThru
             }
         })
-        $summary = foreach ($group in ($samples | Group-Object variant,mode)) {
-            foreach ($metric in 'firstMs','allMs','expandMs','peakWorkingSetBytes') {
+        $groupKeys = if ($WpfRenderMode -eq 'Rich') { @('variant','mode','word','scenario') } else { @('variant','mode') }
+        $summary = foreach ($group in ($samples | Group-Object -Property $groupKeys)) {
+            $metrics = @($group.Group[0].PSObject.Properties.Name | Where-Object { $_ -like '*Ms' -or $_ -like '*Bytes' })
+            foreach ($metric in $metrics) {
                 $values = @($group.Group | ForEach-Object { if ($null -ne $_.$metric) { $_.$metric } } | Sort-Object)
                 if ($values.Count) {
-                    [pscustomobject]@{ variant=$group.Group[0].variant; mode=$group.Group[0].mode; metric=$metric; n=$values.Count
+                    [pscustomobject]@{ variant=$group.Group[0].variant; mode=$group.Group[0].mode; word=$group.Group[0].word; scenario=$group.Group[0].scenario; metric=$metric; n=$values.Count
                         p50=$values[[Math]::Ceiling($values.Count*.50)-1]; p95=$values[[Math]::Ceiling($values.Count*.95)-1]
                         p99=$values[[Math]::Ceiling($values.Count*.99)-1] }
                 }
@@ -4450,10 +5668,11 @@ if ($WpfRenderDirectory) {
         $report = [ordered]@{ createdUtc=[datetime]::UtcNow; os=[Environment]::OSVersion.VersionString
             cpu=(Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0').ProcessorNameString
             logicalProcessors=[Environment]::ProcessorCount; availableMemoryBytes=[GC]::GetGCMemoryInfo().TotalAvailableMemoryBytes
-            method='WPF window in fresh STA PowerShell hosts. Input to submitted first/all preview frame, including debounce. Expansion starts at button click. OS file cache retained. Peak working set is the host only.'
-            databases=$databases; imageDatabases=$illustrated; percentiles=$summary }
+            method='Fresh STA WPF host for each cold entry. OS file cache retained; WebView profile reused within variant. Input includes debounce; detail times start at click. WPF Rendering + DwmFlush and an independent visible DOM/FCP check. A separate host checks idle/list-only behavior. Rich process I/O covers input through completed detail and uses Windows transfer bytes, not physical disk bytes. MDX snapshots bracket detail only. Peak working sets are per-process lifetime values.'
+            databases=$databases; imageDatabases=$illustrated; baselineExecutable=$GuiExecutable; comparisonExecutable=$CompareGuiExecutable; percentiles=$summary }
         $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $run 'report.json') -Encoding utf8
-        $summary | Format-Table -AutoSize
+        if ($WpfRenderMode -eq 'Rich') { $summary | Where-Object { $_.scenario -eq 'cold' -and $_.metric -in 'firstVisibleMs','expandMs' } | Format-Table -AutoSize }
+        else { $summary | Format-Table -AutoSize }
         Write-Output "WPF 原始逐次记录和汇总：$run"
         return
     }
@@ -4474,7 +5693,8 @@ if ($WpfRenderDirectory) {
         $env:WEBVIEW2_USER_DATA_FOLDER = [IO.Path]::GetFullPath((Join-Path $WpfRenderDirectory 'WebView2'))
     }
     $env:E_SEARCH_EVERYTHING_EXE = Join-Path $WpfRenderDirectory 'no-personal-engine.exe'
-    $scope = if ($WpfRenderMode -eq 'Image') { 'shinseiki' } else { [Management.Automation.Language.NullString]::Value }
+    $scope = if ($WpfRenderMode -eq 'Image') { 'shinseiki' } elseif ($WpfRenderMode -eq 'Discovery') { 'oxford' }
+        else { [Management.Automation.Language.NullString]::Value }
     $w = [ESearch.SearchWindow]::new($RealDatabase,$scope)
     $w.ShowActivated = $false
     $w.Topmost = $true
@@ -4512,6 +5732,363 @@ if ($WpfRenderDirectory) {
     }
     $rawOutput = Join-Path $WpfRenderDirectory "$WpfRenderMode-$PID.jsonl"
     $process = [Diagnostics.Process]::GetCurrentProcess()
+    if ($WpfRenderMode -eq 'Discovery') {
+        # 自定义 PowerShell 宿主先注册 DLL 位置，实际模型仍在首次反查时加载。
+        Initialize-ReverseModelRuntime $assembly
+        $prefixes=$w.FindName('PrefixChoices')
+        $reverse=$w.FindName('ReverseChoices')
+        try {
+            $w.Show()
+            Wait-RenderFrame
+            # 先定目标，再读取候选。即使目标排在第六或未入选，也要把实际名次写入报告。
+            $samples=@(@('a','apple'),@('ap','apple'),@('app','apple'),@('appl','apple'),
+                @('en','environment'),@('environm','environment'),@('dic','dictionary'),@('dictio','dictionary'))
+            foreach ($round in 1..4) {
+                foreach ($case in $samples) {
+                    $clock=[Diagnostics.Stopwatch]::StartNew()
+                    $query.Text=$case[0]
+                    do {
+                        Wait-RenderFrame
+                        $first=$prefixes.ItemContainerGenerator.ContainerFromIndex(0)
+                        if ($clock.Elapsed.TotalSeconds -gt 15) { throw "未绘出前缀联想 $($case[0])" }
+                    } while (!(Visible-Text $first))
+                    $elapsed=$clock.Elapsed.TotalMilliseconds
+                    $keys=@($prefixes.Items)
+                    $index=[Array]::IndexOf($keys,$case[1])
+                    [ordered]@{scenario='prefix';round=$round;typed=$case[0];target=$case[1];candidates=$keys
+                        rank=if($index -ge 0){1+$index};charsSaved=if($index -ge 0){$case[1].Length-$case[0].Length}else{0}
+                        visibleMs=$elapsed;appSha256=$appSha256} | ConvertTo-Json -Compress -Depth 3 | Add-Content -Encoding utf8 -LiteralPath $rawOutput
+                }
+            }
+            $query.Text='app'
+            $clock=[Diagnostics.Stopwatch]::StartNew()
+            $query.Text='反查 借来临时替代原件的东西'
+            do {
+                Wait-RenderFrame
+                if ($clock.Elapsed.TotalSeconds -gt 90) { throw "反查窗口未给出候选：$($w.FindName('StatusText').Text)" }
+            } while (!$picker.SelectedItem -or !(Visible-Text $gloss))
+            $firstMs=$clock.Elapsed.TotalMilliseconds
+            $searchMode=$w.FindName('StatusText').Text
+            Assert-Equal $picker.SelectedItem.Hit.Method 'reverse' '真实词库按意思反查'
+            Assert-Equal $prefixes.Items.Count 0 '切换反查后迟到的联想无效'
+            Assert-Equal $w.FindName('FilePanel').IsVisible $false '反查时文件列表收起'
+            $words=@($picker.Items | ForEach-Object { $_.Hit.Term })
+            # 真实点击次选，验证选择器、物理词条和正文高亮一起切换。
+            $picked=$reverse.Items[0]
+            if (!$picked) { throw '真实牛津反查缺少可供选择的第二个义项' }
+            $w.UpdateLayout()
+            $presenter=$reverse.ItemContainerGenerator.ContainerFromIndex(0)
+            $button=[Windows.Media.VisualTreeHelper]::GetChild($presenter,0)
+            $clickTimer=[Diagnostics.Stopwatch]::StartNew()
+            $button.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+            Assert-Equal $picker.SelectedItem.Hit.Term $picked.Hit.Term '点击次选直接打开该词'
+            do {
+                Wait-RenderFrame
+                $highlights=@($body.Inlines | Where-Object { $_.Background -and $_.Text.Trim() })
+                if ($clickTimer.Elapsed.TotalSeconds -gt 30) { throw '反查次选没有显示原书义项高亮' }
+            } while (!$highlights.Count -or !(Visible-Text $w.FindName('DetailScroll')))
+            $shown=($highlights | ForEach-Object Text) -join ''
+            Assert-Equal ($shown.Contains($picked.Hit.Entry.Gloss)) $true '高亮包含此候选的原书中文义项'
+            $rect=$highlights[0].ContentStart.GetCharacterRect([Windows.Documents.LogicalDirection]::Forward)
+            $scroll=$w.FindName('DetailScroll')
+            $point=$body.TranslatePoint($rect.Location,$scroll)
+            Assert-Equal ($point.Y -lt $scroll.ActualHeight -and $point.Y+$rect.Height -ge 0) $true '原书高亮已进入可见视口'
+            [ordered]@{scenario='reverse';query=$query.Text;searchMode=$searchMode;candidates=$words;opened=$picked.Hit.Term;source=$picked.Hit.Entry.DictionaryId
+                ordinal=$picked.Hit.Entry.EntryId;highlight=$shown;clickVisibleMs=$clickTimer.Elapsed.TotalMilliseconds;firstVisibleMs=$firstMs;appSha256=$appSha256} |
+                ConvertTo-Json -Compress -Depth 3 | Add-Content -Encoding utf8 -LiteralPath $rawOutput
+            Write-Output 'PASS 真实牛津窗口联想显示、反查独立选择和原书义项高亮'
+            Test-ReverseEncoderReference $assembly
+        } finally { $w.GetType().GetField('exiting',$fields).SetValue($w,$true); $w.Close() }
+        return
+    }
+    if ($WpfRenderMode -eq 'Rich') {
+        # 用 WebView2 自己的进程清单取当前环境的浏览器、渲染器、GPU 等，不计入用户其他 Edge 窗口。
+        Add-Type -Namespace ESearchBench -Name ProcessIo -MemberDefinition @'
+            [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+            public struct Counts { public ulong ReadOps, WriteOps, OtherOps, ReadBytes, WriteBytes, OtherBytes; }
+            [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+            public static extern bool GetProcessIoCounters(IntPtr handle, out Counts counts);
+'@
+        function Get-DetailProcesses {
+            $members = @(@{ id=$PID; role='WPF host' })
+            $engine = $w.FindName('MergedWebHost').Content.CoreWebView2
+            if ($engine) {
+                $members += @(foreach ($info in $engine.Environment.GetProcessInfos()) {
+                    @{ id=$info.ProcessId; role=$info.Kind.ToString() }
+                })
+            }
+            foreach ($member in $members) {
+                try { $p=[Diagnostics.Process]::GetProcessById($member.id) } catch [ArgumentException] { continue }
+                try {
+                    $io=[ESearchBench.ProcessIo+Counts]::new()
+                    $ok=[ESearchBench.ProcessIo]::GetProcessIoCounters($p.Handle,[ref]$io)
+                    [pscustomobject]@{ pid=$p.Id; role=$member.role; workingSetBytes=$p.WorkingSet64; peakWorkingSetBytes=$p.PeakWorkingSet64
+                        privateBytes=$p.PrivateMemorySize64; readBytes=if($ok){$io.ReadBytes}; writeBytes=if($ok){$io.WriteBytes} }
+                } catch [InvalidOperationException] { if (!$p.HasExited) { throw } } finally { $p.Dispose() }
+            }
+        }
+        function Assert-NoDetailBrowser([string]$scenario) {
+            Assert-Equal ($null -eq $w.FindName('MergedWebHost').Content) $true "$scenario 保持空的 WPF 宿主"
+            # 创建 WebView2 环境可能先于构造控件。按本次 STA 进程的父子关系检查，排除其他应用的 WebView。
+            $children=@(Get-CimInstance Win32_Process -Filter "ParentProcessId=$PID AND Name='msedgewebview2.exe'" -Property ProcessId)
+            Assert-Equal $children.Count 0 "$scenario 没有启动浏览器子进程"
+        }
+        # 固定词头、来源及原书序号。look 的合并页含 1179 个英辞郎小节，避免测到同名的短页。
+        $pages = @{
+            Apple=@{ word='apple'; source='oxford'; ordinal=1634; text='apple'; sections=1 }
+            Book=@{ word='book'; source='oxford'; ordinal=4241; text='book'; sections=1 }
+            Image=@{ word='あ·う'; source='shinseiki'; ordinal=24322; text='あ·う'; sections=1 }
+            Long=@{ word='look'; source='eijiro'; ordinal=842213; text='見ること'; sections=1179 }
+            Multi=@{ word='食べる'; source='sanseido'; ordinal=514232; text='食べる'; sections=3 }
+            Ink=@{ word='(用朱砂制成的墨) ink made of cinnabar'; source='hanying'; ordinal=234820; text='朱墨'; sections=1 }
+        }
+        function Invoke-DetailButton { $details.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent)) }
+        function Select-DetailPage($page) {
+            if ($w.FindName('DetailsPanel').IsVisible) { Invoke-DetailButton }
+            $inputWatch=[Diagnostics.Stopwatch]::StartNew()
+            $query.Text=$page.word
+            do {
+                Wait-RenderFrame
+                $choice=$picker.Items | Where-Object { $_.Hit.Entry.DictionaryId -ceq $page.source -and $_.Hit.Entry.EntryId -eq $page.ordinal } | Select-Object -First 1
+                if ($inputWatch.Elapsed.TotalSeconds -gt 30) { throw "候选缺少 $($page.source) #$($page.ordinal)，输入为 $($page.word)。" }
+            } while (!$choice -or !(Visible-Text $gloss))
+            $picker.SelectedItem=$choice
+            return $inputWatch.Elapsed.TotalMilliseconds
+        }
+        function Read-DetailDom($browser,[string]$javascript) {
+            $task=$browser.ExecuteScriptAsync($javascript)
+            $timeout=[Diagnostics.Stopwatch]::StartNew()
+            while (!$task.IsCompleted) {
+                Wait-RenderFrame
+                if ($timeout.Elapsed.TotalSeconds -gt 60) { throw 'WebView2 读取排版页面超时' }
+            }
+            return (ConvertFrom-Json -InputObject $task.GetAwaiter().GetResult() -NoEnumerate)
+        }
+        function Measure-DetailPage($key,$scenario) {
+            $page=$pages[$key]
+            # 在输入前收集进程快照并准备观察器。列表绘出以后，只取轻量的缓存和时钟读数，随即点击按钮。
+            $before=@(Get-DetailProcesses)
+            $oldPath=$w.FindName('MergedWebHost').Content.CoreWebView2.Source
+            $events=[Collections.Generic.List[object]]::new()
+            $stageEvent=$w.GetType().GetEvent('DetailStage',$fields)
+            $handler=[Action[long,string,long]]{ param($request,$stage,$stamp)
+                $events.Add([pscustomobject]@{ request=$request; stage=$stage; stamp=$stamp })
+            }
+            $seen=@{ textStamp=$null }
+            $observe=[EventHandler]{ param($sender,$args)
+                if ($null -eq $seen.textStamp -and $w.FindName('DetailScroll').IsVisible -and
+                    $body.IsVisible -and $body.ActualHeight -gt 0 -and $body.Text.Contains($page.text)) {
+                    $seen.textStamp=[Diagnostics.Stopwatch]::GetTimestamp()
+                }
+            }
+            $inputStamp=[Diagnostics.Stopwatch]::GetTimestamp()
+            $previewMs=Select-DetailPage $page
+            $listStamp=[Diagnostics.Stopwatch]::GetTimestamp()
+            $cacheBefore=[MdxReader]::CacheStats
+            if ($stageEvent) { $null=$stageEvent.GetAddMethod($true).Invoke($w,@($handler)) }
+            $origin=[Diagnostics.Stopwatch]::GetTimestamp()
+            $timer=[Diagnostics.Stopwatch]::StartNew()
+            $evidence=$firstBody=$allImages=$null
+            try {
+                [Windows.Media.CompositionTarget]::add_Rendering($observe)
+                Invoke-DetailButton
+                if ($RequireDetailFrames -and $oldPath) {
+                    Assert-Equal ($w.FindName('MergedDetail').IsVisible -and $w.FindName('MergedDetail').Opacity -gt 0 -and $w.FindName('MergedDetail').IsHitTestVisible) $false '新请求接管后旧页不能接收点击'
+                }
+                do {
+                    Wait-RenderFrame
+                    $browser=$w.FindName('MergedWebHost').Content.CoreWebView2
+                    $status=$w.FindName('StatusText').Text
+                    if ($timer.Elapsed.TotalSeconds -gt 75 -or $status.StartsWith('无法显示词书排版')) { throw "排版 $key 超时或失败。$status" }
+                    if (!$browser -or $browser.Source -eq $oldPath -or !$w.FindName('MergedDetail').IsVisible -or $w.FindName('MergedDetail').Opacity -lt 1 -or $w.FindName('DetailScroll').IsVisible) { continue }
+                    # 核对实际视口、当前词的原书标记和浏览器绘制记录。图片另行观测，以区分富文本首帧和全部图片完成。
+                    $evidence=Read-DetailDom $browser @"
+(() => {
+  const head=document.querySelector('[name="es-$($page.source)-$($page.ordinal)"]');
+  const article=head?.closest('.es-source'), bounds=article?.getBoundingClientRect();
+  const paint=performance.getEntriesByName('first-contentful-paint')[0];
+  if (!paint || !bounds || bounds.width<=0 || bounds.bottom<=0 || bounds.top>=innerHeight || !article.textContent.trim()) return null;
+  const images=[...document.images].filter(i=>i.src.includes('/es/'));
+  if (images.length && document.readyState==='complete' && window.esBenchDecoded===undefined) {
+    window.esBenchDecoded=false;
+    Promise.all(images.map(i=>i.decode())).then(()=>window.esBenchDecoded=true).catch(()=>window.esBenchDecoded='failed');
+  }
+  return {path:location.pathname, sections:document.querySelectorAll('.es-source').length, fcpMs:paint.startTime,
+    loaded:document.readyState==='complete', images:images.map(i=>[i.getAttribute('src'),i.naturalWidth,i.naturalHeight]),
+    decoded:!images.length || (window.esBenchDecoded===true && images.every(i=>i.complete && i.naturalWidth>0)), decodeFailed:window.esBenchDecoded==='failed'};
+})()
+"@
+                    if (!$evidence -or $evidence.sections -ne $page.sections) { continue }
+                    if ($evidence.decodeFailed) { throw "浏览器无法解码 $key 的原书图片" }
+                    if ($null -eq $firstBody) { $firstBody=$timer.Elapsed.TotalMilliseconds }
+                    if ($evidence.images.Count -and $evidence.decoded -and $null -eq $allImages) { $allImages=$timer.Elapsed.TotalMilliseconds }
+                } while (!$evidence -or $evidence.sections -ne $page.sections -or !$evidence.loaded -or !$evidence.decoded)
+                Wait-RenderFrame
+                $complete=$timer.Elapsed.TotalMilliseconds
+            } finally {
+                [Windows.Media.CompositionTarget]::remove_Rendering($observe)
+                if ($stageEvent) { $null=$stageEvent.GetRemoveMethod($true).Invoke($w,@($handler)) }
+            }
+            if ($key -eq 'Image') {
+                foreach ($n in 1,2) {
+                    $expected="es/shinseiki/img/ic_number_japanese_$n.png"
+                    Assert-Equal (@($evidence.images | Where-Object { $_[0] -ceq $expected -and $_[1] -eq 32 -and $_[2] -eq 32 }).Count -gt 0) $true "图片 $expected 完整解码"
+                }
+            }
+            $after=@(Get-DetailProcesses)
+            $cacheAfter=[MdxReader]::CacheStats
+            $timeline=[ordered]@{}
+            $clicked=$events | Where-Object stage -ceq 'click' | Select-Object -First 1
+            foreach ($step in $events) {
+                if ($step.request -ne $clicked.request) { continue }
+                $timeline[$step.stage]=[Math]::Round(($step.stamp-$origin)*1000/[Diagnostics.Stopwatch]::Frequency,3)
+            }
+            $sourceMs=if ($seen.textStamp) { ($seen.textStamp-$origin)*1000/[Diagnostics.Stopwatch]::Frequency }
+            # 只对持续存在的 PID 做差；新出现进程自启动起的 I/O 计入本次。短命子进程不会出现在快照。
+            $readBytes=$writeBytes=0L
+            foreach ($current in $after) {
+                $previous=$before | Where-Object pid -eq $current.pid | Select-Object -First 1
+                if ($null -ne $current.readBytes) { $readBytes += [long]$current.readBytes - [long]$previous.readBytes }
+                if ($null -ne $current.writeBytes) { $writeBytes += [long]$current.writeBytes - [long]$previous.writeBytes }
+            }
+            $firstVisible=if ($null -ne $sourceMs) { [Math]::Min($sourceMs,$firstBody) } else { $firstBody }
+            $row=[ordered]@{ mode='Rich'; firstPage=$RichFirst[0]; word=$page.word; scenario=$scenario; pid=$PID; appSha256=$appSha256
+                listMs=$previewMs; textFrameMs=$sourceMs; firstVisibleMs=$firstVisible
+                listToClickProbeMs=($origin-$listStamp)*1000/[Diagnostics.Stopwatch]::Frequency
+                listToFirstVisibleMs=($origin-$listStamp)*1000/[Diagnostics.Stopwatch]::Frequency+$firstVisible
+                inputToFirstVisibleMs=($origin-$inputStamp)*1000/[Diagnostics.Stopwatch]::Frequency+$firstVisible
+                bodyFrameMs=$firstBody; imagesDecodedMs=$allImages; expandMs=$complete; webViewVersion=$browser.Environment.BrowserVersionString
+                browserFcpMs=$evidence.fcpMs; sections=$evidence.sections; images=$evidence.images; stages=$timeline; events=$events
+                clickTimestamp=$origin; stopwatchFrequency=[Diagnostics.Stopwatch]::Frequency; cacheBefore=$cacheBefore; cacheAfter=$cacheAfter
+                mdxDecoded=$cacheAfter.DecodedBlocks-$cacheBefore.DecodedBlocks; mdxHits=$cacheAfter.Hits-$cacheBefore.Hits
+                processesBefore=$before; processesAfter=$after; totalWorkingSetBytes=($after | Measure-Object workingSetBytes -Sum).Sum
+                hostWorkingSetBytes=$after[0].workingSetBytes; browserWorkingSetBytes=($after | Select-Object -Skip 1 | Measure-Object workingSetBytes -Sum).Sum
+                readTransferBytes=$readBytes; writeTransferBytes=$writeBytes; ioInterval='before-input-to-completed-detail'
+                dpiScale=[Windows.Media.VisualTreeHelper]::GetDpi($w).DpiScaleX; renderTier=[Windows.Media.RenderCapability]::Tier -shr 16 }
+            foreach ($stage in 'click','source','merged','formatted','text-rendered','browser-ready','assets-ready','navigate','body-frame') {
+                $row["$stage-stageMs"]=$timeline[$stage]
+            }
+            $row | ConvertTo-Json -Compress -Depth 7 | Add-Content -Encoding utf8 -LiteralPath $rawOutput
+            if ($RequireDetailFrames) {
+                Assert-Equal ($null -ne $sourceMs -and $sourceMs -le $firstBody) $true "排版交接前已绘制 $key 的来源原文"
+                foreach ($stage in 'click','source','merged','formatted','text-rendered','browser-ready','assets-ready','navigate','body-frame') {
+                    Assert-Equal ($timeline.Contains($stage)) $true "详情请求记录阶段 $stage"
+                }
+            }
+        }
+        function Test-DetailLink($key,$selector,$targetAnchor,[switch]$Fragment) {
+            $browser=$w.FindName('MergedWebHost').Content.CoreWebView2
+            $path=$browser.Source
+            $point=Read-DetailDom $browser "(()=>{let a=document.querySelector('$selector'); if (!a) return null; a.scrollIntoView({block:'center'}); const r=a.getBoundingClientRect(); return [r.x+2,r.y+2]})()"
+            if (!$point) { throw "$key 缺少已知的来源链接 $selector" }
+            $timer=[Diagnostics.Stopwatch]::StartNew()
+            foreach ($kind in 'mousePressed','mouseReleased') {
+                $json=@{type=$kind;x=$point[0];y=$point[1];button='left';clickCount=1}|ConvertTo-Json -Compress
+                $task=$browser.CallDevToolsProtocolMethodAsync('Input.dispatchMouseEvent',$json)
+                while (!$task.IsCompleted -and $timer.Elapsed.TotalSeconds -lt 10) { Wait-RenderFrame }
+                if (!$task.IsCompleted) { throw "$key 的鼠标点击超时" }
+                $null=$task.GetAwaiter().GetResult()
+            }
+            do {
+                Wait-RenderFrame
+                if ($timer.Elapsed.TotalSeconds -gt 30) { throw "$key 跳转未到达 $targetAnchor，当前页面 $($browser.Source)" }
+                $landed=Read-DetailDom $browser "(()=>{let a=document.getElementById('$targetAnchor')||document.getElementsByName('$targetAnchor')[0]; if (!a || !performance.getEntriesByName('first-contentful-paint').length) return null; let r=a.getBoundingClientRect(); return {hash:location.hash,top:r.top,bottom:r.bottom,height:innerHeight}})()"
+                # WebView2 可能先绘出目标页；还须等 WPF 提交历史并启用返回按钮。
+            } while (!$landed -or $browser.Source -eq $path -or !$w.FindName('MergedDetail').IsHitTestVisible -or !$w.FindName('MergedBack').IsVisible -or $w.FindName('MergedDetail').Opacity -lt 1 -or $w.FindName('DetailScroll').IsVisible)
+            if ($Fragment) {
+                Assert-Equal $landed.hash "#$targetAnchor" '原书链接保留正确的子项片段'
+                Assert-Equal ($landed.top -lt $landed.height -and $landed.bottom -ge 0) $true '目标子项已经滚入视口'
+            }
+            [ordered]@{mode='Rich'; firstPage=$RichFirst[0]; word=$pages[$key].word; scenario='follow-link'; pid=$PID;
+                anchorReadyMs=$timer.Elapsed.TotalMilliseconds; target=$targetAnchor; landing=$landed; appSha256=$appSha256} |
+                ConvertTo-Json -Compress -Depth 4 | Add-Content -Encoding utf8 -LiteralPath $rawOutput
+            $w.FindName('MergedBack').RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+            $timer.Restart()
+            do {
+                Wait-RenderFrame
+                if ($timer.Elapsed.TotalSeconds -gt 30) { throw "$key 返回后未显示原文" }
+            } while (!$w.FindName('MergedDetail').IsHitTestVisible -or $w.FindName('MergedDetail').Opacity -lt 1 -or $w.FindName('DetailScroll').IsVisible -or !(Read-DetailDom $browser "!!document.querySelector('$selector') && performance.getEntriesByName('first-contentful-paint').length>0"))
+        }
+        try {
+            $w.Show()
+            Wait-RenderFrame
+            if ($WpfIdleGuard) {
+                # WMI 首查通常花数百毫秒。在单独的冷进程验隐藏和纯查询，避免探针推迟计时试验的第一次点击。
+                $w.Hide()
+                $idle=[Diagnostics.Stopwatch]::StartNew()
+                do { [void]$w.Dispatcher.Invoke([Action]{},[Windows.Threading.DispatcherPriority]::ApplicationIdle); Start-Sleep -Milliseconds 10 } while ($idle.ElapsedMilliseconds -lt 250)
+                Assert-NoDetailBrowser '隐藏浮窗静置'
+                $w.Show()
+                Wait-RenderFrame
+                $null=Select-DetailPage $pages.Apple
+                Assert-NoDetailBrowser '只查询列表'
+                Write-Output 'PASS 隐藏静置与只查列表均没有启动 WebView2'
+                return
+            }
+            $firstKey=$RichFirst[0]
+            Measure-DetailPage $firstKey 'cold'
+            Measure-DetailPage $firstKey 'reopen'
+            $same=@{Apple='Book'; Image='Multi'; Long='Image'; Multi='Image'}[$firstKey]
+            $cross=if($firstKey -eq 'Apple'){'Image'}else{'Apple'}
+            Measure-DetailPage $same 'prime-same-volume'
+            Measure-DetailPage $firstKey 'same-volume'
+            Measure-DetailPage $cross 'prime-cross-volume'
+            Measure-DetailPage $firstKey 'cross-volume'
+            if ($firstKey -eq 'Multi') {
+                Measure-DetailPage Multi 'link-origin'
+                Test-DetailLink Multi '.es-shinseiki a[href*="/lookup/esref-shinseiki-"]' 'es-shinseiki-137265'
+                Measure-DetailPage Ink 'link-origin'
+                Test-DetailLink Ink 'a[href*="#es-hanying-180023-subEntry1"]' 'es-hanying-180023-subEntry1' -Fragment
+                if ($RequireDetailFrames) {
+                    $null=Select-DetailPage @{word='She turned the radio off and turned the fan off.'; source='oxford'; ordinal=39100}
+                    $labels=@($picker.Items | Where-Object { $_.Hit.Entry.DictionaryId -eq 'oxford' } | ForEach-Object Label)
+                    Assert-Equal $labels.Count 2 '同一父条目同一义项在输入中出现两次'
+                    Assert-Equal ($labels[0].Contains('turned the radio off') -and $labels[1].Contains('turned the fan off')) $true '详情选择器按输入位置区分两次出现的短语'
+                    Assert-Equal (@($other.Items | Where-Object { $_.Contains('turned the fan off') }).Count) 1 '结果预览显示第二处原始片段'
+                    $null=Select-DetailPage @{word='I took it off and took it off.'; source='oxford'; ordinal=37162}
+                    $labels=@($picker.Items | Where-Object { $_.Hit.Entry.DictionaryId -eq 'oxford' } | ForEach-Object Label)
+                    Assert-Equal @($labels | Sort-Object -Unique).Count 2 '两个表面串和义项完全相同也能按出现位置选择'
+                    $null=Select-DetailPage @{word='Turn them off.'; source='oxford'; ordinal=39100}
+                    $choices=@($picker.Items | Where-Object { $_.Hit.Entry.DictionaryId -eq 'oxford' })
+                    Assert-Equal $choices.Count 2 'turn them off 的两种原书义项均可打开'
+                    $browser=$w.FindName('MergedWebHost').Content.CoreWebView2
+                    foreach ($meaning in '使厌烦','关掉') {
+                        $previousPage=$browser.Source
+                        $picker.SelectedItem=$choices | Where-Object { $_.Hit.Entry.Gloss.StartsWith($meaning) } | Select-Object -First 1
+                        if (!$w.FindName('DetailsPanel').IsVisible) { Invoke-DetailButton }
+                        $limit=[Diagnostics.Stopwatch]::StartNew()
+                        do {
+                            Wait-RenderFrame
+                            if ($limit.Elapsed.TotalSeconds -gt 20) { throw "牛津义项排版页未出现：$meaning" }
+                        } while ($browser.Source -eq $previousPage -or $w.FindName('DetailScroll').IsVisible)
+                        $at=Read-DetailDom $browser "(()=>{const a=document.querySelector('.es-oxford mark[id]'),b=document.querySelector('.es-oxford mark[data-es-sense]');if(!a||!b)return null;const r=a.getBoundingClientRect();return {title:a.innerText,sense:b.innerText,visible:r.bottom>0&&r.top<innerHeight,hash:location.hash===('#'+a.id)}})()"
+                        Assert-Equal ($at.visible -and $at.hash) $true "合并页视口定位至所选牛津小标题：$meaning"
+                        $slot=if ($meaning -eq '使厌烦') { 'sb' } else { 'sth' }
+                        Assert-Equal ($at.title.Contains($slot)) $true "排版页所选原书小标题包含 $slot"
+                        Assert-Equal ($at.sense.Contains($meaning)) $true "点击打开所选原书义项：$meaning"
+                        [ordered]@{scenario='oxford-sense'; query='Turn them off.'; expected=$meaning; landing=$at; appSha256=$appSha256} |
+                            ConvertTo-Json -Compress -Depth 3 | Add-Content -Encoding utf8 -LiteralPath $rawOutput
+                    }
+                    Write-Output 'PASS 真实窗口分别显示重复短语的原文位置，两个牛津义项均在视口内高亮'
+                }
+            }
+            if ($RequireDetailFrames) {
+                # 在长页尚未完成时切词，再立即收起新请求；给迟到的任务机会提交，核对真实控件仍保持新状态。
+                $null=Select-DetailPage $pages.Long
+                Invoke-DetailButton
+                $query.Text=$pages.Apple.word
+                Measure-DetailPage Apple 'interrupted-switch'
+                $null=Select-DetailPage $pages.Long
+                Invoke-DetailButton
+                Invoke-DetailButton
+                $settle=[Diagnostics.Stopwatch]::StartNew()
+                do { Wait-RenderFrame } while ($settle.ElapsedMilliseconds -lt 500)
+                Assert-Equal $w.FindName('DetailsPanel').IsVisible $false '收起后迟到请求不能恢复详情面板'
+                Assert-Equal $body.Text '' '收起后迟到请求不能回写旧原文'
+            }
+        } finally { $w.GetType().GetField('exiting',$fields).SetValue($w,$true); $w.Close() }
+        return
+    }
     try {
         $w.Show()
         Wait-RenderFrame
@@ -4545,14 +6122,21 @@ if ($WpfRenderDirectory) {
                 if ($watch.Elapsed.TotalSeconds -gt 45) { throw "查询 $word 未绘制：$($w.FindName('StatusText').Text)" }
             } while ($null -eq $all)
             if ($WpfRenderMode -ne 'Warm') {
+                $sourceFrame = @{ seen=$false }
+                $inspectSource = {
+                    if ($w.FindName('DetailScroll').IsVisible -and $body.Text.Trim() -and $body.Text -ne '正在读取词条…' -and !$body.Text.StartsWith('正文读取失败')) {
+                        $sourceFrame.seen = $true
+                    }
+                }
                 $watch.Restart()
                 $details.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
                 $ready=$false
                 do {
-                    Wait-RenderFrame
+                    Wait-RenderFrame $inspectSource
                     $status = $w.FindName('StatusText').Text
                     if ($watch.Elapsed.TotalSeconds -gt 60 -or $status.StartsWith('无法显示词书排版')) { throw "展开 $word 失败或超时：$status" }
-                    if ($WpfRenderMode -eq 'Image' -or $w.FindName('MergedDetail').IsVisible) {
+                    if ($RequireDetailFrames -or $WpfRenderMode -eq 'Image' -or $w.FindName('MergedDetail').IsVisible) {
+                        if (!$w.FindName('MergedDetail').IsVisible -or $w.FindName('MergedDetail').Opacity -lt 1 -or $w.FindName('DetailScroll').IsVisible) { continue }
                         $web = $w.FindName('MergedWebHost').Content
                         if (!$web -or !$web.CoreWebView2) { continue }
                         $script = if ($WpfRenderMode -eq 'Image') {
@@ -4571,6 +6155,9 @@ if ($WpfRenderDirectory) {
                 } while (!$ready)
                 Wait-RenderFrame
                 $expand = $watch.Elapsed.TotalMilliseconds
+                if ($RequireDetailFrames -and $renderer -eq 'WebView2') {
+                    Assert-Equal $sourceFrame.seen $true '排版交接前至少一帧可见来源原文'
+                }
                 if ($WpfRenderMode -eq 'Image') {
                     foreach ($number in 1,2) {
                         $expected = "es/shinseiki/img/ic_number_japanese_$number.png"
@@ -4610,6 +6197,7 @@ if ($BackendTestDirectory -or $IndexedMdxTestDirectory) {
     }
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
     if ($IndexedMdxTestDirectory) { Test-IndexedMdx $IndexedMdxTestDirectory $assembly; Test-ReleaseDataLocation -Indexed; return }
+    Test-ReverseEncoderReference $assembly
     Test-IndexedMdx $BackendTestDirectory $assembly
     Test-Calculation $assembly
     Test-LookupAudit $BackendTestDirectory $assembly
@@ -4643,8 +6231,11 @@ if ($BackendTestDirectory -or $IndexedMdxTestDirectory) {
     Test-WindowsImportPaths $BackendTestDirectory $assembly
     Test-AdditionalDictionaries $BackendTestDirectory $assembly
     Test-EverythingRecovery $BackendTestDirectory $assembly
+    Test-FileRefind $BackendTestDirectory $assembly
+    Test-FileNameCompletions $BackendTestDirectory $assembly
     Test-SanseidoSummary $BackendTestDirectory $assembly
     Test-OxfordSummary $BackendTestDirectory $assembly
+    Test-ReverseLookup $BackendTestDirectory $assembly
     Test-AuditedRomaji $BackendTestDirectory
     Test-JapaneseAuxiliaries $BackendTestDirectory
     Test-ShogakukanContinuation $BackendTestDirectory $assembly
@@ -4662,6 +6253,8 @@ if ($BackendTestDirectory -or $IndexedMdxTestDirectory) {
     Test-CliAccess $BackendTestDirectory
     Test-ReleaseDataLocation -Indexed
     Test-RunningCancellation $assembly
+    Test-FileDisplayPaths $assembly
+    Test-FileDisplayLayout $assembly $BackendTestDirectory
     Test-QuickLookPipe $assembly
     Test-EngineProbeBinding
     if ($PrepareDesktop) { Initialize-DesktopDatabases $BackendTestDirectory $assembly $RealDatabase }
@@ -4911,8 +6504,9 @@ finally {
 if ($OutOfOrder) {
     if (!$GuiExecutable -or !$RealDatabase) { throw '乱序验收需要指定 -GuiExecutable 和 -RealDatabase' }
     $assemblyDir = Split-Path (Resolve-Path -LiteralPath $GuiExecutable).Path
-    $probe = Join-Path $PSScriptRoot '.data/regressions/apple-stage5-乱序.txt'
-    if (!(Test-Path -LiteralPath $probe)) { [IO.File]::WriteAllText($probe, '第五阶段异步查询探针') }
+    $fixtureParent = if ($FileFixtureRoot) { $FileFixtureRoot } else { Join-Path $PSScriptRoot '.data/regressions' }
+    $fixture = [IO.Directory]::CreateDirectory((Join-Path $fixtureParent ('panes-'+[Guid]::NewGuid().ToString('N')))).FullName
+    foreach ($name in 'taberu','apple') { [IO.File]::WriteAllText((Join-Path $fixture $name),'文件区独立提交验收') }
     $oldBase = [AppContext]::BaseDirectory
     $oldContext = [Threading.SynchronizationContext]::Current
     $window = $null
@@ -4927,19 +6521,14 @@ public sealed class HeldSearchCallbacks : SynchronizationContext {
     public override void Post(SendOrPostCallback callback, object state) =>
         pending.Add(() => callback(state));
     public int Pending => pending.Count;
-    public void Complete(Task search) {
-        var deadline = DateTime.UtcNow.AddSeconds(10);
-        SetSynchronizationContext(this);
-        while (!search.IsCompleted && DateTime.UtcNow < deadline)
-            if (pending.TryTake(out var callback, 50)) callback();
-        if (!search.IsCompleted) throw new TimeoutException("搜索回调未完成");
-        search.GetAwaiter().GetResult();
+    public void RunOne() {
+        if (pending.TryTake(out var callback, 10)) callback();
     }
 }
 '@
     try {
         [AppContext]::SetData('APP_CONTEXT_BASE_DIRECTORY', $assemblyDir)
-        foreach ($library in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search') {
+        foreach ($library in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','Microsoft.Web.WebView2.Core','Microsoft.Web.WebView2.Wpf','E_Search') {
             [void][Reflection.Assembly]::LoadFrom((Join-Path $assemblyDir "$library.dll"))
         }
         [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
@@ -4955,41 +6544,115 @@ public sealed class HeldSearchCallbacks : SynchronizationContext {
         $query = $window.FindName('QueryBox')
         $gloss = $window.FindName('GlossText')
         $list = $window.FindName('FileList')
-        $search = $window.GetType().GetMethod('SearchAsync', [Reflection.BindingFlags]'Instance,NonPublic')
-        # 在同一应用实例中确认两个真后端都可用；一个进程内的 SDK 查询状态由应用独占。
+        $flags = [Reflection.BindingFlags]'Instance,NonPublic'
+        $type = $window.GetType()
+        $search = $type.GetMethod('SearchAsync', $flags)
+        $debounce = $type.GetField('debounce',$flags).GetValue($window)
+        function Set-PaneInput([string]$text) { $query.Text=$text; $debounce.Stop() }
+        function Complete-Held($queue, $task) {
+            $watch=[Diagnostics.Stopwatch]::StartNew()
+            # 词典联想还会让出 WPF 的 Background 队列。只释放指定的后端回调，正常派发这一轮界面任务。
+            while (!$task.IsCompleted -and $watch.Elapsed.TotalSeconds -lt 15) {
+                [Threading.SynchronizationContext]::SetSynchronizationContext($queue)
+                $queue.RunOne()
+                $frame=[Windows.Threading.DispatcherFrame]::new()
+                [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::ApplicationIdle,[Action]{ $frame.Continue=$false })
+                [Windows.Threading.Dispatcher]::PushFrame($frame)
+            }
+            if (!$task.IsCompleted) { throw '等待指定区回调超时' }
+            $task.GetAwaiter().GetResult() | Out-Null
+        }
+        # 按完整路径确认自己的两个样本均进入索引，随后核对同一次正常查询得到日文词条和正确文件。
         $ready = [HeldSearchCallbacks]::new()
         $timer = [Diagnostics.Stopwatch]::StartNew()
-        do {
-            $query.Text = 'apple'
+        foreach ($name in 'apple','taberu') {
+            do {
+                Set-PaneInput $name
+                [Threading.SynchronizationContext]::SetSynchronizationContext($ready)
+                Complete-Held $ready ($search.Invoke($window, $null))
+                if ((Join-Path $fixture $name) -in $list.Items.FullPath) { break }
+                if ($timer.Elapsed.TotalSeconds -gt 40) { throw "专用 $name 未进入索引，请用 -FileFixtureRoot 指定已索引目录" }
+                Start-Sleep -Milliseconds 100
+            } while ($true)
+        }
+        Assert-Equal $gloss.Text '食べる（たべる） · 吃' '同次 taberu 查询呈现真实日语词条和受控文件'
+        Write-Output 'PASS taberu 同时命中隔离词典与专用文件'
+
+        $dictionary=$type.GetMethod('SearchCatalogAsync',$flags)
+        $files=$type.GetMethod('SearchFilesAsync',$flags)
+        foreach ($late in '词典','文件') {
+            Set-PaneInput ''
+            Set-PaneInput 'taberu'
+            $arguments=@('taberu',$type.GetField('revision',$flags).GetValue($window),[Threading.CancellationToken]::None)
+            $dictQueue=[HeldSearchCallbacks]::new()
+            $fileQueue=[HeldSearchCallbacks]::new()
+            [Threading.SynchronizationContext]::SetSynchronizationContext($dictQueue)
+            $dictTask=$dictionary.Invoke($window,$arguments)
+            [Threading.SynchronizationContext]::SetSynchronizationContext($fileQueue)
+            $fileTask=$files.Invoke($window,$arguments)
+            if ($late -eq '词典') {
+                Complete-Held $fileQueue $fileTask
+                Assert-Equal ((Join-Path $fixture 'taberu') -in $list.Items.FullPath) $true '词典延迟时文件区先提交'
+                Assert-Equal $gloss.Text '' '尚未释放词典回调'
+                Complete-Held $dictQueue $dictTask
+            } else {
+                Complete-Held $dictQueue $dictTask
+                Assert-Equal $gloss.Text '食べる（たべる） · 吃' '文件延迟时词典区先提交'
+                Assert-Equal $list.Items.Count 0 '尚未释放文件回调'
+                Complete-Held $fileQueue $fileTask
+            }
+            Assert-Equal ((Join-Path $fixture 'taberu') -in $list.Items.FullPath) $true '迟到文件回调保留正确路径'
+            Assert-Equal $gloss.Text '食べる（たべる） · 吃' '迟到词典回调保留正确释义'
+            Write-Output "PASS ${late}区延迟时另一区先提交，释放后两区均正确"
+        }
+        # 故障仅作用于这个窗口。缺失的只读词库和不能启动的文件工作进程各自走真实错误处理。
+        $dbField=$type.GetField('databasePath',$flags)
+        $knownDb=$dbField.GetValue($window)
+        $fileField=$type.GetField('everything',$flags)
+        $knownFiles=$fileField.GetValue($window)
+        try {
+            Set-PaneInput 'apple'
+            $dbField.SetValue($window,(Join-Path $fixture 'absent.db'))
             [Threading.SynchronizationContext]::SetSynchronizationContext($ready)
-            $ready.Complete($search.Invoke($window, $null))
-            if ($list.SelectedItem -and $gloss.Text -eq '苹果') { break }
-            if ($timer.Elapsed.TotalSeconds -gt 15) { throw '请检查验收索引中 apple 探针及四库数据' }
-            Start-Sleep -Milliseconds 100
-        } while ($true)
+            Complete-Held $ready ($search.Invoke($window,$null))
+            Assert-Equal ($window.FindName('StatusText').Text.StartsWith('词库读取失败')) $true '文件区提交时保留词库错误说明'
+            Assert-Equal ((Join-Path $fixture 'apple') -in $list.Items.FullPath) $true '词库读取失败仍可查文件'
+            $dbField.SetValue($window,$knownDb)
+            Set-PaneInput 'taberu'
+            $brokenCommand=[Diagnostics.ProcessStartInfo]::new((Join-Path $fixture 'absent-worker.exe'))
+            $ctor=$knownFiles.GetType().GetConstructor($flags,$null,[type[]]@([Diagnostics.ProcessStartInfo],[TimeSpan]),$null)
+            $fileField.SetValue($window,$ctor.Invoke(@($brokenCommand,[TimeSpan]::FromSeconds(2))))
+            [Threading.SynchronizationContext]::SetSynchronizationContext($ready)
+            Complete-Held $ready ($search.Invoke($window,$null))
+            Assert-Equal $gloss.Text '食べる（たべる） · 吃' '文件查询失败仍可查词'
+            Assert-Equal ($list.Items.Count -eq 0 -and $window.FindName('FileStatusText').Text.Length -gt 0) $true '文件错误只显示在文件区'
+            Write-Output 'PASS 任一后端报错，另一区仍正常提交'
+        } finally { $dbField.SetValue($window,$knownDb); $fileField.SetValue($window,$knownFiles) }
         $old = [HeldSearchCallbacks]::new()
         $new = [HeldSearchCallbacks]::new()
-        $query.Text = 'taberu'
+        Set-PaneInput ''
+        Set-PaneInput 'taberu'
         [Threading.SynchronizationContext]::SetSynchronizationContext($old)
         $a = $search.Invoke($window, $null)
         $timer = [Diagnostics.Stopwatch]::StartNew()
         while ($old.Pending -lt 2 -and $timer.Elapsed.TotalSeconds -lt 10) { [Threading.Thread]::Sleep(5) }
         if ($old.Pending -lt 2) { throw '未截获 A 的词典和文件回调' }
-        $query.Text = 'apple'
+        Set-PaneInput 'apple'
         [Threading.SynchronizationContext]::SetSynchronizationContext($new)
         $b = $search.Invoke($window, $null)
-        $new.Complete($b)
+        Complete-Held $new $b
         Assert-Equal $gloss.Text '苹果' 'B 先回显牛津释义'
         $bFile = $list.SelectedItem.FullPath
         $bPaths = @($list.Items | ForEach-Object FullPath) -join "`n"
         if (!$bFile -or [IO.Path]::GetFileName($bFile) -notlike '*apple*') {
             throw "B 未返回 apple 探针，选择「$bFile」，文件状态「$($window.FindName('FileStatusText').Text)」"
         }
-        $old.Complete($a)
+        Complete-Held $old $a
         Assert-Equal $gloss.Text '苹果' '较晚返回的 A 没有覆盖 B 的释义'
         Assert-Equal $list.SelectedItem.FullPath $bFile '较晚返回的 A 没有覆盖 B 的选择'
         Assert-Equal (@($list.Items | ForEach-Object FullPath) -join "`n") $bPaths '较晚返回的 A 没有覆盖 B 的文件列表'
-        Write-Output "PASS 两个 taberu 回调均已就绪并延迟到 apple 提交之后，最终释义为苹果，选中 $bFile"
+        Assert-Equal ((Join-Path $fixture 'apple') -in $list.Items.FullPath) $true '快速改词后保留受控 apple 文件'
+        Write-Output 'PASS 两个 taberu 回调延迟到 apple 提交后释放，最终释义、文件列表和选择均属于 apple'
     } finally {
         [Threading.SynchronizationContext]::SetSynchronizationContext($oldContext)
         if ($window) { $window.Hide() }

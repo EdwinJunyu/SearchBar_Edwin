@@ -152,7 +152,7 @@ internal static partial class EntryParser
     [GeneratedRegex(@"(?:^|>)\s*(?:\)\s*)?(?:=|(?:--›\s*)?see\b|(?<form>pt\s*(?:,|and|/)\s*pp|pt|pp|pl\.?|plural|past tense|past participle)\s+of\b)\s*(?:<b\s*>\s*)?<a\s+href\s*=\s*[""']entry://(?<word>[a-z]+(?:[ '\-][a-z]+)*)[""']", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex OxfordReference();
 
-    private static IEnumerable<(string Part, string Gloss, Range RawSpan)> OxfordSenses(string body)
+    internal static IEnumerable<(string Part, string Gloss, Range RawSpan)> OxfordSenses(string body)
     {
         int divDepth = 0, noteDepth = 0, fontDepth = 0, start = 0, formsEnd = 0;
         string part = "";
@@ -195,6 +195,48 @@ internal static partial class EntryParser
             }
         }
     }
+
+    internal static IEnumerable<(string Gloss, Range Span, string Examples, string Definition)> OxfordReverseSenses(string body)
+    {
+        // 例句的中文译文只支持它紧随的主词义；进入习语、短语、用法说明后停止采样。
+        var senses = OxfordSenses(body).ToArray();
+        for (int i = 0; i < senses.Length; i++)
+        {
+            var (_, gloss, span) = senses[i];
+            int start = span.End.Value;
+            int end = i + 1 < senses.Length ? senses[i + 1].RawSpan.Start.Value : body.Length;
+            var boundary = OxfordReferenceBoundary().Match(body,start,end-start);
+            if (boundary.Success) end = boundary.Index;
+            var samples = new List<string>(2);
+            var example = OxfordExampleTranslation().Match(body,start,end-start);
+            while (example.Success && samples.Count < 2)
+            {
+                samples.Add(Plain(example.Groups["sample"].Value));
+                example = example.NextMatch();
+            }
+            // 原书把英文定义放在对应的橙色译义之前。取最后一个非空排版行，不把上一义的例句用作定义。
+            int open = body.LastIndexOf('<',span.Start.Value-1);
+            int lower = Math.Max(i == 0 ? 0 : senses[i-1].RawSpan.End.Value,open-1800);
+            string definition = "";
+            if (open > lower)
+            {
+                var lines = OxfordLineBreak().Split(body[lower..open]);
+                for (int line = lines.Length-1; line >= 0 && definition.Length == 0; line--)
+                {
+                    if (lines[line].Contains("color:#039",StringComparison.OrdinalIgnoreCase)
+                        || lines[line].Contains("color:#04F",StringComparison.OrdinalIgnoreCase)) break;
+                    definition = Plain(lines[line]);
+                }
+            }
+            yield return (gloss,span,string.Join(" ",samples),definition);
+        }
+    }
+
+    [GeneratedRegex(@"<font\b[^>]*\bstyle\s*=\s*[""'][^>""']*\bcolor\s*:\s*#(?:039|003399)\b[^>]*>(?<sample>.*?)</font\s*>", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant)]
+    private static partial Regex OxfordExampleTranslation();
+
+    [GeneratedRegex(@"<br\s*/?>", RegexOptions.IgnoreCase)]
+    private static partial Regex OxfordLineBreak();
 
     private static int OxfordFormsEnd(string body, int afterPartOfSpeech)
     {
@@ -578,6 +620,102 @@ internal static partial class EntryParser
 
     [GeneratedRegex(@"<h1>\s*<span class=""word"">(?<word>[^<>]+)</span>(?:\s*<span>【<span>(?<form>[^<>]+)</span>】)?", RegexOptions.IgnoreCase)]
     private static partial Regex ShinseikiTitle();
+
+    internal static IEnumerable<(string Gloss, Range Span, string Examples, string Definition)> ShinseikiReverseSenses(string body, string head)
+    {
+        const string article = "<div class=\"wrap-switch\">";
+        int first = body.IndexOf(article, IgnoreCase);
+        int next = first < 0 ? -1 : body.IndexOf(article, first + article.Length, IgnoreCase);
+        if (next < 0)
+        {
+            foreach (var sense in MainSenses(0, body.Length)) yield return sense;
+            yield break;
+        }
+
+        // 同一物理键有时收录多个不同写法的同音词。优先确切的原书写法，仅有读音时须唯一。
+        var written = new List<Range>();
+        var readings = new List<Range>();
+        for (int start = first; start >= 0; start = next)
+        {
+            next = body.IndexOf(article, start + article.Length, IgnoreCase);
+            int end = next < 0 ? body.Length : next;
+            var title = ShinseikiTitle().Match(body, start, Math.Min(1536, end - start));
+            if (!title.Success) continue;
+            string form = Plain(title.Groups["form"].Value);
+            if (form == head || form.Split(['·','・'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                .Contains(head, StringComparer.Ordinal))
+                written.Add(start..end);
+            else
+            {
+                string reading = Plain(title.Groups["word"].Value);
+                if (reading == head || reading.Replace("·", "") == head) readings.Add(start..end);
+            }
+        }
+        foreach (var range in written.Count > 0 ? written : readings.Count == 1 ? readings : [])
+            foreach (var sense in MainSenses(range.Start.Value, range.End.Value)) yield return sense;
+
+        IEnumerable<(string Gloss, Range Span, string Examples, string Definition)> MainSenses(int from, int to)
+        {
+            const string divider = "<span class=\"divide-imgs\">";
+            bool main = false;
+            int item = -1;
+            var tag = ShinseikiListTokens().Match(body, from, to - from);
+            for (; tag.Success; tag = tag.NextMatch())
+            {
+                if (tag.ValueSpan.Equals("<li>", IgnoreCase)) { item = main ? tag.Index + tag.Length : -1; continue; }
+                if (!tag.ValueSpan.Equals("</li>", IgnoreCase))
+                {
+                    main = tag.ValueSpan.StartsWith("<ul ", IgnoreCase); // 只有词义列表会匹配打开标记。
+                    item = -1;
+                    continue;
+                }
+                if (item < 0) continue;
+                int start = item, end = tag.Index;
+                item = -1;
+                // 译义与后面的双语例句同在 li 内。跨例句、别义或附属短语搜索会把无关文本挂到当前词头。
+                int example = body.IndexOf("<div class=\"unit-example\"", start, end - start, IgnoreCase);
+                int limit = example >= 0 ? example : end;
+                int split = body.IndexOf(divider, start, limit - start, IgnoreCase);
+                if (split < 0) continue;
+                int splitEnd = body.IndexOf("</span>", split + divider.Length, limit - split - divider.Length, IgnoreCase);
+                if (splitEnd < 0) continue;
+                start = splitEnd + "</span>".Length;
+                int open = body.IndexOf("<span>", start, limit - start, IgnoreCase);
+                if (open < 0) continue;
+                start = open + "<span>".Length;
+                int close = body.LastIndexOf("</span>", limit - 1, limit - start, IgnoreCase);
+                if (close <= start) continue;
+                string gloss = Plain(body[start..close]);
+                if (gloss.Length == 0) continue;
+                // Span 始终使用原 HTML 的 UTF-16 偏移，sup/sub、实体与中文标点留给详情视图统一转换。
+                yield return (gloss, start..close, "", "");
+            }
+        }
+    }
+
+    [GeneratedRegex("""<ul class="ncdata-sense-wrap">|</ul>|</?li>""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex ShinseikiListTokens();
+
+    internal static string ShinseikiReverseHeadword(string body, string head)
+    {
+        if (!head.Any(char.IsAsciiLetter)) return head;
+        const string article = "<div class=\"wrap-switch\">";
+        int first = body.IndexOf(article, IgnoreCase);
+        if (first >= 0 && body.IndexOf(article, first + article.Length, IgnoreCase) >= 0) return head;
+        var title = ShinseikiTitle().Match(body, 0, Math.Min(body.Length, 1536));
+        if (!title.Success) return head;
+        string printed = Plain(title.Groups["word"].Value);
+        if (printed.Length == 0 || !printed.All(c => c is >= 'ァ' and <= 'ヿ')) return head;
+        // 单行标题的纯片假名是外来语表记。只在原书也把西文另列作词源时替换旧索引的展示名称。
+        if (title.Groups["form"].Success && Plain(title.Groups["form"].Value) == head
+            && ShinseikiLanguageOrigin().IsMatch(head)) return printed;
+        if (!head.StartsWith(printed + "[", StringComparison.Ordinal) || !head.EndsWith(']')) return head;
+        int end = body.IndexOf("</h1>", title.Index + title.Length, IgnoreCase);
+        return end >= 0 && Plain(body[title.Index..end]) == head ? printed : head;
+    }
+
+    [GeneratedRegex(@"^(?:ド|フ|イ|ラ|ス|ロ|ギ|オランダ|ポルトガル|アラビア|梵|ヒンデイー)\s+[a-zA-Z\u00c0-\u024f]", RegexOptions.CultureInvariant)]
+    private static partial Regex ShinseikiLanguageOrigin();
 
     private static ParsedEntry Sango(string key, string body)
     {

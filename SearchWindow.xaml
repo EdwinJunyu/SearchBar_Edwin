@@ -72,8 +72,8 @@
                 </Label>
                 <Grid Grid.Column="1" Margin="13,0,0,0">
                     <TextBox x:Name="QueryBox" AutomationProperties.AutomationId="QueryBox"
-                             AutomationProperties.Name="搜索词典和文件、计算算式，或用 ai 加空格提问" VerticalContentAlignment="Center"
-                             ToolTip="输入 ai 加空格和问题，按回车打开 ChatGPT。算式示例：2^3、sqrt(16)、sin(30)。三角函数使用角度，log 为常用对数，ln 为自然对数。"
+                             AutomationProperties.Name="搜索词典和文件、计算算式，或按意思反查词" VerticalContentAlignment="Center"
+                             ToolTip="直接写中文描述可按意思联想。输入「反查」「反查日语」或「反查英语」可直接按释义找词。「ai 」加问题，按回车打开 ChatGPT。算式示例：2^3、sqrt(16)、sin(30)。三角函数使用角度，log 为常用对数，ln 为自然对数。"
                              Foreground="{StaticResource Ink}" CaretBrush="{StaticResource Accent}"
                              FontSize="21" Padding="1,0" BorderThickness="0" Background="Transparent"
                              VerticalScrollBarVisibility="Hidden" HorizontalScrollBarVisibility="Hidden"/>
@@ -149,6 +149,44 @@
                 </ItemsControl.ItemTemplate>
             </ItemsControl>
 
+            <TextBlock x:Name="AutomaticReverseLabel" Text="按意思联想" Margin="20,2,20,3"
+                       Foreground="#506770" Visibility="Collapsed"/>
+            <ItemsControl x:Name="ReverseChoices" AutomationProperties.AutomationId="ReverseChoices"
+                          AutomationProperties.Name="其他反查词义" Margin="20,0">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Button Click="OpenReverseChoice" HorizontalContentAlignment="Left" Padding="4,4" Margin="0,0,0,3"
+                                Background="Transparent" BorderThickness="0" AutomationProperties.Name="{Binding Label}"
+                                ToolTip="{Binding Label}">
+                            <TextBlock Text="{Binding Hit.Display}" TextTrimming="CharacterEllipsis" Foreground="{StaticResource Accent}"/>
+                        </Button>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+            <DockPanel Margin="20,0,20,4" LastChildFill="True">
+                <DockPanel.Style>
+                    <Style TargetType="DockPanel">
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding HasItems, ElementName=PrefixChoices}" Value="False">
+                                <Setter Property="Visibility" Value="Collapsed"/>
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </DockPanel.Style>
+                <TextBlock Text="词典联想" Foreground="#506770" VerticalAlignment="Top" Margin="0,5,8,0"/>
+                <ItemsControl x:Name="PrefixChoices" AutomationProperties.AutomationId="PrefixChoices" AutomationProperties.Name="词典联想">
+                    <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Button Click="UsePrefixSuggestion" AutomationProperties.Name="{Binding}" ToolTip="{Binding}"
+                                    Background="#EFF5F5" Foreground="{StaticResource Accent}" BorderThickness="0"
+                                    Padding="6,3" Margin="0,0,4,3" MaxWidth="170">
+                                <TextBlock Text="{Binding}" TextTrimming="CharacterEllipsis"/>
+                            </Button>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </DockPanel>
             <Border x:Name="DetailsPanel" AutomationProperties.AutomationId="DetailsPanel"
                     BorderThickness="0,1,0,0" BorderBrush="{StaticResource Divider}" Visibility="Collapsed">
                 <StackPanel Margin="20,15,20,17">
@@ -162,21 +200,28 @@
                         <Button x:Name="ClearReadingPreferenceButton" AutomationProperties.AutomationId="ClearReadingPreferenceButton"
                                 Content="清除此读音首选" Padding="7,3"/>
                     </StackPanel>
-                    <ScrollViewer x:Name="DetailScroll" Margin="2,12,0,0" MaxHeight="215" VerticalScrollBarVisibility="Auto"
-                                  HorizontalScrollBarVisibility="Disabled">
-                        <TextBlock x:Name="EntryText" AutomationProperties.AutomationId="EntryText"
-                                   TextWrapping="Wrap" FontSize="15" LineHeight="24" Padding="0,0,6,0"/>
-                    </ScrollViewer>
-                    <StackPanel x:Name="MergedDetail" Visibility="Collapsed">
-                        <Button x:Name="MergedBack" Content="返回上一个词条" HorizontalAlignment="Left"
-                                Click="MergedBackClick" Visibility="Collapsed" Margin="0,4"/>
-                        <ContentControl x:Name="MergedWebHost" Height="215" Margin="0,6,0,0"
-                                        HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch"/>
-                    </StackPanel>
+                    <Grid>
+                        <StackPanel x:Name="MergedDetail" Visibility="Collapsed">
+                            <Button x:Name="MergedBack" Content="返回上一个词条" HorizontalAlignment="Left"
+                                    Click="MergedBackClick" Visibility="Collapsed" Margin="0,4"/>
+                            <ContentControl x:Name="MergedWebHost" Height="215" Margin="0,6,0,0"
+                                            HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch"/>
+                        </StackPanel>
+                        <ScrollViewer x:Name="DetailScroll" Margin="2,12,0,0" MaxHeight="215" VerticalScrollBarVisibility="Auto"
+                                      HorizontalScrollBarVisibility="Disabled">
+                            <TextBlock x:Name="EntryText" AutomationProperties.AutomationId="EntryText"
+                                       TextWrapping="Wrap" FontSize="15" LineHeight="24" Padding="0,0,6,0"/>
+                        </ScrollViewer>
+                    </Grid>
                 </StackPanel>
             </Border>
-            <TextBlock x:Name="StatusText" AutomationProperties.AutomationId="StatusText"
-                       Margin="20,0,20,12" TextWrapping="Wrap" Foreground="#844C18" Visibility="Collapsed"/>
+            <DockPanel LastChildFill="True" Margin="20,0,20,0">
+                <Button x:Name="ReverseModelButton" DockPanel.Dock="Right" Click="PrepareReverseIndex"
+                        Content="准备语义索引" Padding="7,3" Margin="8,0,0,6" VerticalAlignment="Top"
+                        ToolTip="为当前词典准备本地语义索引。准备好后可切换检索方式。" Visibility="Collapsed"/>
+                <TextBlock x:Name="StatusText" AutomationProperties.AutomationId="StatusText"
+                           Margin="0,0,0,12" TextWrapping="Wrap" Foreground="#844C18" Visibility="Collapsed"/>
+            </DockPanel>
             <!-- 文件名与路径分列，即使多个结果同名，用户也可以按目录区分。 -->
             <Border x:Name="FilePanel" BorderBrush="{StaticResource Divider}" BorderThickness="0,1,0,0" Visibility="Collapsed">
                 <StackPanel Margin="8,5,8,7">
@@ -185,6 +230,32 @@
                     <Button x:Name="InstallEverythingButton" AutomationProperties.AutomationId="InstallEverythingButton"
                             Content="下载 Everything" ToolTip="打开 Everything 官方下载页" HorizontalAlignment="Left"
                             Margin="12,0,12,6" Padding="9,3" Visibility="Collapsed"/>
+                    <DockPanel Margin="12,2,12,4">
+                        <DockPanel.Style>
+                            <Style TargetType="DockPanel">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding HasItems, ElementName=FileCompletionChoices}" Value="False">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </DockPanel.Style>
+                        <TextBlock Text="补全文件名" VerticalAlignment="Center" Foreground="#506770" Margin="0,0,8,0"/>
+                        <ItemsControl x:Name="FileCompletionChoices" AutomationProperties.AutomationId="FileCompletionChoices"
+                                      AutomationProperties.Name="文件名补全">
+                            <ItemsControl.ItemsPanel><ItemsPanelTemplate><UniformGrid Rows="1"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Button Click="UseFileCompletion" HorizontalContentAlignment="Left"
+                                            AutomationProperties.Name="{Binding StringFormat='补全为 {0}'}" ToolTip="{Binding}"
+                                            Background="#EFF5F5" Foreground="{StaticResource Accent}" BorderThickness="0"
+                                            Padding="6,3" Margin="0,0,4,0" Cursor="Hand">
+                                        <TextBlock Text="{Binding}" TextTrimming="CharacterEllipsis"/>
+                                    </Button>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </DockPanel>
                     <ListBox x:Name="FileList" AutomationProperties.AutomationId="FileList"
                              AutomationProperties.Name="文件结果" MaxHeight="280" Visibility="Collapsed"
                              BorderThickness="0" Background="Transparent" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
@@ -227,6 +298,7 @@
                                     <!-- 各操作使用本行的完整路径，避免同名文件互相干扰。 -->
                                     <Button AutomationProperties.AutomationId="OpenFileButton"
                                             AutomationProperties.Name="{Binding FullPath, StringFormat='打开 {0}'}"
+                                            AutomationProperties.ItemStatus="{Binding DisplayParent}"
                                             ToolTip="{Binding FullPath}" Click="OpenFileClicked" Cursor="Hand">
                                         <Button.Template>
                                             <ControlTemplate TargetType="Button">
@@ -248,8 +320,21 @@
                                             </Grid.ColumnDefinitions>
                                             <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="{StaticResource Ink}"
                                                        TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="0,0,12,0"/>
-                                            <TextBlock Grid.Column="1" Text="{Binding Parent}" FontSize="12" Foreground="#506770"
-                                                       FlowDirection="LeftToRight" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                                            <TextBlock Grid.Column="1" Text="{Binding DisplayParent}" FontSize="12" Foreground="#506770"
+                                                       FlowDirection="LeftToRight" VerticalAlignment="Center">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock">
+                                                        <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+                                                        <!-- 同名路径的区别可能在很长的目录名末尾，窄窗中允许换行。 -->
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding WrapDisplayParent}" Value="True">
+                                                                <Setter Property="TextTrimming" Value="None"/>
+                                                                <Setter Property="TextWrapping" Value="Wrap"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
                                         </Grid>
                                     </Button>
                                     <Button Grid.Column="1" AutomationProperties.AutomationId="PreviewFileButton"

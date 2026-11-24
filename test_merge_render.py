@@ -1,5 +1,8 @@
 import sqlite3
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import audit_merged
 from merge_render import Renderer
 
 
@@ -159,6 +162,43 @@ class RenderTests(unittest.TestCase):
         self.db.execute("INSERT INTO article VALUES(?,?,0)",(key,b"existing"))
         with self.assertRaisesRegex(ValueError,"碰撞"): index_compatibility(self.db)
         self.assertFalse(list(self.renderer.helpers()))
+
+
+class CompactIndexTests(unittest.TestCase):
+    def test_layouts_preserve_physical_mappings_and_reject_truncated_blocks(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "source.db"
+            with sqlite3.connect(original) as db:
+                db.executescript("""
+                    CREATE TABLE terms(dict TEXT,ordinal INTEGER,kind INTEGER,term TEXT,
+                        PRIMARY KEY(dict,ordinal,kind,term)) WITHOUT ROWID;
+                    CREATE INDEX terms_lookup ON terms(term,kind,dict,ordinal);
+                    CREATE TABLE dictionaries(id TEXT PRIMARY KEY);
+                    INSERT INTO dictionaries VALUES ('a'),('b');
+                """)
+                rows = [('a',1,0,'桜'),('a',9,0,'桜'),('b',9,0,'桜'),('a',1,1,'桜'),
+                        ('a',257,1,'きょう'),('b',13,0,'😀'),('a',99,0,'x'*5500)]
+                db.executemany("INSERT INTO terms VALUES (?,?,?,?)", rows)
+            db.close()
+            before = original.read_bytes()
+            result = audit_merged.compare_term_layouts(original, root / "trial")
+            self.assertEqual(result["verified"], {"keys":4,"mappings":7})
+            self.assertEqual(set(result["blocks"]), {"4","8","16","32"})
+            self.assertIn("packed_nonterm_db_bytes", result, "缺少重建后基础库的真实文件大小")
+            self.assertEqual(original.read_bytes(), before)
+            with self.assertRaises(FileExistsError):
+                audit_merged.compare_term_layouts(original, root / "trial")
+            with audit_merged.CompactTermReader(root / "trial", 4) as reader:
+                self.assertEqual(reader.lookup("桜"), [(0,'a',1),(0,'a',9),(0,'b',9),(1,'a',1)])
+                self.assertEqual(reader.lookup("桜山"), [])
+                self.assertEqual(reader.lookup("x"*5500), [(0,'a',99)])
+            path = root / "trial" / "keys-4.bin"
+            with path.open("r+b") as stream:
+                stream.truncate(path.stat().st_size - 1)
+            with self.assertRaises(ValueError):
+                with audit_merged.CompactTermReader(root / "trial", 4) as reader:
+                    reader.lookup("😀")
 
 
 if __name__ == "__main__":

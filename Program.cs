@@ -245,6 +245,10 @@ if (args is [] or ["help"] or ["--help"])
         article <卷ID> <原词头>      输出合并卷公开词头或辅助页的 HTML
         list                        查看词典标识、语言、条数、哈希与文件名
         query <输入> [词典ID或卷ID]  查询全部词库、单一来源或 zh-en / zh-ja 卷
+        prefix <前缀> [词典ID或卷ID]  列出当前范围内可补全的词典检索键
+        reverse <中文描述> [词典ID或卷ID]  在启用的新世纪或牛津词典中按释义查日语、英语词
+        reverse-lexical <中文描述> [词典ID或卷ID]  用原书词语匹配反查，供对照
+        prepare-reverse [词典ID或卷ID]  为所选词典准备离线语义索引，可指定 shinseiki 或 oxford
         entry <词典ID> <序号>        查看读音依据与 MDX 原始正文
         verify                      核对四本基础词典和已启用的扩展词典样本
         --version                   查看版本、构建标识和支持的词典（JSON）
@@ -360,13 +364,56 @@ try
         case ["list"]:
             using (var store = OpenReader()) store.List();
             break;
-        case ["query",_] or ["query",_,_]:
+        case ["prepare-reverse"] or ["prepare-reverse",_]:
+        {
+            // 显式准备才批量编码词义；普通反查可直接使用已经发布的索引。
+            string? scope = args.Length == 2 ? args[1] : null;
+            using var store = scope is "zh-en" or "zh-ja" ? new DictionaryStore(MergedDatabase(), readOnly: true) : OpenReader();
+            var encoder = ReverseEncoder.Open(ReverseEncoder.ModelDirectory);
+            using var cancel = new CancellationTokenSource();
+            ConsoleCancelEventHandler stop = (_, ev) => { ev.Cancel = true; cancel.Cancel(); };
+            Console.CancelKeyPress += stop;
+            try
+            {
+                int shown = -1;
+                int count = store.PrepareReverseLanguages(scope == null ? null : LookupId(store,scope), encoder, ReverseEncoder.CacheDirectory, cancel.Token,
+                    (done,total) => {
+                        int step = (int)(20L * done / Math.Max(total, 1));
+                        if (shown != step) { shown = step; Console.Error.WriteLine($"{done}/{total}"); }
+                    },null);
+                Console.WriteLine($"已准备 {count} 个原书义项 · {ReverseEncoder.CacheDirectory}");
+            }
+            finally { Console.CancelKeyPress -= stop; }
+            break;
+        }
+        case ["query" or "prefix" or "reverse" or "reverse-lexical",_] or ["query" or "prefix" or "reverse" or "reverse-lexical",_,_]:
         {
             // 未指定 E_SEARCH_DB 时，按卷查询与 import-merged、article 使用同一份独立库。
             using var store = args.Length == 3 && args[2] is "zh-en" or "zh-ja"
                 ? new DictionaryStore(MergedDatabase(), readOnly: true) : OpenReader();
             var only=args.Length==3 ? LookupId(store,args[2]) : null;
-            foreach(var hit in store.Search(args[1],only))
+            if (args[0] == "prefix")
+            {
+                foreach (var key in store.PrefixSuggestions(args[1], only, CancellationToken.None)) Console.WriteLine(key);
+                break;
+            }
+            IReadOnlyList<LookupHit> hits;
+            if (args[0] == "reverse" && ReverseEncoder.IsInstalled)
+            {
+                try
+                {
+                    hits = store.ReverseByLanguage(args[1], only, null, CancellationToken.None, ReverseEncoder.Open(ReverseEncoder.ModelDirectory),
+                        ReverseEncoder.CacheDirectory);
+                }
+                catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException
+                    or Microsoft.ML.OnnxRuntime.OnnxRuntimeException or TypeInitializationException or DllNotFoundException)
+                {
+                    Console.Error.WriteLine("已改用原书词语匹配：" + ex.GetBaseException().Message);
+                    hits = store.ReverseLookup(args[1], only, CancellationToken.None);
+                }
+            }
+            else hits = args[0] == "query" ? store.Search(args[1], only) : store.ReverseLookup(args[1], only, CancellationToken.None);
+            foreach(var hit in hits)
                 Console.WriteLine($"{hit.Entry.DictionaryId}:{hit.Entry.EntryId}\t{hit.Method}\t{hit.Term}\t{hit.Display}");
             break;
         }

@@ -52,6 +52,7 @@ internal sealed class DictionaryStore : IDisposable
         db.Open();
         db.CreateFunction("latin_bound", (string? key, int variant, bool upper) => Lookup.LegacyLatinBound(key, variant, upper), isDeterministic: true);
         db.CreateFunction("term_key", (string key) => Lookup.Normalize(key), isDeterministic: true);
+        db.CreateFunction("is_lookup_kana", (string key) => Lookup.IsKana(key), isDeterministic: true);
         if (readOnly)
         {
             // 只读查词不修改旧库；用实际列信息选择该版本能执行的查询。
@@ -492,7 +493,8 @@ internal sealed class DictionaryStore : IDisposable
         using var command = Command(select + (hit == null ? "WHERE a.volume=$group AND a.head=$key AND ($expected IS NULL OR v.revision=$expected)" : """
             JOIN merged_origins o ON o.page=a.page JOIN dictionary_metadata m ON m.id=o.dict
             WHERE o.dict=$id AND o.ordinal=$ordinal AND m.revision=$revision
-            """), tx);
+            """ + (hit.ReverseSourceHash == null ? "" :
+                " AND COALESCE(m.enabled,1)<>0 AND EXISTS(SELECT 1 FROM dictionaries d WHERE d.id=o.dict AND d.sha256=$hash)")), tx);
         if (hit == null)
         {
             command.Parameters.AddWithValue("$group", group!);
@@ -504,6 +506,7 @@ internal sealed class DictionaryStore : IDisposable
             command.Parameters.AddWithValue("$id", hit.DictionaryId);
             command.Parameters.AddWithValue("$ordinal", hit.EntryId);
             command.Parameters.AddWithValue("$revision", (object?)hit.DictionaryRevision ?? DBNull.Value);
+            if (hit.ReverseSourceHash != null) command.Parameters.AddWithValue("$hash",hit.ReverseSourceHash);
         }
         using var rows = command.ExecuteReader();
         if (!rows.Read()) return null;
@@ -1026,15 +1029,13 @@ internal sealed class DictionaryStore : IDisposable
             using var snapshot = db.BeginTransaction(deferred: true);
             var schema = SchemaIn(snapshot);
             IEnumerable<LookupEntry> FindKey(string key, bool reading) => Find(key, reading, only, snapshot, schema, token);
-            var hits = Lookup.Search(input, FindKey);
-            if (hits.Count == 0)
+            IReadOnlyList<LookupHit> FindPhrases()
             {
-                hits = Lookup.SearchPhrases(input,
+                return Lookup.SearchPhrases(input,
                     (keys, reading, language) => ExistingTerms(keys, reading, language, only, snapshot, schema, token),
-                    FindKey, token);
-                hits = Lookup.SearchOxfordPhrases(input,
-                    key => Find(key, false, only, snapshot, schema, token, phrasalSenses: true), hits, token);
+                    FindKey, key => Find(key, false, only, snapshot, schema, token, phrasalSenses: true), token);
             }
+            var hits = Lookup.Search(input, FindKey, FindPhrases);
             if (hits.Count == 0)
                 hits = SuggestSpelling(input, only, snapshot, schema, token);
             hits = ApplyReadingPreferences(hits, snapshot, token);
@@ -1263,7 +1264,7 @@ internal sealed class DictionaryStore : IDisposable
             // 旧索引可能把读音存成首义。只检查本次命中且符合旧版回退特征的正文前缀。
             var entry = new LookupEntry(r.GetString(0), r.GetInt64(1), r.GetString(2), r.GetInt32(3),
                 r.GetString(4), r.IsDBNull(5) ? null : r.GetString(5), r.GetString(6))
-                { DictionaryName = r.GetString(7), DictionaryRevision = r.GetString(8) };
+                { DictionaryName = r.GetString(7), DictionaryRevision = r.GetString(8), HasIndexedMergedPage = !r.IsDBNull(18) };
             bool indexed = !r.IsDBNull(16);
             bool triedBody = false;
             string? managedBody = null;
@@ -1333,38 +1334,248 @@ internal sealed class DictionaryStore : IDisposable
         return end == body.Length ? body : body[..end];
     }
 
+    private const int SpellingBudgetMilliseconds = 50;
+
     private IReadOnlyList<LookupHit> SuggestSpelling(string input, string? only, SqliteTransaction snapshot,
         MetadataSchema schema, CancellationToken token)
     {
-        var keys = Lookup.SpellingKeys(Lookup.Normalize(input)).Distinct(StringComparer.Ordinal).ToArray();
-        if (keys.Length == 0) return [];
-        // 先批量探测词头索引，只为确实存在的词读取释义。同一拼写取用户排在最前的词典。
-        var known = ExistingTerms(keys, false, "en", only, snapshot, schema, token);
-        var choices = new List<LookupHit>(3);
-        foreach (var key in keys.Where(known.Contains))
+        string word = Lookup.Normalize(input);
+        var known = ExistingTerms(Lookup.SpellingKeys(word), false, "en", only, snapshot, schema, token);
+        var first = Rank(known);
+        if (first.Count > 0 || word.Length is < 7 or > 40 || !word.All(c => c is >= 'a' and <= 'z')) return first;
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        return Rank(NearbySpellingKeys(word, only, snapshot, schema, token), timer);
+
+        List<LookupHit> Rank(IEnumerable<string> keys, System.Diagnostics.Stopwatch? deadline = null)
         {
-            var entry = Find(key, false, only, snapshot, schema, token)
-                .Where(e => e.Language == "en" && Lookup.Normalize(e.Headword) == key)
-                .OrderBy(e => e.Priority).ThenBy(e => e.DictionaryId, StringComparer.Ordinal).ThenBy(e => e.EntryId)
-                .FirstOrDefault();
-            if (entry == null) continue;
-            choices.Add(new(entry, "spelling", key, $"{entry.Headword} · {Lookup.Format(entry, "headword")}"));
-            if (choices.Count == 3) break;
+            IEnumerable<(string Key, int Cost)> ranked = keys.Select(key => (Key: key, Cost: Lookup.SpellingCost(word, key)))
+                .Where(x => x.Cost < 300).OrderBy(x => x.Cost).ThenBy(x => x.Key, StringComparer.Ordinal);
+            var choices = new List<LookupHit>(3);
+            int best = 0;
+            // 词头索引也可能含重定向。二步限制详情探测数，原有一步仍可跳过所有无效别名。
+            if (deadline != null) ranked = ranked.Take(12);
+            foreach (var (key, cost) in ranked)
+            {
+                token.ThrowIfCancellationRequested();
+                if (deadline?.ElapsedMilliseconds >= SpellingBudgetMilliseconds) return [];
+                var entry = Find(key, false, only, snapshot, schema, token)
+                    .Where(e => e.Language == "en" && Lookup.Normalize(e.Headword) == key)
+                    .OrderBy(e => e.Priority).ThenBy(e => e.DictionaryId, StringComparer.Ordinal).ThenBy(e => e.EntryId)
+                    .FirstOrDefault();
+                if (entry == null) continue;
+                if (choices.Count == 0) best = cost;
+                else if (word.Length == 3 && cost == best) return []; // 短词首位并列，保留用户输入。
+                choices.Add(new(entry, "spelling", key, $"{entry.Headword} · {Lookup.Format(entry, "headword")}"));
+                if (choices.Count == 3) break;
+            }
+            return deadline?.ElapsedMilliseconds >= SpellingBudgetMilliseconds ? [] : choices;
         }
-        return choices;
+    }
+
+    public IReadOnlyList<string> PrefixSuggestions(string input, string? only = null, CancellationToken token = default)
+    {
+        token.ThrowIfCancellationRequested();
+        string prefix = Lookup.Normalize(input);
+        if (prefix.Length == 0) return [];
+        // 连接符右边的字母尚未打出时，仍按词内连接符查旧键和新键。
+        prefix = Lookup.Normalize(prefix + "a")[..^1];
+        using var registration = token.Register(() => SQLitePCL.raw.sqlite3_interrupt(db.Handle));
+        try
+        {
+            using var snapshot = db.BeginTransaction(deferred: true);
+            var schema = SchemaIn(snapshot);
+            var found = new Dictionary<string,(int Extra, int Tier, int Priority)>(StringComparer.Ordinal);
+            using var available = Command($"""
+                SELECT COUNT(*),COALESCE(MAX(d.language='ja'),0) FROM dictionaries d {schema.Join}
+                WHERE {ScopeSql(only,"d.id")} {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
+                """, snapshot);
+            available.Parameters.AddWithValue("$only", (object?)only ?? DBNull.Value);
+            bool hasJapanese;
+            using (var books = available.ExecuteReader())
+            {
+                books.Read();
+                if (books.GetInt32(0) == 0) return [];
+                hasJapanese = books.GetBoolean(1);
+            }
+            bool windowFilled = Read(prefix, prefix, reading: false);
+            if (windowFilled && prefix.Length <= 40 && prefix.All(c => c is >= 'a' and <= 'z'))
+                Read(prefix, prefix, reading: false, shortEnglish: true);
+            if (Lookup.HasLatinJoiner(prefix + "a"))
+            {
+                // 旧索引可能仅有弯引号或 U+2010。同一词里出现多个连接符时，缩窄到第二处再核对完整规范前缀。
+                for (int variant = 0; variant < 4; variant++)
+                {
+                    string? old = Lookup.LegacyLatinBound(prefix + "a", variant, false);
+                    if (old == null) continue;
+                    if (old.Length == prefix.Length + 1) old = old[..^1];
+                    if (old != prefix) Read(old, prefix, reading: false, legacy: true);
+                }
+            }
+            if (hasJapanese)
+            {
+                if (Lookup.IsKana(prefix)) ReadKana(Lookup.NormalizeReading(prefix), 0);
+                else foreach (string kana in Lookup.RomajiReadings(prefix)) ReadKana(kana, 1);
+            }
+            token.ThrowIfCancellationRequested();
+            snapshot.Commit();
+            return found.OrderBy(p => p.Value).ThenBy(p => p.Key, StringComparer.Ordinal).Take(8).Select(p => p.Key).ToArray();
+
+            void ReadKana(string kana, int tier)
+            {
+                Read(kana, kana, reading: true, tier: tier);
+                // 旧 MDX 的假名重定向可能只有词头键，没有另存 kind=1 的读音。
+                string katakana = Lookup.ToKatakana(kana);
+                Read(katakana, kana, reading: true, tier: tier, linkedKana: true);
+                if (katakana != kana) Read(kana, kana, reading: true, tier: tier, linkedKana: true);
+            }
+
+            bool Read(string lower, string wanted, bool reading, int tier = 0, bool linkedKana = false, bool legacy = false, bool shortEnglish = false)
+            {
+                token.ThrowIfCancellationRequested();
+                // 先在启用范围内找至多 32 个不同键，再按补写字符数与词书优先级选八个；重复物理词条不消耗名额。
+                // 单字只取八个键。英文长词组常排在 apple 这类短词之前，再用最多 26+26² 个索引点查短后缀。
+                // 同书重定向只需确认能抵达实体，不解压 MDX 或读取长释义。UNION 可终止别名环。
+                string? upper = shortEnglish ? null : PrefixUpperBound(lower);
+                const string letters = "WITH RECURSIVE letters(c) AS (VALUES('a') UNION ALL SELECT char(unicode(c)+1) FROM letters WHERE c<'z')";
+                string shortKeys = lower.Length == 1 ? "t.term IN (SELECT $lower||c FROM letters)"
+                    : "t.term IN (SELECT $lower||c FROM letters UNION ALL SELECT $lower||a.c||b.c FROM letters a CROSS JOIN letters b)";
+                string predicate = shortEnglish ? shortKeys : "t.term >= $lower" + (upper == null ? "" : " AND t.term < $upper");
+                int typed = wanted.EnumerateRunes().Count();
+                int limit = typed == 1 ? 8 : 32;
+                using var cmd = Command($"""
+                    {(shortEnglish ? letters : "")}
+                    SELECT t.term, MIN(d.priority)
+                    FROM terms t INDEXED BY terms_lookup
+                    CROSS JOIN dictionaries d ON d.id=t.dict {schema.Join}
+                    CROSS JOIN entries e ON e.dict=t.dict AND e.ordinal=t.ordinal
+                    WHERE {predicate} AND t.kind={(reading && !linkedKana ? 1 : 0)}
+                      AND {ScopeSql(only,"t.dict")} {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
+                      {(reading ? "AND d.language='ja' AND is_lookup_kana(t.term)" : "")} {(linkedKana ? "AND e.link IS NOT NULL" : "")}
+                      {(legacy ? "AND substr(term_key(t.term),1,length($wanted))=$wanted" : "")}
+                      AND (e.link IS NULL OR EXISTS(
+                        WITH RECURSIVE targets(ordinal,link) AS (
+                            SELECT e.ordinal,e.link UNION SELECT dest.ordinal,dest.link FROM targets ref
+                            JOIN terms k INDEXED BY terms_lookup ON k.term IN (SELECT ref.link UNION ALL {LegacyLatinTerms("ref.link")})
+                                AND k.kind=0 AND k.dict=t.dict
+                            JOIN entries dest ON dest.dict=k.dict AND dest.ordinal=k.ordinal
+                        ) SELECT 1 FROM targets WHERE link IS NULL))
+                    GROUP BY t.term ORDER BY {(shortEnglish ? "length(t.term),MIN(d.priority)," : "")}t.term LIMIT {limit}
+                    """, snapshot);
+                cmd.Parameters.AddWithValue("$lower", lower);
+                if (upper != null) cmd.Parameters.AddWithValue("$upper", upper);
+                cmd.Parameters.AddWithValue("$only", (object?)only ?? DBNull.Value);
+                if (legacy) cmd.Parameters.AddWithValue("$wanted", wanted);
+                using var rows = cmd.ExecuteReader();
+                int rawKeys = 0;
+                while (rows.Read())
+                {
+                    rawKeys++;
+                    string raw = rows.GetString(0);
+                    string term = reading ? Lookup.NormalizeReading(raw) : Lookup.Normalize(raw);
+                    var score = (term.EnumerateRunes().Count() - typed, tier, rows.GetInt32(1));
+                    if (!found.TryGetValue(term, out var old) || score.CompareTo(old) < 0) found[term] = score;
+                }
+                // 不足上限表示字面区间已读尽。不同旧键可能归一为同一显示项，不能用 found.Count 判断是否补查。
+                return rawKeys == limit;
+            }
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == SQLitePCL.raw.SQLITE_INTERRUPT && token.IsCancellationRequested)
+        {
+            throw new OperationCanceledException("词典联想已取消", ex, token);
+        }
+    }
+
+    private static string? PrefixUpperBound(string prefix)
+    {
+        // SQLite BINARY 比较 UTF-8 字节，即 Unicode 标量顺序。最大标量须向左进位，D7FF 的后继为 E000。
+        for (int end = prefix.Length; end > 0;)
+        {
+            Rune.DecodeLastFromUtf16(prefix.AsSpan(0,end), out Rune rune, out int size);
+            end -= size;
+            if (rune.Value < 0x10ffff)
+                return prefix[..end] + new Rune(rune.Value == 0xd7ff ? 0xe000 : rune.Value + 1);
+        }
+        return null;
+    }
+
+    private HashSet<string> NearbySpellingKeys(string word, string? only, SqliteTransaction snapshot,
+        MetadataSchema schema, CancellationToken token)
+    {
+        // 使用已有的覆盖索引。每个前缀最多读 96 条物理映射（包括其他来源），
+        // 一次最多读 2048 条、保留 256 个英语键。密集区间用完配额后放弃，没有全表扫描。
+        const int perPrefix = 96, rowBudget = 2048, keyBudget = 256;
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        var eligible = new HashSet<string>(StringComparer.Ordinal);
+        using (var scope = Command($"""
+            SELECT d.id FROM dictionaries d {schema.Join} WHERE d.language='en' AND {ScopeSql(only,"d.id")}
+                {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
+            """, snapshot))
+        {
+            scope.Parameters.AddWithValue("$only", (object?)only ?? DBNull.Value);
+            using var books = scope.ExecuteReader();
+            while (books.Read()) eligible.Add(books.GetString(0));
+        }
+        var found = new HashSet<string>(StringComparer.Ordinal);
+        if (eligible.Count == 0) return found;
+        using var range = Command("""
+            SELECT term,kind,dict FROM terms INDEXED BY terms_lookup
+            WHERE term >= $prefix AND term < $end ORDER BY term LIMIT $cap
+            """, snapshot);
+        var start = range.Parameters.Add("$prefix", SqliteType.Text);
+        var end = range.Parameters.Add("$end", SqliteType.Text);
+        var cap = range.Parameters.Add("$cap", SqliteType.Integer);
+        int remaining = rowBudget;
+        foreach (var prefix in Prefixes().Distinct(StringComparer.Ordinal))
+        {
+            token.ThrowIfCancellationRequested();
+            if (timer.ElapsedMilliseconds >= SpellingBudgetMilliseconds) return []; // 丢弃超时的半批结果。
+            start.Value = prefix;
+            end.Value = prefix + '{'; // 小写 ASCII 的 z 后紧接 {。
+            cap.Value = Math.Min(perPrefix, remaining);
+            using var rows = range.ExecuteReader();
+            while (rows.Read())
+            {
+                remaining--;
+                if (rows.GetInt32(1) != 0 || !eligible.Contains(rows.GetString(2))) continue;
+                string key = rows.GetString(0);
+                if (Math.Abs(key.Length - word.Length) <= 2 && key.All(c => c is >= 'a' and <= 'z'))
+                    found.Add(key);
+                if (found.Count == keyBudget) break;
+            }
+            if (remaining == 0 || found.Count == keyBudget) break;
+        }
+        return timer.ElapsedMilliseconds < SpellingBudgetMilliseconds ? found : [];
+
+        IEnumerable<string> Prefixes()
+        {
+            // 先试词内错误。首字母也可能打错、漏打、多打或换位，分别探测这些窄区间。
+            for (int length = Math.Min(8, word.Length); length >= 4; length--) yield return word[..length];
+            // 多个首字母候选都先查窄区间，避免先试的常见短前缀用完预算。
+            for (int length = Math.Min(9, word.Length - 1); length >= 4; length--)
+            {
+                yield return word.Substring(1, length);
+                yield return string.Concat(word[1], word[0], word[2..length]);
+                for (char c = 'a'; c <= 'z'; c++)
+                {
+                    if (c != word[0]) yield return c + word[1..length];
+                    yield return c + word[..(length - 1)];
+                }
+            }
+        }
     }
 
     public string? CurrentBody(LookupEntry candidate) =>
-        candidate.DictionaryRevision == null ? null : GetBody(candidate.DictionaryId, candidate.EntryId, candidate.DictionaryRevision)?.Raw;
+        candidate.DictionaryRevision == null ? null : GetBody(candidate.DictionaryId, candidate.EntryId,
+            candidate.DictionaryRevision, candidate.ReverseSourceHash)?.Raw;
 
     public (string? Evidence, string Raw) Detail(string id, long ordinal) =>
         GetBody(id, ordinal, null) ?? throw new InvalidOperationException("找不到指定词条");
 
-    private (string? Evidence, string Raw)? GetBody(string id, long ordinal, string? revision)
+    private (string? Evidence, string Raw)? GetBody(string id, long ordinal, string? revision, string? expectedHash = null, string? physicalHead = null)
     {
         // 同一快照核对版本并取得对应散列及范围。托管文件不可变，读取它时无须占用 WAL 快照。
         using var snapshot = db.BeginTransaction(deferred: true);
-        var result = FindBody(id, ordinal, revision, snapshot, SchemaIn(snapshot));
+        var result = FindBody(id, ordinal, revision, snapshot, SchemaIn(snapshot),expectedHash,physicalHead);
         snapshot.Commit();
         if (result == null) return null;
         var row = result.Value;
@@ -1408,16 +1619,21 @@ internal sealed class DictionaryStore : IDisposable
     }
 
     private (string? Evidence, string Raw, string? Hash, long Start, long End, bool Merged)? FindBody(string id, long ordinal, string? revision,
-        SqliteTransaction snapshot, MetadataSchema schema)
+        SqliteTransaction snapshot, MetadataSchema schema, string? expectedHash = null, string? physicalHead = null)
     {
         using var cmd = Command($"""
             SELECT e.evidence,e.raw,d.sha256,{schema.RecordRange}
             FROM entries e JOIN dictionaries d ON d.id=e.dict {schema.Join} {schema.RecordJoin}
             WHERE e.dict=$id AND e.ordinal=$ordinal {(revision == null ? "" : $"AND {schema.Revision}=$revision")}
+                {(expectedHash == null ? "" : "AND d.sha256=$hash")}
+                {(physicalHead == null ? "" : "AND e.head=$head")}
+                {(expectedHash != null && schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
             """, snapshot);
         cmd.Parameters.AddWithValue("$id", id);
         cmd.Parameters.AddWithValue("$ordinal", ordinal);
         if (revision != null) cmd.Parameters.AddWithValue("$revision", revision);
+        if (expectedHash != null) cmd.Parameters.AddWithValue("$hash", expectedHash);
+        if (physicalHead != null) cmd.Parameters.AddWithValue("$head", physicalHead);
         using var r = cmd.ExecuteReader();
         if (!r.Read()) return null;
         string? evidence = r.IsDBNull(0) ? null : r.GetString(0);
@@ -1543,6 +1759,773 @@ internal sealed class DictionaryStore : IDisposable
         }
         tx.Commit();
         return count;
+    }
+
+    private sealed record ReverseSense(long Ordinal, string Head, string Gloss, Range Span, bool Merged, int GramCount);
+    private sealed record ReverseIndex(List<ReverseSense> Senses, Dictionary<long,List<int>> Postings,
+        Dictionary<long,List<int>> Examples, Dictionary<string,List<string>> Translations, Dictionary<string,List<int>> Definitions);
+    // 界面每次查词都会重开只读连接。仅反查共享最近两份完整的只读索引，导入批次也属于缓存键。
+    private static readonly SemaphoreSlim reverseBuild = new(1);
+    private static readonly LinkedList<((object Database, string Source, string Revision, string Hash) Key, ReverseIndex Index)> reverseCache = new();
+
+    private sealed record ReverseBook(string Id, string Name, int Priority, string Revision, string Hash, string Language);
+
+    private List<ReverseBook> ReverseBooks(string? only, string? targetLanguage, SqliteTransaction snapshot, MetadataSchema schema)
+    {
+        using var sources = Command($"""
+            SELECT d.id,d.filename,d.priority,{schema.Revision},d.sha256,d.language FROM dictionaries d {schema.Join}
+            WHERE ($language IS NULL OR d.language=$language) AND {ScopeSql(only,"d.id")}
+                AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
+                    CASE WHEN d.id='oxford' OR d.filename=$oxford THEN 'oxford'
+                         WHEN d.id='shinseiki' OR d.filename=$shinseiki THEN 'shinseiki' END)
+                    = CASE d.language WHEN 'en' THEN 'oxford' WHEN 'ja' THEN 'shinseiki' END
+                {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
+            ORDER BY d.priority,d.id
+            """,snapshot);
+        sources.Parameters.AddWithValue("$only",(object?)only ?? DBNull.Value);
+        sources.Parameters.AddWithValue("$language",(object?)targetLanguage ?? DBNull.Value);
+        foreach (string id in new[] { "oxford","shinseiki" })
+            sources.Parameters.AddWithValue("$" + id,Path.GetFileName(Source.All.First(s => s.Id == id).RelativePath));
+        var books = new List<ReverseBook>();
+        using var rows = sources.ExecuteReader();
+        while (rows.Read()) books.Add(new(rows.GetString(0),rows.GetString(1),rows.GetInt32(2),rows.GetString(3),rows.GetString(4),rows.GetString(5)));
+        return books;
+    }
+
+    private ReverseIndex GetReverseIndex(ReverseBook book, SqliteTransaction snapshot, MetadataSchema schema, CancellationToken token, string? cacheDirectory)
+    {
+        // 旧写入器可能保留 revision 却替换正文；内存库没有可跨连接复用的物理路径。
+        object database = string.IsNullOrEmpty(db.DataSource) || db.DataSource == ":memory:" ? db : (object)db.DataSource;
+        var key = (database,book.Id,book.Revision,book.Hash);
+        reverseBuild.Wait(token);
+        try
+        {
+            var found = reverseCache.First;
+            while (found != null && !found.Value.Key.Equals(key)) found = found.Next;
+            ReverseIndex index;
+            if (found != null)
+            {
+                index = found.Value.Index;
+                reverseCache.Remove(found);
+            }
+            else index = BuildReverseIndex(book,snapshot,schema,token,cacheDirectory);
+            token.ThrowIfCancellationRequested();
+            reverseCache.AddFirst((key,index));
+            if (reverseCache.Count > 2) reverseCache.RemoveLast();
+            return index;
+        }
+        finally { reverseBuild.Release(); }
+    }
+
+    public IReadOnlyList<LookupHit> ReverseLookup(string description, string? only, CancellationToken token) =>
+        ReverseByLanguage(description,only,null,token);
+
+    internal IReadOnlyList<LookupHit> ReverseLookup(string description, string? only, CancellationToken token,
+        ReverseEncoder? encoder, string? cacheDirectory) =>
+        ReverseByLanguage(description, only, "en", token, encoder, cacheDirectory);
+
+    internal IReadOnlyList<LookupHit> ReverseByLanguage(string description, string? only, string? targetLanguage,
+        CancellationToken token, ReverseEncoder? encoder = null, string? cacheDirectory = null)
+    {
+        token.ThrowIfCancellationRequested();
+        if (description.Length is < 2 or > 256) return [];
+        var query = ReverseGrams(description);
+        if (query.Count < 2) return [];
+        using var registration = token.Register(() => SQLitePCL.raw.sqlite3_interrupt(db.Handle));
+        try
+        {
+            using var snapshot = db.BeginTransaction(deferred: true);
+            var schema = SchemaIn(snapshot);
+            var books = ReverseBooks(only,targetLanguage,snapshot,schema);
+            var prepared = new Dictionary<string,(List<ReverseSense> Senses,ReverseVectors Matrix)>();
+            var lexical = new Dictionary<string,ReverseIndex>();
+            // 每本词典独立核验。用户已为英语建模时，日语仍可同时用原书词语检索。
+            foreach (var book in books)
+            {
+                if (encoder != null && cacheDirectory != null)
+                {
+                    string path = VectorPath(cacheDirectory,book,encoder);
+                    var senses = ReverseCatalogue.Open(path,token);
+                    if (senses != null && ReverseVectors.Open(path,encoder.Dimension,senses.Count,token) is { } matrix)
+                    {
+                        prepared.Add(book.Id,(senses,matrix));
+                        continue;
+                    }
+                }
+                lexical.Add(book.Id,GetReverseIndex(book,snapshot,schema,token,cacheDirectory));
+            }
+            snapshot.Commit();
+            float[]? embedding = prepared.Count == 0 ? null : encoder!.Encode([description],true,token).Single();
+            var ranked = new List<(double Score, LookupHit Hit)>();
+            string? supportPhrase = books.Any(b => b.Language == "ja") ? ChineseSupportPhrase(description) : null;
+            var japaneseQuery = query;
+            if (supportPhrase != null)
+            {
+                japaneseQuery = new HashSet<long>(query);
+                japaneseQuery.UnionWith(ReverseGrams(supportPhrase));
+            }
+            foreach (var book in books)
+            {
+                bool hasVectors = prepared.TryGetValue(book.Id,out var data);
+                var selected = hasVectors ? data.Matrix!.Nearest(description,embedding!,data.Senses!,token,book.Language == "ja" ? supportPhrase : null)
+                    : RankReverse(description,book.Language == "ja" ? japaneseQuery : query,lexical[book.Id],token);
+                foreach (var (score,item) in selected)
+                {
+                    // 零宽标题落在释义开头，让已有详情控件直接滚到所选义项并高亮原文。
+                    var entry = new LookupEntry(book.Id,item.Ordinal,book.Language,book.Priority,item.Head,null,item.Gloss)
+                    {
+                        DictionaryName=book.Name, DictionaryRevision=book.Revision, HasIndexedMergedPage=item.Merged,
+                        ReverseSourceHash=book.Hash,
+                        Anchor=new EntryAnchor(item.Span.Start..item.Span.Start,item.Span)
+                    };
+                    // 目录可跨进程复用。只回读入围日语词的同一版本物理正文，核对选中义项与原文位置。
+                    if (book.Language == "ja")
+                    {
+                        string? body = GetBody(book.Id,item.Ordinal,book.Revision,book.Hash,item.Head)?.Raw;
+                        if (body == null || !EntryParser.ShinseikiReverseSenses(body,item.Head)
+                            .Any(sense => sense.Span.Equals(item.Span) && sense.Gloss == item.Gloss)) continue;
+                        string? reading = EntryParser.Parse("shinseiki",item.Head,body,"ja").Reading;
+                        entry = entry with { Headword = EntryParser.ShinseikiReverseHeadword(body,item.Head), Reading = reading };
+                    }
+                    string label = entry.Headword;
+                    if (entry.Reading is { Length: > 0 } kana && Lookup.NormalizeReading(kana) != Lookup.NormalizeReading(label))
+                        label += $"（{kana}）";
+                    ranked.Add((score,new LookupHit(entry,"reverse",entry.Headword,$"{label} · {item.Gloss}")
+                        { UsedSemanticIndex = hasVectors }));
+                }
+            }
+            token.ThrowIfCancellationRequested();
+            // 同一词头可来自多本书。先选分数最高的真实义项，同分沿用来源优先级，再按不同词头补足五项。
+            var groups = ranked.GroupBy(r => r.Hit.Entry.Language).Select(language => language
+                .OrderByDescending(r => r.Score).ThenBy(r => r.Hit.Entry.Priority)
+                .ThenBy(r => r.Hit.Entry.DictionaryId,StringComparer.Ordinal).ThenBy(r => r.Hit.Entry.EntryId)
+                .DistinctBy(r => r.Hit.Entry.Headword,StringComparer.OrdinalIgnoreCase).Take(5)
+                .Select((r,rank) => (r.Hit,rank)));
+            // 词片得分与余弦分数不可跨语言直接比较；逐层交错，范围内的两种语言都能被看到。
+            return groups.SelectMany(g => g).OrderBy(item => item.rank)
+                .ThenBy(item => item.Hit.Entry.Language == "ja" ? 0 : 1).Take(5).Select(item => item.Hit).ToArray();
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == SQLitePCL.raw.SQLITE_INTERRUPT && token.IsCancellationRequested)
+        {
+            throw new OperationCanceledException("释义反查已取消",ex,token);
+        }
+    }
+
+    private static string VectorPath(string directory, ReverseBook book, ReverseEncoder? encoder = null)
+    {
+        // 格式版本还标识词义抽取、编码输入和量化语义。来源换版或模型替换产生独立的缓存文件。
+        string format = book.Language == "ja" ? "shinseiki-chinese-sense/int8/v1" : "oxford-main-gloss/int8/v1";
+        var identity = JsonSerializer.SerializeToUtf8Bytes(new[] { format,book.Id,book.Revision,book.Hash,encoder?.Fingerprint ?? ReverseEncoder.ModelFingerprint });
+        return Path.Combine(Path.GetFullPath(directory),"reverse-v1-"+Convert.ToHexString(SHA256.HashData(identity))+".vec");
+    }
+
+    internal bool HasPreparedReverseModel(string? only, ReverseEncoder encoder, string cacheDirectory, CancellationToken token = default)
+        => HasPreparedReverseLanguage(only,encoder,cacheDirectory,token,"en");
+
+    internal bool HasPreparedReverseLanguage(string? only, ReverseEncoder encoder, string cacheDirectory,
+        CancellationToken token, string? targetLanguage)
+    {
+        token.ThrowIfCancellationRequested();
+        using var snapshot = db.BeginTransaction(deferred:true);
+        var books = ReverseBooks(only,targetLanguage,snapshot,SchemaIn(snapshot));
+        return books.Any(book =>
+        {
+            string path = VectorPath(cacheDirectory,book,encoder);
+            return ReverseCatalogue.Ready(path) && ReverseVectors.Ready(path,encoder.Dimension);
+        });
+    }
+
+    internal int PrepareReverseModel(string? only, ReverseEncoder encoder, string cacheDirectory, CancellationToken token,
+        Action<int,int>? progress = null)
+        => PrepareReverseLanguages(only,encoder,cacheDirectory,token,progress,"en");
+
+    internal int PrepareReverseLanguages(string? only, ReverseEncoder encoder, string cacheDirectory, CancellationToken token,
+        Action<int,int>? progress, string? targetLanguage)
+    {
+        token.ThrowIfCancellationRequested();
+        List<(string Path,List<ReverseSense> Senses)> books;
+        using (var snapshot = db.BeginTransaction(deferred:true))
+        {
+            var schema = SchemaIn(snapshot);
+            books = ReverseBooks(only,targetLanguage,snapshot,schema).Select(book =>
+            {
+                string path = VectorPath(cacheDirectory,book,encoder);
+                return (path,ReverseCatalogue.Open(path,token) ?? GetReverseIndex(book,snapshot,schema,token,cacheDirectory).Senses);
+            }).ToList();
+            snapshot.Commit();
+        }
+        // 原书解析已绑定到不可变版本。漫长的模型编码期间不占用 SQLite 的读事务。
+        int total = books.Sum(item => item.Senses.Count), completed = 0;
+        progress?.Invoke(0,total);
+        foreach (var (path,senses) in books)
+        {
+            ReverseVectors.Prepare(path,senses,encoder,token,n => progress?.Invoke(completed+n,total));
+            completed += senses.Count;
+        }
+        return total;
+    }
+
+    // 英、日两本常用书轮流查时，各保留最近使用的两份快照。空值表示这版文件校验失败；
+    // 换版按文件长度和写入时间失效，重新发布时也只清除被替换的那一本。
+    private sealed class ReverseFileCache<T> where T : class
+    {
+        private sealed record Snapshot(string Path, long Length, DateTime Stamp, T? Value);
+        private readonly List<Snapshot> snapshots = new(2);
+        public readonly SemaphoreSlim LoadGate = new(1);
+
+        public bool TryGet(FileInfo file, out T? value)
+        {
+            lock (snapshots)
+            {
+                int index = snapshots.FindIndex(s => s.Path == file.FullName);
+                if (index >= 0)
+                {
+                    var item = snapshots[index];
+                    if (item.Length == file.Length && item.Stamp == file.LastWriteTimeUtc)
+                    {
+                        if (index != 0) { snapshots.RemoveAt(index); snapshots.Insert(0, item); }
+                        value = item.Value;
+                        return true;
+                    }
+                }
+                value = null;
+                return false;
+            }
+        }
+
+        public T? Remember(FileInfo file, T? value)
+        {
+            lock (snapshots)
+            {
+                snapshots.RemoveAll(s => s.Path == file.FullName);
+                if (snapshots.Count == 2) snapshots.RemoveAt(1);
+                snapshots.Insert(0, new(file.FullName, file.Length, file.LastWriteTimeUtc, value));
+            }
+            return value;
+        }
+
+        public void Publish(string pending, string path, CancellationToken token)
+        {
+            // 与正在校验的读取串行。即使文件系统将同尺寸的新旧文件赋予同一时间，也不能重新装入旧对象。
+            LoadGate.Wait(token);
+            try
+            {
+                File.Move(pending, path, true);
+                string full = Path.GetFullPath(path);
+                lock (snapshots) snapshots.RemoveAll(s => s.Path == full);
+            }
+            finally { LoadGate.Release(); }
+        }
+    }
+
+    // 已准备的向量按词典物理顺序排列。小目录让新进程直接还原每一行的原书义项，无需重新生成词片倒排。
+    private static class ReverseCatalogue
+    {
+        private const int Header = 76;
+        private static readonly ReverseFileCache<List<ReverseSense>> cache = new();
+
+        internal static bool Ready(string path)
+        {
+            var info = new FileInfo(path+".catalog");
+            if (!info.Exists || info.Length < Header || info.Length > 128L*1024*1024) return false;
+            return !cache.TryGet(info,out var cached) || cached != null;
+        }
+
+        internal static List<ReverseSense>? Open(string path,CancellationToken token)
+        {
+            cache.LoadGate.Wait(token);
+            try
+            {
+                var info = new FileInfo(path+".catalog");
+                if (!info.Exists || info.Length < Header || info.Length > 128L*1024*1024) return null;
+                if (cache.TryGet(info,out var cached)) return cached;
+                using var input = new FileStream(info.FullName,FileMode.Open,FileAccess.Read,FileShare.Read|FileShare.Delete);
+                if (input.Length != info.Length) return null;
+                var bytes = new byte[checked((int)input.Length)];
+                input.ReadExactly(bytes);
+                int count = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(40));
+                if (!bytes.AsSpan(0,8).SequenceEqual("ESRC0001"u8) || !bytes.AsSpan(8,32).SequenceEqual(ReverseVectors.Key(path))
+                    || count < 0 || count > (bytes.Length-Header)/19
+                    || !SHA256.HashData(bytes.AsSpan(Header)).AsSpan().SequenceEqual(bytes.AsSpan(44,32))) return cache.Remember(info,null);
+                using var stream = new MemoryStream(bytes,Header,bytes.Length-Header,false);
+                using var reader = new BinaryReader(stream,new UTF8Encoding(false,true));
+                var senses = new List<ReverseSense>(count);
+                for (int i=0;i<count;i++)
+                {
+                    if ((i & 255) == 0) token.ThrowIfCancellationRequested();
+                    long ordinal = reader.ReadInt64();
+                    int start = reader.ReadInt32(), end = reader.ReadInt32();
+                    bool merged = reader.ReadBoolean();
+                    string head = reader.ReadString(), gloss = reader.ReadString();
+                    if (ordinal < 0 || start < 0 || end <= start) return cache.Remember(info,null);
+                    senses.Add(new(ordinal,head,gloss,start..end,merged,0));
+                }
+                return cache.Remember(info,stream.Position == stream.Length ? senses : null);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DecoderFallbackException or FormatException) { return null; }
+            finally { cache.LoadGate.Release(); }
+        }
+
+        internal static void Ensure(string path,List<ReverseSense> senses,CancellationToken token)
+        {
+            if (Open(path,token)?.Count == senses.Count) return;
+            using var payload = new MemoryStream();
+            using (var writer = new BinaryWriter(payload,Encoding.UTF8,true))
+                foreach (var sense in senses)
+                {
+                    token.ThrowIfCancellationRequested();
+                    writer.Write(sense.Ordinal);
+                    writer.Write(sense.Span.Start.Value);
+                    writer.Write(sense.Span.End.Value);
+                    writer.Write(sense.Merged);
+                    writer.Write(sense.Head);
+                    writer.Write(sense.Gloss);
+                }
+            var bytes = payload.GetBuffer().AsSpan(0,(int)payload.Length);
+            string catalog = path+".catalog";
+            using (var file = new FileStream(catalog+".part",FileMode.Create,FileAccess.Write,FileShare.None))
+            using (var header = new BinaryWriter(file))
+            {
+                header.Write("ESRC0001"u8);
+                header.Write(ReverseVectors.Key(path));
+                header.Write(senses.Count);
+                header.Write(SHA256.HashData(bytes));
+                header.Write(bytes);
+                file.Flush(true);
+            }
+            token.ThrowIfCancellationRequested();
+            cache.Publish(catalog+".part",catalog,token);
+        }
+
+        internal static void TrySaveLexical(string path,List<ReverseSense> senses,CancellationToken token)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                // 普通查询只尝试取得一次与显式模型准备相同的锁；另一进程写入时直接使用内存结果。
+                using var guard = new FileStream(path+".lock",FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None);
+                Ensure(path,senses,token);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    private sealed class ReverseVectors(byte[] data, int dimension, float[] inverseNorms)
+    {
+        private const int BatchRows = 64, HeaderLength = 48;
+        private static readonly ReverseFileCache<ReverseVectors> cache = new();
+
+        private static int ReadHeader(FileStream stream,string path,int dim)
+        {
+            Span<byte> header = stackalloc byte[HeaderLength];
+            if (stream.Length < header.Length) return -1;
+            stream.ReadExactly(header);
+            if (!header[..8].SequenceEqual("ESRV0001"u8) || !header[8..40].SequenceEqual(Key(path))
+                || System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(header[40..]) != dim) return -1;
+            return System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(header[44..]);
+        }
+
+        internal static byte[] Key(string path) => Convert.FromHexString(Path.GetFileNameWithoutExtension(path)["reverse-v1-".Length..]);
+        private static long FileSize(int count,int dim) => HeaderLength + (long)count*dim + ((count + 63L)/BatchRows)*32;
+        private static FileStream ReadFile(string path) => new(path,FileMode.Open,FileAccess.Read,
+            FileShare.Read|FileShare.Delete,64*1024,FileOptions.SequentialScan);
+
+        internal static bool Ready(string path,int dim)
+        {
+            try
+            {
+                var info = new FileInfo(path);
+                if (!info.Exists || cache.TryGet(info,out var cached) && cached == null) return false;
+                using var file = ReadFile(path);
+                int count = ReadHeader(file,path,dim);
+                return count >= 0 && file.Length == FileSize(count,dim);
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+        }
+
+        private static bool ReadBatch(FileStream input, Span<byte> values)
+        {
+            Span<byte> saved = stackalloc byte[32], actual = stackalloc byte[32];
+            if (input.Length-input.Position < saved.Length + values.Length) return false;
+            input.ReadExactly(saved);
+            input.ReadExactly(values);
+            SHA256.HashData(values,actual);
+            return saved.SequenceEqual(actual);
+        }
+
+        internal static ReverseVectors? Open(string path,int dim,int count,CancellationToken token)
+        {
+            cache.LoadGate.Wait(token);
+            try
+            {
+                var info = new FileInfo(path);
+                if (!info.Exists || info.Length != FileSize(count,dim)) return null;
+                if (cache.TryGet(info,out var cached)) return cached;
+                using var file = ReadFile(path);
+                if (ReadHeader(file,path,dim) != count) return null;
+                var vectors = new byte[checked(count*dim)];
+                var norms = new float[count];
+                for (int row = 0; row < count; row += BatchRows)
+                {
+                    token.ThrowIfCancellationRequested();
+                    int rows = Math.Min(BatchRows,count-row);
+                    if (!ReadBatch(file,vectors.AsSpan(row*dim,rows*dim))) return cache.Remember(info,null);
+                    for (int j = row; j < row+rows; j++)
+                    {
+                        var vector = vectors.AsSpan(j*dim,dim);
+                        int squared = Dot(vector,vector);
+                        if (squared == 0) return cache.Remember(info,null);
+                        norms[j] = 1/MathF.Sqrt(squared);
+                    }
+                }
+                var matrix = new ReverseVectors(vectors,dim,norms);
+                return cache.Remember(info,matrix);
+            }
+            catch (IOException) { return null; }
+            catch (UnauthorizedAccessException) { return null; }
+            finally { cache.LoadGate.Release(); }
+        }
+
+        private static FileStream WriterLock(string path,CancellationToken token)
+        {
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                try { return new FileStream(path,FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None); }
+                catch (IOException ex) when ((ex.HResult & 0xffff) is 32 or 33 or 11) { token.WaitHandle.WaitOne(100); }
+            }
+        }
+
+        internal static void Prepare(string path,List<ReverseSense> senses,ReverseEncoder encoder,CancellationToken token,Action<int> progress)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            int dim = encoder.Dimension, total = senses.Count;
+            using var guard = WriterLock(path+".lock",token);
+            ReverseCatalogue.Ensure(path,senses,token);
+            if (Open(path,dim,total,token) != null) { progress(total); return; }
+            string partial = path+".part";
+            using (var file = new FileStream(partial,FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.Read))
+            {
+                if (ReadHeader(file,path,dim) != total)
+                {
+                    file.SetLength(0);
+                    file.Position = 0;
+                    using var header = new BinaryWriter(file,Encoding.UTF8,true);
+                    header.Write("ESRV0001"u8);
+                    header.Write(Key(path));
+                    header.Write(dim);
+                    header.Write(total);
+                }
+                var buffer = new byte[checked(BatchRows*dim)];
+                int row = 0;
+                // 只信任完整且散列正确的批次。取消、断电或第二个进程接手时从上一个完整批次继续。
+                while (row < total)
+                {
+                    token.ThrowIfCancellationRequested();
+                    int rows = Math.Min(BatchRows,total-row);
+                    long begin = file.Position;
+                    if (!ReadBatch(file,buffer.AsSpan(0,rows*dim))) { file.SetLength(begin); file.Position=begin; break; }
+                    row += rows;
+                }
+                progress(row);
+                while (row < total)
+                {
+                    token.ThrowIfCancellationRequested();
+                    int rows = Math.Min(BatchRows,total-row);
+                    var texts = senses.GetRange(row,rows).Select(s => s.Gloss).ToArray();
+                    var batch = encoder.Encode(texts,false,token);
+                    if (batch.Length != rows) throw new InvalidDataException("模型返回的词义向量数不符。");
+                    for (int i=0;i<rows;i++) Quantize(batch[i],buffer.AsSpan(i*dim,dim));
+                    var values = buffer.AsSpan(0,rows*dim);
+                    file.Write(SHA256.HashData(values));
+                    file.Write(values);
+                    file.Flush();
+                    row += rows;
+                    progress(row);
+                }
+                token.ThrowIfCancellationRequested();
+                file.SetLength(file.Position);
+                file.Flush(true);
+            }
+            cache.Publish(partial,path,token);
+        }
+
+        private static void Quantize(float[] vector, Span<byte> output)
+        {
+            if (vector.Length != output.Length) throw new InvalidDataException("模型向量维度与索引不符。");
+            float peak = 0;
+            foreach (float value in vector) peak = Math.Max(peak,Math.Abs(value));
+            if (!float.IsFinite(peak) || peak == 0) throw new InvalidDataException("模型词向量不是有限非零向量。");
+            for (int j=0;j<vector.Length;j++)
+                output[j] = unchecked((byte)(sbyte)Math.Clamp((int)MathF.Round(vector[j]/peak*127),-127,127));
+        }
+
+        private static int Dot(ReadOnlySpan<byte> left,ReadOnlySpan<byte> right)
+        {
+            var a = System.Runtime.InteropServices.MemoryMarshal.Cast<byte,sbyte>(left);
+            var b = System.Runtime.InteropServices.MemoryMarshal.Cast<byte,sbyte>(right);
+            int sum = 0, j = 0;
+            // 先把有符号字节扩到 16 位再做相邻乘加，累积到 32 位。与逐项整数点积一致。
+            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+            {
+                var accumulator = System.Runtime.Intrinsics.Vector256<int>.Zero;
+                ref sbyte first = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(a);
+                ref sbyte second = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(b);
+                for (; j+16 <= a.Length; j+=16)
+                {
+                    var x = System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int16(System.Runtime.Intrinsics.Vector128.LoadUnsafe(ref first,(nuint)j));
+                    var y = System.Runtime.Intrinsics.X86.Avx2.ConvertToVector256Int16(System.Runtime.Intrinsics.Vector128.LoadUnsafe(ref second,(nuint)j));
+                    accumulator += System.Runtime.Intrinsics.X86.Avx2.MultiplyAddAdjacent(x,y);
+                }
+                sum = System.Runtime.Intrinsics.Vector256.Sum(accumulator);
+            }
+            for (;j<a.Length;j++) sum += a[j]*b[j];
+            return sum;
+        }
+
+        internal List<(double Score,ReverseSense Sense)> Nearest(string description,float[] embedding,List<ReverseSense> senses,
+            CancellationToken token, string? supportPhrase)
+        {
+            var query = new byte[dimension];
+            Quantize(embedding,query);
+            string original = description.Trim();
+            float inverse = 1/MathF.Sqrt(Dot(query,query));
+            var top = new List<(double Score,ReverseSense Sense)>(6);
+            (double Score,ReverseSense Sense)? supported = null;
+            // 对该书每个真实义项精确计算量化后的余弦；没有汉字重叠的词也能被检出。
+            for (int row=0;row<senses.Count;row++)
+            {
+                if ((row & 127) == 0) token.ThrowIfCancellationRequested();
+                var sense = senses[row];
+                double score = sense.Gloss.Equals(original, StringComparison.Ordinal) ? 2
+                    : Dot(query,data.AsSpan(row*dimension,dimension))*inverse*inverseNorms[row];
+                if (supportPhrase != null && (supported == null || score > supported.Value.Score)
+                    && sense.Gloss.Contains(supportPhrase,StringComparison.Ordinal))
+                    supported = (score,sense);
+                if (top.Count == 5 && score <= top[^1].Score) continue;
+                int index = top.FindIndex(item => item.Sense.Head.Equals(sense.Head,StringComparison.OrdinalIgnoreCase));
+                if (index >= 0)
+                {
+                    if (top[index].Score >= score) continue;
+                    top.RemoveAt(index);
+                }
+                int place = top.FindIndex(item => item.Score < score);
+                top.Insert(place < 0 ? top.Count : place,(score,sense));
+                if (top.Count > 5) top.RemoveAt(5);
+            }
+            // 余弦容易返回用途相关的动作词。给原书明确写出所述支撑关系的最佳义项留一个位置。
+            // 首个语义候选仍优先；同词若已入围则替换到有原文佐证的义项，逐字命中的原义保留。
+            if (supported is { } hit && top.Count > 0)
+            {
+                int found = top.FindIndex(x => x.Sense.Head.Equals(hit.Sense.Head,StringComparison.OrdinalIgnoreCase));
+                if (found == 0)
+                {
+                    if (top[0].Score < 2) top[0] = (top[0].Score,hit.Sense);
+                }
+                else if (found < 0 || top[found].Score < 2)
+                {
+                    if (found >= 0) top.RemoveAt(found);
+                    int slot = Math.Max(1,top.TakeWhile(x => x.Score == 2).Count());
+                    double rankScore = slot == top.Count ? hit.Score : (top[slot-1].Score + top[slot].Score) / 2;
+                    top.Insert(slot,(rankScore,hit.Sense));
+                    if (top.Count > 5) top.RemoveAt(5);
+                }
+            }
+            return top;
+        }
+    }
+
+    private ReverseIndex BuildReverseIndex(ReverseBook book, SqliteTransaction snapshot, MetadataSchema schema, CancellationToken token, string? cacheDirectory)
+    {
+        var index = new ReverseIndex(new(),new(),new(),new(StringComparer.Ordinal),new(StringComparer.Ordinal));
+        string? catalogPath = null;
+        if (book.Language == "ja")
+        {
+            // 新世纪仅用中文主释义，现有义项目录包含完整的词片证据。牛津的例句和英文释词仍需原书。
+            try { catalogPath = VectorPath(cacheDirectory ?? ReverseEncoder.CacheDirectory,book); }
+            catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException or UnauthorizedAccessException) { }
+            if (catalogPath != null && ReverseCatalogue.Open(catalogPath,token) is { } retained)
+            {
+                foreach (var sense in retained)
+                {
+                    token.ThrowIfCancellationRequested();
+                    AddSense(sense.Ordinal,sense.Head,sense.Gloss,sense.Span,sense.Merged);
+                }
+                return index;
+            }
+        }
+        // 顺序访问所选原书的物理记录；每个主词义独立建索引，例句、惯用语和词形表沿用牛津解析器的边界。
+        using var command = Command($"""
+            SELECT e.ordinal,e.head,e.raw,{schema.RecordRange} FROM entries e {schema.RecordJoin}
+            WHERE e.dict=$source AND e.link IS NULL ORDER BY e.ordinal
+            """,snapshot);
+        command.Parameters.AddWithValue("$source",book.Id);
+        using var rows = command.ExecuteReader();
+        while (rows.Read())
+        {
+            token.ThrowIfCancellationRequested();
+            long ordinal = rows.GetInt64(0);
+            string head = rows.GetString(1);
+            bool merged = !rows.IsDBNull(5);
+            string body = rows.IsDBNull(3) ? rows.GetString(2)
+                : ReadSourceBody(book.Hash,rows.GetInt64(3),rows.GetInt64(4),merged,book.Id,ordinal);
+            var senses = book.Language == "ja" ? EntryParser.ShinseikiReverseSenses(body,head) : EntryParser.OxfordReverseSenses(body);
+            foreach (var (gloss,span,examples,definition) in senses)
+            {
+                int id = AddSense(ordinal,head,gloss,span,merged);
+                if (id < 0 || book.Language == "ja") continue;
+                foreach (long gram in ReverseGrams(examples))
+                {
+                    if (!index.Examples.TryGetValue(gram,out var posting)) index.Examples[gram] = posting = new();
+                    posting.Add(id);
+                }
+                // 只用本书短释义建立中英对应。多义过多的中文词片不参与跨语言扩展。
+                string word = head.ToLowerInvariant();
+                if (word.Length is >= 3 and <= 40 && word.All(c => c is >= 'a' and <= 'z'))
+                {
+                    foreach (string part in gloss.Split(['；','，','、',';',','],StringSplitOptions.TrimEntries))
+                    {
+                        if (part.Length is < 2 or > 8 || !part.All(c => c is >= '\u3400' and <= '\u9fff')) continue;
+                        if (!index.Translations.TryGetValue(part,out var words)) index.Translations[part] = words = new();
+                        if (words.Count <= 12 && !words.Contains(word)) words.Add(word);
+                    }
+                }
+                var english = System.Text.RegularExpressions.Regex.Matches(definition.ToLowerInvariant(), @"[a-z]{3,}")
+                    .Select(m => m.Value).Distinct(StringComparer.Ordinal);
+                foreach (string term in english)
+                {
+                    if (!index.Definitions.TryGetValue(term,out var posting)) index.Definitions[term] = posting = new();
+                    posting.Add(id);
+                }
+            }
+        }
+        if (catalogPath != null) ReverseCatalogue.TrySaveLexical(catalogPath,index.Senses,token);
+        return index;
+
+        int AddSense(long ordinal,string head,string gloss,Range span,bool merged)
+        {
+            var grams = ReverseGrams(gloss);
+            if (grams.Count == 0) return -1;
+            int id = index.Senses.Count;
+            index.Senses.Add(new(ordinal,head,gloss,span,merged,grams.Count));
+            foreach (long gram in grams)
+            {
+                if (!index.Postings.TryGetValue(gram,out var posting)) index.Postings[gram] = posting = new();
+                posting.Add(id);
+            }
+            return id;
+        }
+    }
+
+    private static HashSet<long> ReverseGrams(string text)
+    {
+        // 只在相邻汉字间建二元组；标点、词性标记和虚词切断跨度。单字保留独立证据。
+        var grams = new HashSet<long>();
+        int previous = 0;
+        foreach (var rune in text.EnumerateRunes())
+        {
+            int c = rune.Value;
+            if (!(c is >= 0x3400 and <= 0x9fff or >= 0x20000 and <= 0x323af)
+                || c <= char.MaxValue && "的是了与和而也把被或等及这那".Contains((char)c))
+            { previous = 0; continue; }
+            grams.Add(c);
+            if (previous != 0) grams.Add(((long)previous << 21) | (uint)c);
+            previous = c;
+        }
+        return grams;
+    }
+
+    private static string? ChineseSupportPhrase(string description)
+    {
+        // 口语“放在 X 下面”可对应原书的“垫 X”。保留原描述，仅补入动作与受支撑部位相邻的证据。
+        var position = System.Text.RegularExpressions.Regex.Match(description,
+            @"(?:放在|垫在|墊在)([\u3400-\u9fff]{1,6}?)(?:的)?(?:底下|下面|下方|下)");
+        return position.Success ? "垫" + position.Groups[1].Value : null;
+    }
+
+    private static IEnumerable<(double Score, ReverseSense Sense)> RankReverse(string description, HashSet<long> query, ReverseIndex index, CancellationToken token)
+    {
+        var scores = new Dictionary<int,(double Weight,double GlossWeight,int Singles,bool Pair,int ExamplePairs,int Concepts)>();
+        foreach (long term in query)
+        {
+            bool pair = term >= 1L << 21;
+            // 中文译例只作为辅助证据。仅依靠例句进入候选时，须至少命中两个不同的二元片段。
+            Add(index.Postings, false);
+            if (pair) Add(index.Examples, true);
+
+            void Add(Dictionary<long,List<int>> field, bool example)
+            {
+                if (!field.TryGetValue(term,out var posting)) return;
+                double idf = Math.Log(1 + (index.Senses.Count + 1.0) / (posting.Count + 1));
+                double weight = idf * (pair ? 3 : 1) * (example ? 0.45 : 1);
+                for (int i = 0; i < posting.Count; i++)
+                {
+                    if ((i & 255) == 0) token.ThrowIfCancellationRequested();
+                    int doc = posting[i];
+                    scores.TryGetValue(doc,out var old);
+                    scores[doc] = (old.Weight + weight,old.GlossWeight + (example ? 0 : weight),old.Singles + (!pair ? 1 : 0),
+                        old.Pair || pair && !example,old.ExamplePairs + (example ? 1 : 0),old.Concepts);
+                }
+            }
+        }
+        // 用输入里完整的中文释义查本书对应的英文单词，再找定义中出现这些词的义项。
+        // 同一中文概念的多个英文释词对同一义只计一次；仅依靠英文定义时须两个独立概念互相印证。
+        var seen = new HashSet<string>();
+        for (int start=0; start+1<description.Length;start++)
+        {
+            for (int length=Math.Min(8,description.Length-start);length>=2;length--)
+            {
+                string part = description.Substring(start,length);
+                if (!index.Translations.TryGetValue(part,out var words) || words.Count > 12) continue;
+                if (seen.Add(part))
+                {
+                    var evidence = new Dictionary<int,double>();
+                    foreach (string word in words)
+                    {
+                        if (!index.Definitions.TryGetValue(word,out var matches) || matches.Count > Math.Max(32,index.Senses.Count/16)) continue;
+                        double weight = 4.5 * Math.Log(1 + (index.Senses.Count+1.0)/(matches.Count+1)) / Math.Sqrt(words.Count);
+                        for (int n=0;n<matches.Count;n++)
+                        {
+                            if ((n & 255)==0) token.ThrowIfCancellationRequested();
+                            int doc=matches[n];
+                            evidence[doc]=Math.Max(evidence.GetValueOrDefault(doc),weight);
+                        }
+                    }
+                    foreach (var (doc,weight) in evidence)
+                    {
+                        scores.TryGetValue(doc,out var old);
+                        scores[doc]=(old.Weight+weight,old.GlossWeight,old.Singles,old.Pair,old.ExamplePairs,old.Concepts+1);
+                    }
+                }
+                start += length-1;
+                break;
+            }
+        }
+        var best = new List<(double Score, ReverseSense Sense)>();
+        (double Score, ReverseSense? Sense) lexical = (0,null);
+        double lexicalScore = 0;
+        foreach (var (id,evidence) in scores)
+        {
+            var sense = index.Senses[id];
+            bool direct = evidence.Pair || evidence.Singles >= 3;
+            if (!direct && evidence.ExamplePairs < 2 && evidence.Concepts < 2) continue;
+            double scale = 3 + Math.Sqrt(sense.GramCount);
+            double score = sense.Gloss.Equals(description.Trim(), StringComparison.Ordinal) ? double.MaxValue : evidence.Weight / scale;
+            best.Add((score,sense));
+            if (direct && (evidence.GlossWeight/scale > lexicalScore || evidence.GlossWeight/scale == lexicalScore
+                && lexical.Sense is { } previous && (sense.Ordinal,sense.Span.Start.Value).CompareTo((previous.Ordinal,previous.Span.Start.Value)) < 0))
+            {
+                lexicalScore = evidence.GlossWeight/scale;
+                lexical = (score,sense);
+            }
+        }
+        var top = best.OrderByDescending(x => x.Score).ThenBy(x => x.Sense.Ordinal).ThenBy(x => x.Sense.Span.Start.Value)
+            .DistinctBy(x => x.Sense.Head,StringComparer.OrdinalIgnoreCase).Take(5).ToList();
+        // 双语证据可以引入新候选，同时给直接释义字片证据最强的词头保留一个名额。
+        if (top.Count == 5 && lexical.Sense != null && !top.Any(t => t.Sense.Head.Equals(lexical.Sense.Head,StringComparison.OrdinalIgnoreCase)))
+            top[^1] = (lexical.Score, lexical.Sense);
+        return top;
     }
 
     public void Compact()

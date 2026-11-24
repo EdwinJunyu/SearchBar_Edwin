@@ -13,20 +13,26 @@ public partial class SettingsWindow : Window
     private readonly string databasePath;
     private readonly Func<uint, uint, Task<string?>> applyHotkey;
     private readonly Action onCatalogChanged;
+    private readonly FileRefindHistory fileHistory;
+    private (int Mode, long Epoch) savedFilePreferences;
+    internal event Action<(int Mode, long Epoch)>? FileRefindChanged;
     private IReadOnlyList<string[]> sample = [];
     private string? preparedPath;
     private int previewVersion;
     private bool busy, ready, closed;
     private CancellationTokenSource? currentOperation;
-    internal bool HasPendingWrite { get; private set; }
+    private bool catalogWritePending, fileSettingsPending;
+    internal bool HasPendingWrite => catalogWritePending || fileSettingsPending;
     private const string NoReading = "不导入读音";
 
     internal SettingsWindow(string databasePath, Func<uint, uint, Task<string?>> applyHotkey, Action onCatalogChanged, string hotkeyWarning)
     {
         this.databasePath = databasePath;
+        fileHistory = new FileRefindHistory(databasePath);
         this.applyHotkey = applyHotkey;
         this.onCatalogChanged = onCatalogChanged;
         InitializeComponent();
+        Loaded += InitializeFileHistory;
         if (hotkeyWarning.Length > 0) Message(HotkeyStatus, hotkeyWarning, true);
         MinWidth = Math.Min(MinWidth, SystemParameters.WorkArea.Width);
         MinHeight = Math.Min(MinHeight, SystemParameters.WorkArea.Height);
@@ -49,6 +55,59 @@ public partial class SettingsWindow : Window
     {
         "en" => "英语", "zh" => "中文", "ja" => "日语", _ => language
     };
+
+    private async void InitializeFileHistory(object sender, RoutedEventArgs e)
+    {
+        Loaded -= InitializeFileHistory;
+        try
+        {
+            savedFilePreferences = await Task.Run(fileHistory.GetPreferences);
+            FileRefindMode.SelectedIndex = savedFilePreferences.Mode;
+            FileRefindMode.IsEnabled = ClearFileRefindButton.IsEnabled = true;
+        }
+        catch (Exception ex) when (FileRefindHistory.IsStorageFailure(ex)) { Message(FileRefindStatus, ex.Message, true); }
+    }
+
+    private async void ChangeFileRefindMode(object sender, SelectionChangedEventArgs e)
+    {
+        int choice = FileRefindMode.SelectedIndex;
+        if (!FileRefindMode.IsEnabled || choice < 0 || choice == savedFilePreferences.Mode) return;
+        fileSettingsPending = true;
+        FileRefindMode.IsEnabled = ClearFileRefindButton.IsEnabled = false;
+        if (choice == 0) FileRefindChanged?.Invoke(default);
+        try
+        {
+            savedFilePreferences = await Task.Run(() => fileHistory.SetMode(choice));
+            Message(FileRefindStatus, choice == 0 ? "已停止记录，已恢复 Everything 顺序。" : "已保存文件排序方式。");
+            FileRefindChanged?.Invoke(savedFilePreferences);
+        }
+        catch (Exception ex) when (FileRefindHistory.IsStorageFailure(ex))
+        {
+            FileRefindMode.SelectedIndex = savedFilePreferences.Mode;
+            FileRefindChanged?.Invoke(savedFilePreferences);
+            Message(FileRefindStatus, $"未能保存排序方式。{ex.Message}", true);
+        }
+        finally { fileSettingsPending = false; FileRefindMode.IsEnabled = ClearFileRefindButton.IsEnabled = true; }
+    }
+
+    private async void ClearFileRefind(object sender, RoutedEventArgs e)
+    {
+        fileSettingsPending = true;
+        FileRefindMode.IsEnabled = ClearFileRefindButton.IsEnabled = false;
+        FileRefindChanged?.Invoke(default);
+        try
+        {
+            savedFilePreferences = await Task.Run(fileHistory.Clear);
+            FileRefindChanged?.Invoke(savedFilePreferences);
+            Message(FileRefindStatus, "已清除本机的文件打开记录。");
+        }
+        catch (Exception ex) when (FileRefindHistory.IsStorageFailure(ex))
+        {
+            FileRefindChanged?.Invoke(savedFilePreferences);
+            Message(FileRefindStatus, ex.Message, true);
+        }
+        finally { fileSettingsPending = false; FileRefindMode.IsEnabled = ClearFileRefindButton.IsEnabled = true; }
+    }
 
     private async void Initialize(object sender, RoutedEventArgs e)
     {
@@ -116,7 +175,7 @@ public partial class SettingsWindow : Window
     private Action<string,long,long> TrackProgress(CancellationTokenSource operation, TextBlock status)
     {
         currentOperation = operation;
-        HasPendingWrite = true;
+        catalogWritePending = true;
         Busy(true);
         bool importing = status == ImportStatus;
         var cancel = importing ? CancelImportButton : CancelRestoreButton;
@@ -156,7 +215,7 @@ public partial class SettingsWindow : Window
     private void EndOperation()
     {
         currentOperation = null;
-        HasPendingWrite = false;
+        catalogWritePending = false;
         if (closed) return;
         ImportProgress.Visibility = CancelImportButton.Visibility = CancelRestoreButton.Visibility = Visibility.Collapsed;
         Busy(false);
@@ -457,7 +516,7 @@ public partial class SettingsWindow : Window
         try
         {
             var (modifiers, key) = ParseHotkey(HotkeyCapture.Text);
-            HasPendingWrite = true;
+            catalogWritePending = true;
             Busy(true);
             Message(HotkeyStatus, "正在保存快捷键…");
             var error = await applyHotkey(modifiers, key);
@@ -469,7 +528,7 @@ public partial class SettingsWindow : Window
         catch (Exception ex) { if (!closed) Message(HotkeyStatus, ex.Message, true); }
         finally
         {
-            HasPendingWrite = false;
+            catalogWritePending = false;
             if (!closed) Busy(false);
         }
     }

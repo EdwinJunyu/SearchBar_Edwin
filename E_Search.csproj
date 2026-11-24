@@ -6,7 +6,16 @@
     <Nullable>enable</Nullable>
     <Version>0.2.0</Version>
     <DefaultItemExcludes>$(DefaultItemExcludes);.tools/**;.data/**</DefaultItemExcludes>
+    <ReverseModelDirectory Condition="'$(ReverseModelDirectory)' == ''">$(E_SEARCH_REVERSE_MODEL)</ReverseModelDirectory>
   </PropertyGroup>
+  <!-- 仅显式指定时随包交付已核验的模型目录。限制复制文件名，避免带入用户缓存、测试数据或其它权重。 -->
+  <ItemGroup Condition="'$(ReverseModelDirectory)' != ''">
+    <_ReverseModelFile Include="$(ReverseModelDirectory)/model.onnx;$(ReverseModelDirectory)/vocab.txt;$(ReverseModelDirectory)/LICENSE.txt;$(ReverseModelDirectory)/provenance.json" />
+    <_ReverseModelFile Include="$(ReverseModelDirectory)/MODEL-CARD.md" Condition="Exists('$(ReverseModelDirectory)/MODEL-CARD.md')" />
+    <_ReverseModelFile Include="$(ReverseModelDirectory)/CONVERSION.md" Condition="Exists('$(ReverseModelDirectory)/CONVERSION.md')" />
+    <Content Include="@(_ReverseModelFile)" Link="models/bge-small-zh-v1.5/%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
   <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0-windows'">
     <!-- 透明 WPF 浮窗的 WebView2 合成控件需要 Windows 10 1809 WinRT 投影。 -->
     <TargetPlatformIdentifier>Windows</TargetPlatformIdentifier>
@@ -91,5 +100,10 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.0" />
     <PackageReference Include="SQLitePCLRaw.provider.winsqlite3" Version="2.1.11" />
+    <!-- 中文释义反查在 Windows CPU 上运行本地 ONNX 模型，命令行与桌面使用同一个推理运行时。 -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.23.2" GeneratePathProperty="true" />
+    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime)/LICENSE;$(PkgMicrosoft_ML_OnnxRuntime)/ThirdPartyNotices.txt"
+             Condition="'$(PkgMicrosoft_ML_OnnxRuntime)' != ''" Link="licenses/OnnxRuntime-%(Filename)%(Extension)"
+             CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

@@ -7,6 +7,7 @@ using System.Net;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -18,6 +19,7 @@ using System.Windows.Interop;
 using System.Windows.Threading;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
+using Microsoft.Data.Sqlite;
 using Forms = System.Windows.Forms;
 
 namespace ESearch;
@@ -33,8 +35,19 @@ public partial class SearchWindow : Window
     private long catalogRevision;
     private readonly string databasePath;
     private string? dictionaryId;
+    private string? acceptedDictionaryText;
+    private string? acceptedFileName;
     private readonly DispatcherTimer debounce;
     private readonly EverythingSearch everything = new();
+    private readonly FileRefindHistory fileHistory;
+    private IReadOnlyList<FileHit> sdkFiles = [];
+    private string sdkQuery = "";
+    private Task<(int Mode, long Epoch)> filePreferences;
+    private Task pendingFileWrite = Task.CompletedTask;
+    private CancellationTokenSource writingConsent = new();
+    private CancellationTokenSource? pendingFileRank;
+    private readonly SemaphoreSlim fileRankGate = new(1);
+    private bool userPickedFile;
     private readonly double preferredWidth;
     private (string Monitor, int X, int Y)? dragPosition;
     private readonly ForegroundCallback observeForeground;
@@ -48,18 +61,58 @@ public partial class SearchWindow : Window
     private long fileActionRevision;
     private bool navigatingFiles;
     private CancellationTokenSource? pending;
+    private CancellationTokenSource? catalogPending;
+    private CancellationTokenSource? preparingReverse;
+    private string? selectedReverseDirectory;
+    private string? rejectedModelDirectory;
+    private string? reverseTargetLanguage;
+    private bool reverseModelReady, useReverseModel = true;
+    private string CurrentModelDirectory => selectedReverseDirectory ?? ReverseEncoder.ModelDirectory;
     private CancellationTokenSource? pendingPreview;
     private readonly Stack<(MergedArticle Page, string Fragment)> mergedHistory = new();
     private (MergedArticle Page, string Fragment)? mergedCurrent;
-    private Task? mergedBrowserReady;
+    private Task<Exception?>? mergedBrowserReady;
     private WebView2CompositionControl? mergedWeb;
     private string? mergedResourcePath, mergedDocumentPath;
     private byte[] mergedDocument = [];
     private Dictionary<string, byte[]> mergedAssets = new(StringComparer.Ordinal);
+    // 实际读取完成时取样，统一在窗口线程交付，使基准可以关联工作线程和屏幕上的同一次展开。
+    internal event Action<long, string, long>? DetailStage;
+
+    private void MarkDetail(long request, string stage)
+    {
+        var observer = DetailStage;
+        if (observer == null) return;
+        long ticks = Stopwatch.GetTimestamp();
+        void Report()
+        {
+            try { observer(request, stage, ticks); }
+            catch (Exception ex) { Debug.WriteLine(ex); } // 性能观察器不能改变正常查词的结果。
+        }
+        if (Dispatcher.CheckAccess()) Report();
+        else Dispatcher.InvokeAsync(Report);
+    }
+
+    private void ObserveTextFrame(long request)
+    {
+        if (DetailStage == null) return;
+        void Rendered(object? sender, EventArgs args)
+        {
+            System.Windows.Media.CompositionTarget.Rendering -= Rendered;
+            if (request == detailRevision && DetailScroll.IsVisible) MarkDetail(request, "text-rendered");
+        }
+        System.Windows.Media.CompositionTarget.Rendering += Rendered;
+    }
 
     public SearchWindow(string databasePath, string? dictionaryId = null)
     {
         this.databasePath = Path.GetFullPath(databasePath);
+        fileHistory = new FileRefindHistory(this.databasePath);
+        filePreferences = Task.Run(() =>
+        {
+            try { return fileHistory.GetPreferences(); }
+            catch (Exception ex) when (FileRefindHistory.IsStorageFailure(ex)) { Debug.WriteLine(ex); return default; }
+        });
         this.dictionaryId = dictionaryId;
         InitializeComponent();
         preferredWidth = Width;
@@ -81,6 +134,7 @@ public partial class SearchWindow : Window
         ClearReadingPreferenceButton.Click += async (_, _) => await ChangeReadingPreferenceAsync(clear: true);
         CandidatePicker.SelectionChanged += (_, _) => { if (DetailsPanel.IsVisible) _ = ShowEntryAsync(); };
         FileList.SelectionChanged += (_, _) => pendingPreview?.Cancel();
+        FileList.PreviewMouseDown += (_, _) => userPickedFile = true;
         SizeChanged += (_, e) =>
         {
             if (IsVisible && e.HeightChanged && e.NewSize.Height > e.PreviousSize.Height)
@@ -203,6 +257,21 @@ public partial class SearchWindow : Window
         if (settings == null)
         {
             var page = new SettingsWindow(databasePath, ApplyHotkeyAsync, RefreshDictionary, hotkeyWarning);
+            page.FileRefindChanged += preferences =>
+            {
+                if (preferences.Mode == 0)
+                {
+                    writingConsent.Cancel();
+                    writingConsent.Dispose();
+                    writingConsent = new();
+                }
+                filePreferences = Task.FromResult(preferences);
+                pendingFileRank?.Cancel();
+                if (fileRevision != revision) return;
+                // 停用/清除直接恢复已取得的 SDK 页，无须等 SQLite 或再次运行 Everything。
+                PresentFileRows(sdkFiles);
+                if (preferences.Mode != 0) _ = RankRememberedFilesAsync();
+            };
             settings = page;
             page.Closing += (_, e) =>
             {
@@ -222,7 +291,15 @@ public partial class SearchWindow : Window
         if (IsVisible)
         {
             Hide();
-            RefreshInput();
+            if (fileRevision != revision) RefreshInput();
+            else
+            {
+                // 设置可以直接对当前有效页切换排序；收起期间停止未交付的搜索与预览。
+                fileActionRevision++;
+                pending?.Cancel();
+                pendingFileRank?.Cancel();
+                pendingPreview?.Cancel();
+            }
         }
         if (!settings.IsVisible) settings.Show();
         if (settings.WindowState == WindowState.Minimized) settings.WindowState = WindowState.Normal;
@@ -236,17 +313,29 @@ public partial class SearchWindow : Window
         if (dragPosition.HasValue) PositionSearchWindow();
         Activate();
         QueryBox.Focus();
-        RefreshInput();
+        if (fileRevision != revision) RefreshInput();
+        else
+        {
+            // 先沿用当前列表与用户选择，随后从 SDK 刷新，设置期间移动的文件也会更新。
+            _ = RankRememberedFilesAsync();
+            _ = SearchAsync();
+        }
     }
 
     private void RefreshDictionary()
     {
         // 设置变动只使词典结果失效；文件选择属于当前输入，可继续使用。
         catalogRevision++;
+        reverseModelReady = false;
+        catalogPending?.Cancel();
+        preparingReverse?.Cancel();
+        preparingReverse = null;
+        if (IsReverseInput(QueryBox.Text)) UpdateReverseModelButton();
+        PrefixChoices.ItemsSource = null;
         ClearDictionaryResults();
         if (IsVisible && !composing && !string.IsNullOrWhiteSpace(QueryBox.Text)
-            && !IsChatGptInput(QueryBox.Text) && !ShowCalculation(QueryBox.Text))
-            _ = SearchDictionaryAsync(QueryBox.Text, revision, CancellationToken.None);
+            && !InChatGptMode(QueryBox.Text) && !ShowCalculation(QueryBox.Text))
+            _ = SearchCatalogAsync(QueryBox.Text, revision, CancellationToken.None);
     }
 
     private void ClearDictionaryResults()
@@ -257,6 +346,8 @@ public partial class SearchWindow : Window
         GlossText.Text = "";
         OtherGlosses.ItemsSource = null;
         SpellingChoices.ItemsSource = null;
+        ReverseChoices.ItemsSource = null;
+        AutomaticReverseLabel.Visibility = Visibility.Collapsed;
     }
 
     private void RememberForeground(nint window)
@@ -297,6 +388,7 @@ public partial class SearchWindow : Window
 
     internal void ActivateFromLaunch(string? requestedDictionary)
     {
+        if (dictionaryId != requestedDictionary) reverseModelReady = false;
         if (IsVisible && dictionaryId != requestedDictionary) QueryBox.Clear();
         dictionaryId = requestedDictionary;
         Summon();
@@ -396,9 +488,112 @@ public partial class SearchWindow : Window
     }
 
     private const string ChatGptPrefix = "ai ";
+    private const string ReversePrefix = "反查";
+
+    private bool IsAcceptedLiteral(string text) => text == acceptedDictionaryText || text == acceptedFileName;
+
+    private bool IsReverseInput(string text) => !IsAcceptedLiteral(text) && text.StartsWith(ReversePrefix, StringComparison.Ordinal);
+
+    private bool TryReverseInput(string text, out string description, out string? targetLanguage)
+    {
+        description = "";
+        targetLanguage = null;
+        if (!IsReverseInput(text)) return false;
+        // 语言标签紧接命令。显式留一个空格可保留以“日语”或“英语”开头的原始描述。
+        var rest = text.AsSpan(ReversePrefix.Length);
+        if (rest.StartsWith("日语", StringComparison.Ordinal)) targetLanguage = "ja";
+        else if (rest.StartsWith("英语", StringComparison.Ordinal)) targetLanguage = "en";
+        if (targetLanguage != null) rest = rest[2..];
+        description = rest.Trim().ToString();
+        return true;
+    }
+
+    private static bool HasModelFiles(string folder) =>
+        File.Exists(Path.Combine(folder, "model.onnx")) && File.Exists(Path.Combine(folder, "vocab.txt"));
+
+    private void UpdateReverseModelButton()
+    {
+        (ReverseModelButton.Content, ReverseModelButton.ToolTip) =
+            (CurrentModelDirectory == rejectedModelDirectory || !HasModelFiles(CurrentModelDirectory), reverseModelReady, useReverseModel) switch
+            {
+                (true, _, _) => ("选择本地模型", "选择包含模型和词表的本地文件夹。"),
+                (_, false, _) => ("准备语义索引", "在本机为当前词典编码义项，可取消后继续。"),
+                (_, _, true) => ("用词语匹配", "立即用原书词语匹配当前描述，模型载入期间也可切换。"),
+                _ => ("用语义模型", "使用已准备的本地语义模型重新查找当前描述。")
+            };
+    }
+
+    private async void PrepareReverseIndex(object sender, RoutedEventArgs e)
+    {
+        if (preparingReverse != null) { preparingReverse.Cancel(); return; }
+        if (!TryReverseInput(QueryBox.Text, out _, out string? targetLanguage)) return;
+        // 两种检索对同一描述可能选出不同的义项，准备索引后可以直接切换，不必重建。
+        if (reverseModelReady)
+        {
+            useReverseModel = !useReverseModel;
+            RefreshInput();
+            return;
+        }
+        string folder = CurrentModelDirectory;
+        if (folder == rejectedModelDirectory || !HasModelFiles(folder))
+        {
+            var dialog = new Microsoft.Win32.OpenFolderDialog { Title = "选择包含 BGE 模型 model.onnx 和 vocab.txt 的文件夹" };
+            if (dialog.ShowDialog(this) != true) return;
+            selectedReverseDirectory = folder = dialog.FolderName;
+            rejectedModelDirectory = null;
+        }
+        string? only = dictionaryId;
+        using var cancel = new CancellationTokenSource();
+        preparingReverse = cancel;
+        ReverseModelButton.Content = "取消准备";
+        ReverseModelButton.ToolTip = "停止准备并保留已完成的批次。";
+        try
+        {
+            int previous = -1;
+            int count = await Task.Run(() =>
+            {
+                using var store = new DictionaryStore(databasePath, readOnly: true);
+                return store.PrepareReverseLanguages(only, ReverseEncoder.Open(folder), ReverseEncoder.CacheDirectory, cancel.Token, (done, total) =>
+                {
+                    int percent = (int)(100L * done / Math.Max(1,total));
+                    if (percent == previous) return;
+                    previous = percent;
+                    Dispatcher.InvokeAsync(() => { if (preparingReverse == cancel) ReverseModelButton.Content = $"取消准备 · {percent}%"; });
+                }, targetLanguage);
+            }, cancel.Token);
+            if (preparingReverse == cancel && !cancel.IsCancellationRequested && IsVisible && IsReverseInput(QueryBox.Text))
+            {
+                preparingReverse = null;
+                reverseModelReady = count > 0;
+                useReverseModel = true;
+                RefreshInput();
+                SetStatus(count > 0 ? $"已准备 {count:N0} 个原书义项。" : "当前范围没有启用可反查的词典。");
+            }
+        }
+        catch (OperationCanceledException) when (cancel.IsCancellationRequested) { }
+        catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException or Microsoft.Data.Sqlite.SqliteException
+            or Microsoft.ML.OnnxRuntime.OnnxRuntimeException or TypeInitializationException or DllNotFoundException)
+        {
+            if (preparingReverse == cancel && !cancel.IsCancellationRequested)
+            {
+                if (ex is InvalidDataException) rejectedModelDirectory = folder;
+                if (IsVisible && IsReverseInput(QueryBox.Text)) SetStatus("语义索引准备失败：" + ex.GetBaseException().Message);
+            }
+        }
+        finally
+        {
+            if (preparingReverse == cancel)
+            {
+                preparingReverse = null;
+                UpdateReverseModelButton();
+            }
+        }
+    }
 
     private static bool IsChatGptInput(string text) =>
         text.StartsWith(ChatGptPrefix, StringComparison.Ordinal);
+
+    private bool InChatGptMode(string text) => !IsAcceptedLiteral(text) && IsChatGptInput(text);
 
     private static string? GetChatGptUrl(string text)
     {
@@ -443,7 +638,7 @@ public partial class SearchWindow : Window
                 bool repeated = message.message == 0x0100 && message.wParam == 0x0D
                     ? (message.lParam.ToInt64() & (1L << 30)) != 0 : e.IsRepeat;
                 // AI 提问与打开文件共用回车的长按判定。空问题仍由输入框消费。
-                if (Keyboard.Modifiers == ModifierKeys.None && QueryBox.IsKeyboardFocused && IsChatGptInput(QueryBox.Text))
+                if (Keyboard.Modifiers == ModifierKeys.None && QueryBox.IsKeyboardFocused && InChatGptMode(QueryBox.Text))
                 {
                     e.Handled = true;
                     if (!repeated && IsVisible && GetChatGptUrl(QueryBox.Text) is string url)
@@ -474,6 +669,7 @@ public partial class SearchWindow : Window
                 FileList.ScrollIntoView(FileList.SelectedItem);
                 QueryBox.Focus();
                 navigatingFiles = true;
+                userPickedFile = true;
                 e.Handled = true;
             }
         }
@@ -495,6 +691,7 @@ public partial class SearchWindow : Window
         // 鼠标按钮携带被点击行的数据。输入改变或窗口隐藏后，旧行不能再启动 Shell。
         if (file == null || !IsVisible || composing || fileRevision != revision || !FileList.Items.Contains(file)) return;
         FileList.SelectedItem = file;
+        userPickedFile = true;
         if (action == FileAction.Preview) _ = PreviewFileAsync(file.FullPath);
         else OpenWithShell(file.FullPath, action);
     }
@@ -583,6 +780,11 @@ public partial class SearchWindow : Window
             else
             {
                 using var process = Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+                // Shell 可复用进程而返回 null；只有正常返回的文件打开才作为反馈。
+                if (fileAction == FileAction.Open)
+                {
+                    QueueShellOpen(target);
+                }
             }
             if (fileAction != null)
             {
@@ -679,29 +881,56 @@ public partial class SearchWindow : Window
 
     private void RefreshInput()
     {
+        // 采纳的是词典键，即使字面恰好也是 ai 命令或算式也要查词。用户下一次修改文本就恢复常规路由。
+        if (QueryBox.Text != acceptedDictionaryText) acceptedDictionaryText = null;
+        if (QueryBox.Text != acceptedFileName) acceptedFileName = null;
         navigatingFiles = false;
         revision++;
         fileActionRevision++; // 编辑或收起搜索后，旧的 Explorer 定位不再补选。
         pendingPreview?.Cancel();
         debounce.Stop();
         pending?.Cancel();
+        catalogPending?.Cancel();
         // 同步撤销旧选择；即使用户在 debounce 或原生查询期间按回车，也不会打开上一项。
         fileRevision = -1;
+        pendingFileRank?.Cancel();
+        userPickedFile = false;
+        sdkFiles = [];
+        sdkQuery = "";
         FileList.SelectedIndex = -1;
         FileList.ItemsSource = null;
+        FileCompletionChoices.ItemsSource = null;
         FileList.Visibility = Visibility.Collapsed;
         FilePanel.Visibility = Visibility.Collapsed;
         InstallEverythingButton.Visibility = Visibility.Collapsed;
         SetFileStatus("");
+        PrefixChoices.ItemsSource = null;
         ClearDictionaryResults();
         ClearButton.Visibility = QueryBox.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        bool reverse = TryReverseInput(QueryBox.Text, out string description, out string? targetLanguage);
+        if (targetLanguage != reverseTargetLanguage || !reverse || !IsVisible)
+        {
+            // 目标改变时，之前准备或探测的索引不再对应当前命令。
+            preparingReverse?.Cancel();
+            preparingReverse = null;
+            reverseModelReady = false;
+        }
+        reverseTargetLanguage = targetLanguage;
+        ReverseModelButton.Visibility = reverse ? Visibility.Visible : Visibility.Collapsed;
+        if (reverse && preparingReverse == null) UpdateReverseModelButton();
         // 已取消上一轮文件与词典查询，此模式仅在用户主动按回车时打开浏览器。
-        if (IsChatGptInput(QueryBox.Text))
+        if (InChatGptMode(QueryBox.Text))
         {
             SetStatus("输入问题，按回车带到 ChatGPT，在网页中发送。");
             return;
         }
-        SetStatus("");
+        SetStatus(reverse ? targetLanguage switch
+        {
+            "ja" => "用中文描述要找的日语词。",
+            "en" => "用中文描述要找的英语词。",
+            _ => "用中文描述要找的词。可用「反查日语」或「反查英语」选择目标。"
+        } : "");
+        if (reverse && description.Length == 0) return;
         if (!composing && IsVisible && !string.IsNullOrWhiteSpace(QueryBox.Text)) debounce.Start();
     }
 
@@ -709,14 +938,16 @@ public partial class SearchWindow : Window
     {
         long request = revision;
         string text = QueryBox.Text;
-        if (IsChatGptInput(text) || ShowCalculation(text)) return;
+        if (InChatGptMode(text) || ShowCalculation(text)) return;
         using var cancellation = new CancellationTokenSource();
         pending = cancellation;
         var token = cancellation.Token;
         try
         {
-            // 两个任务在各自完成时提交到 UI。WhenAll 仅管理本轮令牌的生命周期。
-            await Task.WhenAll(SearchDictionaryAsync(text, request, token), SearchFilesAsync(text, request, token));
+            var catalog = SearchCatalogAsync(text, request, token);
+            // 反查的描述只交给本地词典；普通模式的文件结果仍独立提交。
+            if (IsReverseInput(text)) await catalog;
+            else await Task.WhenAll(catalog, SearchFilesAsync(text, request, token));
         }
         finally
         {
@@ -726,7 +957,7 @@ public partial class SearchWindow : Window
 
     private bool ShowCalculation(string text)
     {
-        if (!TryCalculate(text, out string result)) return false;
+        if (IsAcceptedLiteral(text) || !TryCalculate(text, out string result)) return false;
         GlossText.Text = "= " + result;
         return true;
     }
@@ -875,22 +1106,187 @@ public partial class SearchWindow : Window
         }
     }
 
+    private async Task SearchCatalogAsync(string text, long request, CancellationToken token)
+    {
+        catalogPending?.Cancel();
+        using var cancel = CancellationTokenSource.CreateLinkedTokenSource(token);
+        catalogPending = cancel;
+        try
+        {
+            if (TryReverseInput(text, out string description, out _))
+            {
+                if (description.Length > 0)
+                {
+                    SetStatus("正在查找词典释义…");
+                    await SearchDictionaryAsync(text, request, cancel.Token);
+                }
+            }
+            else
+            {
+                // 先提交本轮首义或拼写，把已排队的布局和绘制交还给 WPF，再查询和创建联想按钮。
+                long catalog = catalogRevision;
+                string? only = dictionaryId;
+                await SearchDictionaryAsync(text, request, cancel.Token);
+                if (cancel.IsCancellationRequested || request != revision || catalog != catalogRevision) return;
+                if (DetailsButton.IsVisible || SpellingChoices.HasItems)
+                {
+                    // 输入已有可选结果时复用输入防抖间隔，连续键入不会反复创建、清空两排联想控件。
+                    try { await Task.Delay(debounce.Interval, cancel.Token); }
+                    catch (OperationCanceledException) when (cancel.IsCancellationRequested) { return; }
+                }
+                await System.Windows.Threading.Dispatcher.Yield(DispatcherPriority.Background);
+                if (cancel.IsCancellationRequested || request != revision || catalog != catalogRevision || !IsVisible) return;
+                await SearchPrefixesAsync(text, only, request, catalog, cancel.Token);
+                if (cancel.IsCancellationRequested || request != revision || catalog != catalogRevision || !IsVisible
+                    || composing || SpellingChoices.HasItems || PrefixChoices.HasItems || !LooksLikeChineseDescription(text)) return;
+                // 直接词义优先。混有外语片段的描述可同时显示句中词和释义候选，正文选择由用户决定。
+                if (CandidatePicker.SelectedItem is Candidate hit
+                    && (hit.Hit.Method != "phrase" || hit.Hit.Term.Length >= text.Trim().Length)) return;
+                await Task.Delay(400, cancel.Token);
+                if (!cancel.IsCancellationRequested && request == revision && catalog == catalogRevision && IsVisible && !composing)
+                {
+                    AutomaticReverseLabel.Text = "正在按意思联想…";
+                    AutomaticReverseLabel.Visibility = Visibility.Visible;
+                    await SearchDictionaryAsync(ReversePrefix + " " + text, request, cancel.Token);
+                    if (ReferenceEquals(catalogPending, cancel) && request == revision && catalog == catalogRevision && !ReverseChoices.HasItems)
+                        AutomaticReverseLabel.Visibility = Visibility.Collapsed;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancel.IsCancellationRequested) { }
+        finally { if (ReferenceEquals(catalogPending, cancel)) catalogPending = null; }
+    }
+
+    private static bool LooksLikeChineseDescription(string text)
+    {
+        if (text.Length is < 4 or > 256 || IsChatGptInput(text)) return false;
+        int han = 0;
+        foreach (var rune in text.EnumerateRunes())
+        {
+            int c = rune.Value;
+            if (c is >= 0x3400 and <= 0x9fff or >= 0xf900 and <= 0xfaff or >= 0x20000 and <= 0x323af) han++;
+            else if (!(rune.IsAscii && char.IsAsciiLetterOrDigit((char)c)) && !Rune.IsWhiteSpace(rune)
+                && !(c <= char.MaxValue && "，。！？、（）".Contains((char)c))) return false;
+        }
+        if (han < 4) return false;
+        // 保留带作者、日期等归属线索的个人文件标题；文件扩展名、路径、运算符在上方已退出。
+        const string ownerOrDate = @"^\s*(?:我[们們]?|咱[们們]|本人|[今昨明]天|[本上下这這](?:[周年月]|星期|季度))";
+        const string documentType = @"(?:[记記][录錄]|[报報][告表]|[笔筆][记記]|文[档檔]|[清名][单單]|照片|[视視][频頻]|[备備]份|草稿|作[业業]|方案)\s*$";
+        if (Regex.IsMatch(text, ownerOrDate + @".*的.{0,16}" + documentType))
+            return false;
+        if (Regex.IsMatch(text, @"用[于於来來以]|[用拿靠][它其]|一[种種]|形容|指的是|[什甚][么麼]叫|的(?:东西|東西|物品|器具|工具|地方|人|动[作物]|動[作物]|现象|現象|状态|狀態|意思|感[觉覺]|[词詞])"))
+            return true;
+        // “动作或用途 + 的 + 简短名词”可描述陌生词。仅有领属关系（如“北京大学的校园”）不足以触发。
+        int linker = text.LastIndexOf('的');
+        if (linker < 4 || !Regex.IsMatch(text[(linker + 1)..], @"^\p{Lo}{1,6}[。！？]?\s*$")) return false;
+        return Regex.IsMatch(text[..linker], @"[用能靠把被从從给給让讓放戴穿藏裝装]|[显顯]示|表[示明]|[测測]量|[记記][录錄]|[保維维][护護持存]|提供|[帮幫]助|代替|[发發]出|[传傳][递遞]|提醒|控制|判[断斷]");
+    }
+
+    private async Task SearchPrefixesAsync(string text, string? only, long request, long catalog, CancellationToken token)
+    {
+        try
+        {
+            var keys = await Task.Run(() =>
+            {
+                using var store = new DictionaryStore(databasePath, readOnly: true);
+                return store.PrefixSuggestions(text, only, token);
+            }, token);
+            if (request == revision && catalog == catalogRevision && IsVisible && !composing)
+            {
+                string typed = Lookup.Normalize(text);
+                PrefixChoices.ItemsSource = keys.Where(key => Lookup.Normalize(key) != typed).ToArray();
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        // 主查询会报告词库错误。联想失败时保留已有词条的释义和选择。
+        catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException) { }
+    }
+
     private async Task SearchDictionaryAsync(string text, long request, CancellationToken token)
     {
         long catalog = catalogRevision;
+        string? only = dictionaryId;
+        bool reverse = TryReverseInput(text, out string description, out string? targetLanguage);
+        bool automatic = reverse && !IsReverseInput(QueryBox.Text);
+        string folder = CurrentModelDirectory;
+        bool semanticRequested = useReverseModel;
+        bool modelReady = false;
+        string? modelError = null;
+        bool invalidModel = false;
         try
         {
             // 所有候选共享一次读取快照；导入或调整优先级时不会把两版词库混入一个结果。
             var matches = await Task.Run(() =>
             {
                 using var store = new DictionaryStore(databasePath, readOnly: true);
-                return store.Search(text, dictionaryId, token);
+                if (!reverse) return store.Search(text, only, token);
+                if (HasModelFiles(folder))
+                {
+                    try
+                    {
+                        var encoder = ReverseEncoder.Open(folder);
+                        modelReady = store.HasPreparedReverseLanguage(only, encoder, ReverseEncoder.CacheDirectory, token, targetLanguage);
+                        if (modelReady && semanticRequested)
+                        {
+                            if (!automatic && !encoder.IsSessionReady)
+                            {
+                                // 本机推理环境初始化可能持续数秒。先在当前请求发布可操作的状态，再进入原生调用。
+                                Dispatcher.Invoke(() =>
+                                {
+                                    if (token.IsCancellationRequested || request != revision || catalog != catalogRevision || !IsVisible
+                                        || only != dictionaryId || folder != CurrentModelDirectory || !useReverseModel || preparingReverse != null) return;
+                                    reverseModelReady = true;
+                                    UpdateReverseModelButton();
+                                    SetStatus("正在载入本地语义模型…");
+                                }, DispatcherPriority.Normal, token);
+                                token.ThrowIfCancellationRequested();
+                            }
+                            var hits = store.ReverseByLanguage(description, only, targetLanguage, token, encoder, ReverseEncoder.CacheDirectory);
+                            // 部分来源可能只有词语索引。只有读后复验也没有可用模型索引，才提示重新准备。
+                            if (hits.Count > 0 && !hits.Any(h => h.UsedSemanticIndex)
+                                && !store.HasPreparedReverseLanguage(only, encoder, ReverseEncoder.CacheDirectory, token, targetLanguage))
+                            {
+                                modelReady = false;
+                                modelError = "语义索引未通过校验，可重新准备。";
+                            }
+                            return hits;
+                        }
+                    }
+                    catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException
+                        or Microsoft.ML.OnnxRuntime.OnnxRuntimeException or TypeInitializationException or DllNotFoundException)
+                    {
+                        modelReady = false;
+                        modelError = ex.GetBaseException().Message;
+                        invalidModel = ex is InvalidDataException;
+                    }
+                }
+                return store.ReverseByLanguage(description, only, targetLanguage, token);
             }, token);
-            if (request != revision || catalog != catalogRevision || !IsVisible) return;
+            if (token.IsCancellationRequested || request != revision || catalog != catalogRevision || !IsVisible) return;
+            if (automatic)
+            {
+                // 另行展示真实义项。文件选择、输入框和普通查出的句中词均不被后台反查覆盖。
+                var suggestions = matches.Select(hit => new Candidate(hit, null)).ToArray();
+                ReverseChoices.ItemsSource = suggestions;
+                AutomaticReverseLabel.Text = "按意思联想";
+                AutomaticReverseLabel.Visibility = suggestions.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+                return;
+            }
+            if (invalidModel)
+            {
+                rejectedModelDirectory = folder;
+                UpdateReverseModelButton();
+            }
+            if (reverse && preparingReverse == null)
+            {
+                reverseModelReady = modelReady;
+                UpdateReverseModelButton();
+            }
             // 首选保存后的同词重查也可能遇到另一进程停用词库，先撤销已失效的详情。
             if (matches.Count == 0)
             {
                 ClearDictionaryResults();
+                if (reverse) SetStatus("当前范围内没有匹配的释义。可换用描述中的关键词，或检查对应词典是否已启用。");
                 return;
             }
             if (matches[0].Method == "spelling")
@@ -902,25 +1298,99 @@ public partial class SearchWindow : Window
             }
             SpellingChoices.ItemsSource = null;
             GlossText.Text = matches[0].Display;
-            OtherGlosses.ItemsSource = Lookup.AdditionalPreviews(matches);
-            var items = matches.Select(hit => new Candidate(hit)).ToArray();
+            OtherGlosses.ItemsSource = reverse ? null : Lookup.AdditionalPreviews(matches);
+            // 不同位置可能指向同一原书义项。下拉框按出现顺序展示输入片段，重复文字也能区分。
+            var positions = matches[0].SourceOffset != null && matches[0].Entry.Language == "en"
+                ? matches.Where(h => h.SourceOffset.HasValue).Select(h => h.SourceOffset!.Value).Distinct().Order()
+                    .Select((offset, i) => (offset, number: i + 1)).ToDictionary(x => x.offset, x => x.number)
+                : null;
+            var items = matches.Select(hit => new Candidate(hit,
+                positions is { Count: > 1 } && hit.SourceOffset is int offset ? positions[offset] : null)).ToArray();
             CandidatePicker.ItemsSource = items;
             CandidatePicker.SelectedIndex = 0;
             DetailsButton.Visibility = Visibility.Visible;
+            ReverseChoices.ItemsSource = reverse ? items.Skip(1).ToArray() : null;
+            if (reverse)
+            {
+                bool hasJapanese = matches.Any(h => h.Entry.Language == "ja");
+                bool hasEnglish = matches.Any(h => h.Entry.Language == "en");
+                string source = hasJapanese && hasEnglish ? "牛津英语词典、新世纪日汉双解"
+                    : hasJapanese ? "新世纪日汉双解" : "牛津英语词典";
+                string method = matches.All(h => h.UsedSemanticIndex) ? "本地语义模型"
+                    : matches.Any(h => h.UsedSemanticIndex) ? "本地语义模型和原书词语匹配" : "原书词语匹配";
+                SetStatus(modelError == null ? $"按意思反查 · {method} · {source}" : $"已改用原书词语匹配 · {source}：{modelError}");
+            }
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException)
         {
-            if (IsVisible && request == revision && catalog == catalogRevision) SetStatus("词库读取失败：" + ex.Message);
+            if (!automatic && IsVisible && request == revision && catalog == catalogRevision) SetStatus("词库读取失败：" + ex.Message);
         }
     }
 
     private void UseSpellingSuggestion(object sender, RoutedEventArgs e)
     {
         if (sender is not FrameworkElement { DataContext: LookupHit { Method: "spelling" } hit }) return;
-        QueryBox.Text = hit.Entry.Headword;
-        QueryBox.CaretIndex = QueryBox.Text.Length;
+        AcceptDictionaryText(hit.Entry.Headword);
+    }
+
+    private void UsePrefixSuggestion(object sender, RoutedEventArgs args)
+    {
+        if (sender is not FrameworkElement { DataContext: string key } || !PrefixChoices.Items.Contains(key)) return;
+        AcceptDictionaryText(key);
+    }
+
+    private void AcceptDictionaryText(string key)
+    {
+        acceptedFileName = null;
+        acceptedDictionaryText = key;
+        QueryBox.Text = key;
+        QueryBox.CaretIndex = key.Length;
         QueryBox.Focus();
+    }
+
+    private void UpdateFileCompletions(string text, IReadOnlyList<FileHit> files)
+    {
+        if (text != QueryBox.Text || fileRevision != revision) return;
+        if (composing || text == acceptedFileName || string.IsNullOrWhiteSpace(text)
+            || !EverythingSearch.IsPlainFileQuery(text) || IsChatGptInput(text) || text.StartsWith(ReversePrefix, StringComparison.Ordinal)
+            || TryCalculate(text, out _))
+        {
+            FileCompletionChoices.ItemsSource = null;
+            return;
+        }
+        // 只从本次 SDK 文件页取字面前缀；后缀短者优先，等长沿用原页顺序。保留首次出现的真实拼写。
+        FileCompletionChoices.ItemsSource = files.Select(file => file.Name)
+            .Where(name => name.Length > text.Length && name.StartsWith(text, StringComparison.OrdinalIgnoreCase)
+                && !name.Contains('"'))
+            .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(name => name.Length).Take(3).ToArray();
+    }
+
+    private void UseFileCompletion(object sender, RoutedEventArgs args)
+    {
+        if (composing || fileRevision != revision || sender is not FrameworkElement { DataContext: string name }
+            || !FileCompletionChoices.Items.Contains(name)) return;
+        acceptedDictionaryText = null;
+        acceptedFileName = name;
+        QueryBox.Text = name;
+        QueryBox.CaretIndex = name.Length;
+        QueryBox.Focus();
+    }
+
+    // 选择的是具体文件名，空格、感叹号等应当按字面检索。输入框保留真实名称，手动编辑后恢复原生语法。
+    private string GetFileQuery(string text) => text == acceptedFileName ? $"file:wfn:\"{text}\"" : text;
+
+    private void OpenReverseChoice(object sender, RoutedEventArgs args)
+    {
+        if (sender is not FrameworkElement { DataContext: Candidate candidate } || !ReverseChoices.Items.Contains(candidate)) return;
+        if (!CandidatePicker.Items.Contains(candidate))
+        {
+            // 采纳联想后再将候选加入详情选择器；仍可切回普通查到的物理词条。
+            CandidatePicker.ItemsSource = CandidatePicker.Items.Cast<Candidate>().Concat(ReverseChoices.Items.Cast<Candidate>()).ToArray();
+            DetailsButton.Visibility = Visibility.Visible;
+        }
+        CandidatePicker.SelectedItem = candidate;
+        if (!DetailsPanel.IsVisible) ToggleDetails();
     }
 
     private async Task SearchFilesAsync(string text, long request, CancellationToken token)
@@ -930,30 +1400,93 @@ public partial class SearchWindow : Window
         bool finished = false;
         try
         {
-            var files = await everything.SearchAsync(text, message => Dispatcher.BeginInvoke(new Action(() =>
+            var files = await everything.SearchAsync(GetFileQuery(text), message => Dispatcher.BeginInvoke(new Action(() =>
             {
-                if (!finished && request == revision && IsVisible) SetFileStatus(message);
+                if (!finished && !token.IsCancellationRequested && request == revision && IsVisible) SetFileStatus(message);
             })), token);
-            if (request != revision || !IsVisible) return;
+            if (token.IsCancellationRequested || request != revision || !IsVisible) return;
             fileRevision = request;
-            FileList.ItemsSource = files;
-            if (files.Count > 0)
-            {
-                FileList.Visibility = Visibility.Visible;
-                FileList.SelectedIndex = 0;
-                FileList.ScrollIntoView(FileList.SelectedItem);
-            }
-            ShowFileCount(files.Count);
+            // 补全取自当前 SDK 页；历史排序和同名目录缩写只用于呈现这一页。
+            UpdateFileCompletions(text, files);
+            sdkQuery = text;
+            sdkFiles = files;
+            PresentFileRows(files);
+            _ = RankRememberedFilesAsync();
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception
             or InvalidOperationException or DllNotFoundException or BadImageFormatException or EntryPointNotFoundException)
         {
-            if (request != revision || !IsVisible) return;
+            if (token.IsCancellationRequested || request != revision || !IsVisible) return;
             SetFileStatus(ex.Message);
             if (ex is FileNotFoundException) InstallEverythingButton.Visibility = Visibility.Visible;
         }
         finally { finished = true; }
+    }
+
+    private void PresentFileRows(IReadOnlyList<FileHit> files)
+    {
+        string? previousPath = userPickedFile ? (FileList.SelectedItem as FileHit)?.FullPath : null;
+        var rows = FileHit.WithDisplayPaths(files);
+        FileList.ItemsSource = rows;
+        FileList.Visibility = rows.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        if (rows.Count > 0)
+        {
+            // 切换重找设置时沿用已选的完整路径，下一次按回车仍打开用户选定的文件。
+            FileList.SelectedItem = rows.FirstOrDefault(row => string.Equals(row.FullPath, previousPath,
+                StringComparison.OrdinalIgnoreCase)) ?? rows[0];
+            FileList.ScrollIntoView(FileList.SelectedItem);
+        }
+        ShowFileCount(rows.Count);
+    }
+
+    private void QueueShellOpen(string path)
+    {
+        var preferences = filePreferences;
+        if (preferences.IsCompletedSuccessfully && preferences.Result.Mode == 0) return;
+        var previous = pendingFileWrite;
+        var token = writingConsent.Token;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        pendingFileWrite = Task.Run(async () =>
+        {
+            // 保持实际点击的先后；排队期间关停或清除会更换 epoch，旧操作不会复活。
+            await previous.ConfigureAwait(false);
+            var consent = await preferences.ConfigureAwait(false);
+            if (consent.Mode == 0 || token.IsCancellationRequested) return;
+            try { fileHistory.RecordShellOpen(path, now, consent.Epoch, token); }
+            catch (Exception ex) when (FileRefindHistory.IsStorageFailure(ex)) { Debug.WriteLine(ex); }
+        });
+    }
+
+    private async Task RankRememberedFilesAsync()
+    {
+        pendingFileRank?.Cancel();
+        var preferences = filePreferences;
+        var files = sdkFiles;
+        var query = sdkQuery;
+        long request = fileRevision;
+        if (files.Count < 2 || !EverythingSearch.IsPlainFileQuery(query)
+            || (preferences.IsCompletedSuccessfully && preferences.Result.Mode == 0)) return;
+        using var operation = new CancellationTokenSource();
+        pendingFileRank = operation;
+        try
+        {
+            if ((await preferences).Mode == 0) return;
+            await pendingFileWrite.WaitAsync(operation.Token);
+            await fileRankGate.WaitAsync(operation.Token);
+            IReadOnlyList<FileHit> ranked;
+            try
+            {
+                ranked = await Task.Run(() => fileHistory.Rank(query, files, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()), operation.Token);
+            }
+            finally { fileRankGate.Release(); }
+            if (!operation.IsCancellationRequested && request == revision && request == fileRevision && IsVisible
+                && !ReferenceEquals(ranked, files) && !ranked.SequenceEqual(files)
+                && !FileList.IsKeyboardFocusWithin && !FileList.IsMouseCaptureWithin) PresentFileRows(ranked);
+        }
+        catch (OperationCanceledException) when (operation.IsCancellationRequested) { }
+        catch (Exception ex) when (FileRefindHistory.IsStorageFailure(ex)) { Debug.WriteLine(ex); }
+        finally { if (ReferenceEquals(pendingFileRank, operation)) pendingFileRank = null; }
     }
 
     private void ShowFileCount(int count) => SetFileStatus(count switch
@@ -1046,6 +1579,23 @@ public partial class SearchWindow : Window
     private sealed record DetailBody(string Text, EntryAnchor? Anchor);
 
     private const string DictionaryOrigin = "https://dictionary.invalid";
+
+    private async Task<Exception?> PrepareRichView(long request)
+    {
+        // 实际展开后才启动引擎。保留原文层直到本次导航已经绘出，旧页面在这期间无法接收点击。
+        MergedDetail.Visibility = Visibility.Visible;
+        var ready = mergedBrowserReady ??= Initialize();
+        var failure = await ready;
+        if (failure != null && ReferenceEquals(mergedBrowserReady, ready)) mergedBrowserReady = null;
+        if (failure == null) MarkDetail(request, "browser-ready");
+        return failure;
+
+        async Task<Exception?> Initialize()
+        {
+            try { await ConfigureMergedBrowser(); return null; }
+            catch (Exception ex) { return ex; } // 收起或换词后也能观察初始化失败，下次展开可以重试。
+        }
+    }
 
     private async Task ConfigureMergedBrowser()
     {
@@ -1189,7 +1739,7 @@ public partial class SearchWindow : Window
 
     private async Task FollowMergedLink(string key, string fragment)
     {
-        if (mergedCurrent is not { } current) return;
+        if (mergedCurrent is not { } current || !MergedDetail.IsHitTestVisible) return;
         long request = ++detailRevision;
         try
         {
@@ -1206,41 +1756,89 @@ public partial class SearchWindow : Window
 
     private async void MergedBackClick(object sender, RoutedEventArgs args)
     {
-        if (!mergedHistory.TryPeek(out var previous)) return;
+        if (!MergedDetail.IsHitTestVisible || !mergedHistory.TryPeek(out var previous)) return;
         long request = ++detailRevision;
         try { await DisplayMerged(previous.Page, previous.Fragment, request, () => mergedHistory.Pop()); }
         catch (Exception ex) { if (request == detailRevision && DetailsPanel.IsVisible) SetStatus("无法返回词条：" + ex.Message); }
     }
 
-    private async Task DisplayMerged(MergedArticle article, string fragment, long request, Action? commitHistory = null)
+    private async Task DisplayMerged(MergedArticle article, string fragment, long request, Action? commitHistory = null,
+        Task<Exception?>? browserReady = null)
     {
         if (request != detailRevision || !DetailsPanel.IsVisible) return;
-        DetailScroll.Visibility = Visibility.Collapsed;
-        MergedDetail.Visibility = Visibility.Visible;
-        var ready = mergedBrowserReady ??= ConfigureMergedBrowser();
-        try { await ready; }
-        catch { if (ReferenceEquals(mergedBrowserReady, ready)) mergedBrowserReady = null; throw; }
-        if (request != detailRevision || !DetailsPanel.IsVisible) return;
+        // 资源读取与浏览器启动可以并行。切卷时只把当前请求的资源发布给虚拟来源。
+        var ready = browserReady ?? PrepareRichView(request);
+        var assets = mergedAssets;
         if (!string.Equals(mergedResourcePath, article.ResourceArchive, StringComparison.Ordinal))
         {
-            var assets = await Task.Run(() => article.ResourceArchive is null ? new Dictionary<string, byte[]>(StringComparer.Ordinal)
+            assets = await Task.Run(() => article.ResourceArchive is null ? new Dictionary<string, byte[]>(StringComparer.Ordinal)
                 : MdxReader.ReadResources(article.ResourceArchive).ToDictionary(a => a.Key, a => a.Data.ToArray(), StringComparer.Ordinal));
             if (request != detailRevision || !DetailsPanel.IsVisible) return;
+        }
+        MarkDetail(request, "assets-ready");
+        string path = "/page-" + request;
+        // 大页的链接重写和 UTF-8 编码不占用窗口线程，用户仍可阅读、关闭或切换。
+        var document = await Task.Run(() => EncodeMergedDocument(article.Html, path));
+        var failure = await ready;
+        if (request != detailRevision || !DetailsPanel.IsVisible) return;
+        if (failure != null) throw new InvalidOperationException(failure.Message, failure);
+        var browser = mergedWeb!.CoreWebView2;
+        var previous = (mergedDocumentPath, mergedDocument, mergedResourcePath, mergedAssets);
+        try
+        {
             mergedAssets = assets;
             mergedResourcePath = article.ResourceArchive;
+            mergedDocumentPath = path;
+            mergedDocument = document;
+            MergedDetail.IsHitTestVisible = false;
+            browser.Navigate(DictionaryOrigin + path + fragment);
+            MarkDetail(request, "navigate");
+            await WaitForMergedFrame(browser, path, request);
+            if (request != detailRevision || !DetailsPanel.IsVisible) return;
+            commitHistory?.Invoke();
+            mergedCurrent = (article, fragment);
+            MergedBack.Visibility = mergedHistory.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            MergedDetail.Opacity = 1;
+            MergedDetail.IsHitTestVisible = true;
+            DetailScroll.Visibility = Visibility.Collapsed;
+            MarkDetail(request, "body-frame");
         }
-        commitHistory?.Invoke();
-        mergedCurrent = (article, fragment);
-        mergedDocumentPath = "/page-" + request;
-        MergedBack.Visibility = mergedHistory.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
-        string body = RewriteMergedLinks(article.Html, mergedDocumentPath);
+        catch
+        {
+            // 书内跳转保留上一页和返回栈；导航失败也不能退到最初展开的、已经不相关的来源原文。
+            if (commitHistory != null && request == detailRevision && DetailsPanel.IsVisible && mergedCurrent is { } current)
+            {
+                (mergedDocumentPath, mergedDocument, mergedResourcePath, mergedAssets) = previous;
+                MergedDetail.IsHitTestVisible = true;
+                browser.Navigate(DictionaryOrigin + mergedDocumentPath + current.Fragment);
+            }
+            throw;
+        }
+    }
+
+    private async Task WaitForMergedFrame(CoreWebView2 browser, string path, long request)
+    {
+        // Source 在渲染器换页前就会更新。必须在浏览器内同时验证本页路径、正文与首次内容绘制。
+        string expected = JsonSerializer.Serialize(path);
+        string probe = $"location.pathname==={expected} && !!document.body?.hasChildNodes() && performance.getEntriesByName('first-contentful-paint').length>0";
+        var elapsed = Stopwatch.StartNew();
+        while (request == detailRevision && DetailsPanel.IsVisible)
+        {
+            if (await browser.ExecuteScriptAsync(probe) == "true") return;
+            if (elapsed.Elapsed > TimeSpan.FromSeconds(30)) throw new TimeoutException("词书页面未能完成绘制。");
+            await Task.Delay(16);
+        }
+    }
+
+    private static byte[] EncodeMergedDocument(string source, string path)
+    {
+        string body = RewriteMergedLinks(source, path);
         string html = """<!doctype html><html lang="zh"><meta charset="utf-8"><base href="https://dictionary.invalid/"><style>body{font:15px/1.55 "Segoe UI","Yu Gothic UI",sans-serif;margin:4px 8px;color:#172c39;overflow-wrap:anywhere}.es-source+.es-source{margin-top:14px}.es-label{font-size:12px;color:#24646b;margin:0 0 5px}</style><body>"""
             + body + "</body></html>";
-        mergedDocument = Encoding.UTF8.GetBytes(html);
         // 相对资源从站点根目录加载；页内跳转须保留当前文章的路径。
         if (body.Contains("href=\"#", StringComparison.OrdinalIgnoreCase) || body.Contains("href='#", StringComparison.OrdinalIgnoreCase))
-            mergedDocument = Encoding.UTF8.GetBytes(html.Replace("<base href=\"https://dictionary.invalid/\">", "", StringComparison.Ordinal));
-        mergedWeb!.CoreWebView2.Navigate(DictionaryOrigin + mergedDocumentPath + fragment);
+            html = html.Replace("<base href=\"https://dictionary.invalid/\">", "", StringComparison.Ordinal);
+        return Encoding.UTF8.GetBytes(html);
     }
 
     private static string RewriteMergedLinks(string html, string documentPath)
@@ -1250,6 +1848,38 @@ public partial class SearchWindow : Window
             "$1" + documentPath + "/lookup/");
         body = Regex.Replace(body, @"(?i)(\bhref\s*=\s*[""'])sound://(?:/)?(?=es/)", "$1" + documentPath + "/sound/");
         return Regex.Replace(body, @"(?i)(\bhref\s*=\s*[""'])entry://#", "$1#");
+    }
+
+    private const string SelectedPhraseId = "es-selected-phrase";
+
+    private static MergedArticle? HighlightMergedPhrase(MergedArticle article, LookupEntry hit, string raw)
+    {
+        // 合并器会改写原书链接和标签位置。先按来源与物理序号限定小节，再按同标题义项的原书顺序映射。
+        const string sectionTag = "<div class=\"es-source es-";
+        string sectionStart = $"{sectionTag}{hit.DictionaryId}\"><a name=\"es-{hit.DictionaryId}-{hit.EntryId}\"></a>";
+        string html = article.Html;
+        int section = html.IndexOf(sectionStart, StringComparison.Ordinal);
+        int separator = hit.Headword.IndexOf(' ');
+        if (section < 0 || separator < 1 || html.Contains(SelectedPhraseId, StringComparison.Ordinal)) return null;
+        int start = section + sectionStart.Length;
+        int end = html.IndexOf(sectionTag, start, StringComparison.Ordinal);
+        var parent = hit.Headword[..separator];
+        var from = EntryParser.OxfordPhrasalSenses(raw, parent).Where(p => p.Headword == hit.Headword).ToArray();
+        string sectionBody = html[start..(end < 0 ? html.Length : end)];
+        var to = EntryParser.OxfordPhrasalSenses(sectionBody, parent)
+            .Where(p => p.Headword == hit.Headword).ToArray();
+        int index = Array.FindIndex(from, p => p.Anchor == hit.Anchor);
+        if (index < 0 || !from.Select(p => (raw[p.Anchor.Title], p.Gloss))
+                .SequenceEqual(to.Select(p => (sectionBody[p.Anchor.Title], p.Gloss)))) return null;
+        var anchor = to[index].Anchor;
+        int title = start + anchor.Title.Start.Value, titleEnd = start + anchor.Title.End.Value;
+        int sense = start + anchor.Sense.Start.Value, senseEnd = start + anchor.Sense.End.Value;
+        var marked = new StringBuilder(html.Length + 80)
+            .Append(html, 0, title).Append("<mark id=\"").Append(SelectedPhraseId).Append("\">")
+            .Append(html, title, titleEnd - title).Append("</mark>").Append(html, titleEnd, sense - titleEnd)
+            .Append("<mark data-es-sense>").Append(html, sense, senseEnd - sense).Append("</mark>")
+            .Append(html, senseEnd, html.Length - senseEnd);
+        return article with { Html = marked.ToString() };
     }
 
     private static DetailBody FormatDetail(string raw, EntryAnchor? anchor)
@@ -1328,40 +1958,65 @@ public partial class SearchWindow : Window
     {
         if (CandidatePicker.SelectedItem is not Candidate chosen) return;
         long request = ++detailRevision;
+        MarkDetail(request, "click");
         mergedHistory.Clear();
         mergedCurrent = null;
         mergedDocumentPath = null;
         MergedDetail.Visibility = Visibility.Collapsed;
+        MergedDetail.Opacity = 0;
+        MergedDetail.IsHitTestVisible = false;
         DetailScroll.Visibility = Visibility.Visible;
         EntryText.Text = "正在读取词条…";
         ReadingPreferencePanel.Visibility = Visibility.Collapsed;
         var reading = DictionaryStore.PreferenceReading(chosen.Hit);
+        // 索引已经确认有排版页时，从点击起并行初始化。普通词库和仅查看列表的用户不会启动浏览器。
+        // 老版内联合并库在 MergedArticleFor 确认有正文后走同一入口。
+        // 反查命中的是原书中文释义的字符位置，原文控件可直接滚动到这段文字。
+        bool sourceSense = chosen.Hit.Method == "reverse" && chosen.Hit.Entry.Anchor != null;
+        var browserReady = !sourceSense && chosen.Hit.Entry.HasIndexedMergedPage ? PrepareRichView(request) : null;
         try
         {
             var full = await Task.Run(() =>
             {
                 using var store = new DictionaryStore(databasePath, readOnly: true);
                 var raw = store.CurrentBody(chosen.Hit.Entry);
-                if (raw == null) return (Body: (DetailBody?)null, Merged: (MergedArticle?)null, Preferred: (string?)null, LayoutError: (string?)null);
+                MarkDetail(request, "source");
+                if (raw == null) return (Found: false, Merged: (MergedArticle?)null, Preferred: (string?)null, LayoutError: (string?)null);
+                var body = FormatDetail(raw, chosen.Hit.Entry.Anchor);
+                MarkDetail(request, "formatted");
+                Dispatcher.InvokeAsync(() =>
+                {
+                    if (request != detailRevision || !DetailsPanel.IsVisible) return;
+                    DisplayDetail(body);
+                    ObserveTextFrame(request);
+                });
                 MergedArticle? merged = null;
                 string? error = null;
                 // 来源原文已经读到；伴随资源的位置或权限出错时仍可展示这一来源。
-                try { merged = store.MergedArticleFor(chosen.Hit.Entry); }
+                try
+                {
+                    if (!sourceSense) merged = store.MergedArticleFor(chosen.Hit.Entry);
+                    // 旧版或自制合并页缺少可核对的小节时，保留已经定位的来源原文。
+                    if (merged != null && chosen.Hit.Entry.Anchor != null)
+                        merged = HighlightMergedPhrase(merged, chosen.Hit.Entry, raw);
+                }
                 catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException) { error = ex.Message; }
-                return (Body: FormatDetail(raw, chosen.Hit.Entry.Anchor), Merged: merged,
+                MarkDetail(request, "merged");
+                return (Found: true, Merged: merged,
                     Preferred: reading == null ? null : store.ReadReadingPreference(reading), LayoutError: error);
             });
             if (request != detailRevision || !DetailsPanel.IsVisible) return;
-            if (full.Body == null)
+            if (!full.Found)
             {
                 RefreshDictionary();
                 return;
             }
-            DisplayDetail(full.Body);
+            if (full.Merged == null) MergedDetail.Visibility = Visibility.Collapsed;
             if (full.LayoutError != null) SetStatus("无法显示词书排版，已显示本来源原文。" + full.LayoutError);
             if (full.Merged != null)
             {
-                try { await DisplayMerged(full.Merged, "", request); }
+                var fragment = chosen.Hit.Entry.Anchor == null ? "" : "#" + SelectedPhraseId;
+                try { await DisplayMerged(full.Merged, fragment, request, browserReady: browserReady); }
                 catch (Exception ex)
                 {
                     if (request != detailRevision) return;
@@ -1410,8 +2065,14 @@ public partial class SearchWindow : Window
         detailRevision++;
         pendingPreview?.Cancel();
         mergedWeb?.Dispose();
+        pendingFileRank?.Cancel();
+        // 真正退出时完成已接受的本机打开记录；后台写入没有 Dispatcher 依赖。
+        pendingFileWrite.GetAwaiter().GetResult();
+        writingConsent.Dispose();
         debounce.Stop();
         pending?.Cancel();
+        catalogPending?.Cancel();
+        preparingReverse?.Cancel();
         if (registered) UnregisterHotKey(hwnd, hotkeyId);
         if (foregroundHook != 0) UnhookWinEvent(foregroundHook);
         source?.RemoveHook(WindowMessage);
@@ -1424,9 +2085,10 @@ public partial class SearchWindow : Window
         base.OnClosed(e);
     }
 
-    private sealed record Candidate(LookupHit Hit)
+    private sealed record Candidate(LookupHit Hit, int? Occurrence)
     {
-        public string Label => $"{Hit.Entry.Headword} · {Hit.Entry.DictionaryName ?? Hit.Entry.DictionaryId} · {Hit.Entry.Gloss}";
+        public string Label => (Occurrence is int n ? $"第 {n} 处 · {Hit.Term} → " : "") +
+            $"{Hit.Entry.Headword} · {Hit.Entry.DictionaryName ?? Hit.Entry.DictionaryId} · {Hit.Entry.Gloss}";
         // WPF 候选项的自动化名称也使用面向用户的标签，读屏时可直接辨认来源。
         public override string ToString() => Label;
     }
@@ -1458,7 +2120,237 @@ public partial class SearchWindow : Window
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(nint hwnd, StringBuilder name, int capacity);
 }
 
-internal sealed record FileHit(string Name, string Parent, string FullPath);
+internal sealed record FileHit(string Name, string Parent, string FullPath)
+{
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string DisplayParent => distinguishingParent ?? Parent;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool WrapDisplayParent => distinguishingParent is not null;
+    private string? distinguishingParent;
+
+    // 只比较当前结果页的同名项。完整路径仍是打开、预览和定位所用的原始标识。
+    internal static IReadOnlyList<FileHit> WithDisplayPaths(IReadOnlyList<FileHit> files)
+    {
+        var result = files.ToArray();
+        var comparer = StringComparer.OrdinalIgnoreCase;
+        foreach (var group in Enumerable.Range(0, files.Count).GroupBy(i => files[i].Name, comparer))
+        {
+            var parents = group.GroupBy(i => Path.TrimEndingDirectorySeparator(files[i].Parent), comparer).ToArray();
+            if (parents.Length == 1)
+            {
+                foreach (var i in group)
+                    if (result[i].distinguishingParent is not null) result[i] = result[i] with { distinguishingParent = null };
+                continue;
+            }
+
+            // 倒序按目录组件计数。每条真实目录仅计一次，即使同一文件在结果中出现多次。
+            var root = new DirectorySuffix();
+            foreach (var parent in parents)
+            {
+                var node = root;
+                foreach (var (part, _) in DirectoryParts(parent.Key))
+                {
+                    if (!node.Children.TryGetValue(part, out var child))
+                        node.Children[part] = child = new DirectorySuffix();
+                    child.Count++;
+                    node = child;
+                }
+            }
+            foreach (var parent in parents)
+            {
+                var node = root;
+                foreach (var (part, offset) in DirectoryParts(parent.Key))
+                {
+                    node = node.Children[part];
+                    if (node.Count != 1) continue;
+                    foreach (var i in parent)
+                        result[i] = files[i] with { distinguishingParent = Path.TrimEndingDirectorySeparator(files[i].Parent)[offset..] };
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
+    private sealed class DirectorySuffix
+    {
+        public readonly Dictionary<string, DirectorySuffix> Children = new(StringComparer.OrdinalIgnoreCase);
+        public int Count;
+    }
+
+    private static IEnumerable<(string Part, int Offset)> DirectoryParts(string parent)
+    {
+        // 路径根作为整体参与比较，UNC 服务器和共享名始终一起显示。
+        int rootLength = Path.GetPathRoot(parent)?.Length ?? 0;
+        int end = parent.Length;
+        while (end > rootLength)
+        {
+            int start = end;
+            while (start > rootLength && parent[start - 1] is not ('\\' or '/')) start--;
+            if (start < end) yield return (parent[start..end], start);
+            end = start - 1;
+        }
+        yield return (parent[..rootLength], 0);
+    }
+}
+
+// 单独存放在当前词库旁，随 E_SEARCH_DB 隔离；发布种子与导入导出都不含个人打开记录。
+internal sealed class FileRefindHistory(string databasePath)
+{
+    private readonly string path = databasePath + ".file-refind.sqlite";
+    private const long Day = 86_400_000;
+    private const long Lifetime = 90 * Day;
+    private const int MaxFiles = 256;
+    private const int Recent = 1, Frequent = 2;
+
+    internal static bool IsStorageFailure(Exception ex) => ex is SqliteException or IOException or UnauthorizedAccessException;
+
+    private SqliteConnection Open(bool create = false)
+    {
+        var db = new SqliteConnection(new SqliteConnectionStringBuilder {
+            DataSource = path, Mode = create ? SqliteOpenMode.ReadWriteCreate : SqliteOpenMode.ReadWrite,
+            Pooling = false, DefaultTimeout = 1
+        }.ToString());
+        try { db.Open(); return db; }
+        catch { db.Dispose(); throw; }
+    }
+
+    private static void Prune(SqliteConnection db, SqliteTransaction tx, long now)
+    {
+        using var prune = db.CreateCommand();
+        prune.Transaction = tx;
+        prune.CommandText = """
+            DELETE FROM opens WHERE opened < $cutoff;
+            DELETE FROM opens WHERE rowid IN
+                (SELECT rowid FROM opens ORDER BY opened DESC, rowid DESC LIMIT -1 OFFSET $limit);
+            """;
+        prune.Parameters.AddWithValue("$cutoff", now - Lifetime);
+        prune.Parameters.AddWithValue("$limit", MaxFiles);
+        prune.ExecuteNonQuery();
+    }
+
+    public (int Mode, long Epoch) GetPreferences()
+    {
+        if (!File.Exists(path)) return default;
+        using var db = Open();
+        using var cmd = db.CreateCommand();
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        cmd.CommandText = "SELECT mode,epoch,EXISTS(SELECT 1 FROM opens WHERE opened < $cutoff) FROM settings WHERE id=1";
+        cmd.Parameters.AddWithValue("$cutoff", now - Lifetime);
+        using var row = cmd.ExecuteReader();
+        if (!row.Read()) return default;
+        var result = (row.GetInt32(0), row.GetInt64(1));
+        bool expired = row.GetBoolean(2);
+        row.Close();
+        if (expired)
+        {
+            using var tx = db.BeginTransaction();
+            Prune(db, tx, now);
+            tx.Commit();
+        }
+        return result;
+    }
+
+    public (int Mode, long Epoch) SetMode(int mode)
+    {
+        if (mode is < 0 or > Frequent) throw new ArgumentOutOfRangeException(nameof(mode));
+        if (mode == 0 && !File.Exists(path)) return default;
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+        using var db = Open(create: true);
+        using var tx = db.BeginTransaction();
+        using var cmd = db.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY CHECK(id=1), mode INTEGER NOT NULL, salt BLOB NOT NULL, epoch INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS opens(file_key TEXT PRIMARY KEY, opened INTEGER NOT NULL, weight REAL NOT NULL);
+            INSERT INTO settings(id,mode,salt,epoch) VALUES(1,$mode,randomblob(32),1)
+                ON CONFLICT(id) DO UPDATE SET mode=excluded.mode, epoch=settings.epoch+(excluded.mode=0 OR settings.mode=0);
+            """;
+        cmd.Parameters.AddWithValue("$mode", mode);
+        cmd.ExecuteNonQuery();
+        Prune(db, tx, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        cmd.CommandText = "SELECT epoch FROM settings WHERE id=1";
+        long epoch = (long)cmd.ExecuteScalar()!;
+        tx.Commit();
+        return (mode, epoch);
+    }
+
+    public (int Mode, long Epoch) Clear()
+    {
+        if (!File.Exists(path)) return default;
+        using var db = Open();
+        using var tx = db.BeginTransaction();
+        using var cmd = db.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "PRAGMA secure_delete=ON; DELETE FROM opens; UPDATE settings SET salt=randomblob(32),epoch=epoch+1 WHERE id=1";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "SELECT mode,epoch FROM settings WHERE id=1";
+        using var row = cmd.ExecuteReader();
+        row.Read();
+        var state = (row.GetInt32(0), row.GetInt64(1));
+        row.Close();
+        tx.Commit();
+        return state;
+    }
+
+    // 同一份本地库中，Windows 大小写变体共享记录；库内仅保存带随机密钥的路径摘要。
+    private static string FileKey(byte[] salt, string fullPath) =>
+        Convert.ToHexString(HMACSHA256.HashData(salt, Encoding.UTF8.GetBytes(fullPath.ToUpperInvariant())));
+
+    private static double Decay(double weight, long from, long to) =>
+        weight * Math.Pow(0.5, Math.Max(0d, (double)to - from) / (14 * Day));
+
+    public void RecordShellOpen(string fullPath, long now, long? expectedEpoch = null, CancellationToken consent = default)
+    {
+        if (!File.Exists(path)) return;
+        using var db = Open();
+        using var tx = db.BeginTransaction();
+        using var cmd = db.CreateCommand();
+        cmd.Transaction = tx;
+        // 在写事务中复核同意状态，即使另一进程刚关闭实验，也不能再积累打开次数。
+        cmd.CommandText = "SELECT salt FROM settings WHERE id=1 AND mode IN (1,2) AND ($epoch IS NULL OR epoch=$epoch)";
+        cmd.Parameters.AddWithValue("$epoch", (object?)expectedEpoch ?? DBNull.Value);
+        if (cmd.ExecuteScalar() is not byte[] salt || consent.IsCancellationRequested) return;
+        db.CreateFunction("decayed_weight", (double weight, long from, long to) => Decay(weight, from, to));
+        cmd.CommandText = """
+            INSERT INTO opens(file_key,opened,weight) VALUES($key,$now,1)
+            ON CONFLICT(file_key) DO UPDATE SET
+                weight=(CASE WHEN opens.opened < $cutoff THEN 0 ELSE decayed_weight(opens.weight,opens.opened,$now) END)
+                    + decayed_weight(1,$now,opens.opened),
+                opened=MAX(opens.opened,$now)
+            """;
+        cmd.Parameters.AddWithValue("$key", FileKey(salt, fullPath));
+        cmd.Parameters.AddWithValue("$now", now);
+        cmd.Parameters.AddWithValue("$cutoff", now - Lifetime);
+        cmd.ExecuteNonQuery();
+        Prune(db, tx, now);
+        tx.Commit();
+    }
+
+    public IReadOnlyList<FileHit> Rank(string query, IReadOnlyList<FileHit> files, long now)
+    {
+        if (files.Count < 2 || !EverythingSearch.IsPlainFileQuery(query) || !File.Exists(path)) return files;
+        using var db = Open();
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = """
+            SELECT mode,salt,file_key,opened,weight FROM settings JOIN opens ON opened >= $cutoff
+            WHERE id=1 AND mode IN (1,2)
+            """;
+        cmd.Parameters.AddWithValue("$cutoff", now - Lifetime);
+        using var rows = cmd.ExecuteReader();
+        if (!rows.Read()) return files;
+        int mode = rows.GetInt32(0);
+        var salt = (byte[])rows[1];
+        var scores = new Dictionary<string,double>(StringComparer.Ordinal);
+        do {
+            long opened = rows.GetInt64(3);
+            scores.Add(rows.GetString(2), mode == Recent ? opened : Decay(rows.GetDouble(4), opened, now));
+        } while (rows.Read());
+        // 只在 SDK 已返回的集合中重排。整名精确组优先；同分沿用 LINQ 稳定排序的原始次序。
+        return files.OrderByDescending(file => string.Equals(file.Name, query, StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(file => scores.GetValueOrDefault(FileKey(salt, file.FullPath))).ToArray();
+    }
+}
 
 internal sealed class EverythingSearch
 {
@@ -1636,12 +2528,15 @@ internal sealed class EverythingSearch
         return null;
     }
 
+    internal static bool IsPlainFileQuery(string input) =>
+        input.IndexOfAny(Path.GetInvalidFileNameChars()) < 0 &&
+        !input.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Any(word => word.StartsWith('!'));
+
     private static IReadOnlyList<FileHit> Search(string input)
     {
         // 额外的精确查询覆盖整个索引，避免普通查询先截断时，漏掉排在后面的同名文件。
         // 原查询始终原样发送；原生表达式只走原查询。两批内部均保留 SDK 的原始顺序。
-        bool plain = input.IndexOfAny(Path.GetInvalidFileNameChars()) < 0 &&
-            !input.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Any(word => word.StartsWith('!'));
+        bool plain = IsPlainFileQuery(input);
         var output = new List<FileHit>(ResultLimit);
         try
         {
