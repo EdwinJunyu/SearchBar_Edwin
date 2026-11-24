@@ -17,23 +17,46 @@ public static class MdxReader
 
     public static IEnumerable<(int Ordinal, string Headword, string Body)> Read(string path)
     {
+        foreach (var row in ReadPhysical(path, resource: false))
+            yield return (row.Ordinal, row.Key, row.Encoding.GetString(row.Data.Span).TrimEnd('\0'));
+    }
+
+    /// <summary>独立核对时只去除一个格式终止符，保留正文末尾可能有意义的 NUL。</summary>
+    public static IEnumerable<(int Ordinal, string Headword, string Body)> ReadExact(string path)
+    {
+        foreach (var row in ReadPhysical(path, resource: false))
+        {
+            var text = row.Encoding.GetString(row.Data.Span);
+            yield return (row.Ordinal, row.Key, text.EndsWith('\0') ? text[..^1] : text);
+        }
+    }
+
+    public static IEnumerable<(int Ordinal, string Key, ReadOnlyMemory<byte> Data)> ReadResources(string path)
+    {
+        foreach (var row in ReadPhysical(path, resource: true))
+            yield return (row.Ordinal, row.Key, row.Data);
+    }
+
+    private static IEnumerable<(int Ordinal, string Key, ReadOnlyMemory<byte> Data, Encoding Encoding)> ReadPhysical(string path, bool resource)
+    {
         using var file = File.OpenRead(path);
         byte[] header = ReadBytes(file, Number(file, 4));
         uint headerSum = BinaryPrimitives.ReadUInt32LittleEndian(ReadBytes(file, 4));
         Require(Adler(header) == headerSum, "MDX 文件头校验失败。");
         var xml = XElement.Parse(Encoding.Unicode.GetString(header).TrimEnd('\0'));
+        Require(xml.Name.LocalName == (resource ? "Library_Data" : "Dictionary"), "MDX/MDD 文件类型不符。");
         string version = xml.Attribute("GeneratedByEngineVersion")?.Value ?? "";
         int width = version switch { "1.2" => 4, "2.0" => 8, _ => throw new InvalidDataException($"未支持的 MDX 版本 {version}。") };
         string encryption = xml.Attribute("Encrypted")?.Value ?? "0";
         Require(encryption is "No" or "0" || (width == 8 && encryption == "2"), "未支持的 MDX 加密模式。");
-        string charset = (xml.Attribute("Encoding")?.Value ?? "").ToUpperInvariant();
+        string charset = resource ? "UTF-16" : (xml.Attribute("Encoding")?.Value ?? "").ToUpperInvariant();
         Encoding encoding = charset switch
         {
-            "UTF-16" or "UTF-16LE" => Encoding.Unicode,
-            "UTF-8" => Encoding.UTF8,
+            "UTF-16" or "UTF-16LE" => new UnicodeEncoding(false, false, true),
+            "UTF-8" => new UTF8Encoding(false, true),
             _ => throw new InvalidDataException($"未支持的 MDX 编码 {charset}。")
         };
-        int unit = encoding == Encoding.Unicode ? 2 : 1;
+        int unit = encoding.CodePage == 1200 ? 2 : 1;
         byte[] descriptor = ReadBytes(file, width == 8 ? 40 : 16);
         if (width == 8)
             Require(Adler(descriptor) == Number(file, 4), "MDX 词头区文件头校验失败。");
@@ -104,7 +127,7 @@ public static class MdxReader
             int remaining = (int)length;
             byte[] combined = [];
             int copied = 0;
-            string body = "";
+            ReadOnlyMemory<byte> body = ReadOnlyMemory<byte>.Empty;
             while (remaining > 0)
             {
                 if (cursor == current.Length)
@@ -117,7 +140,7 @@ public static class MdxReader
                 }
                 int take = Math.Min(remaining, current.Length - cursor);
                 if (take == length)
-                    body = encoding.GetString(current, cursor, take);
+                    body = current.AsMemory(cursor, take);
                 else
                 {
                     if (copied == 0) combined = new byte[(int)length];
@@ -127,8 +150,8 @@ public static class MdxReader
                 cursor += take;
                 remaining -= take;
             }
-            if (copied != 0) body = encoding.GetString(combined);
-            yield return (i + 1, keys[i].Text, body.TrimEnd('\0'));
+            if (copied != 0) body = combined;
+            yield return (i + 1, keys[i].Text, body, encoding);
         }
     }
 

@@ -3,7 +3,8 @@ param([string] $RealDatabase, [switch] $Desktop, [switch] $FileDesktop, [string]
       [switch] $SettingsDesktop, [string] $MdxSample, [string] $GuiExecutable, [switch] $OutOfOrder, [switch] $RestartEngine,
       [ValidateSet('Files','Keyboard','ColdEdit','Tray')][string[]] $AcceptanceDesktop,
       [string] $BackendTestDirectory, [switch] $PrepareDesktop, [switch] $WindowDesktop, [switch] $FileActionsDesktop, [string] $FileFixtureRoot,
-      [string] $PackageSeed, [string] $VerifyReleaseZip)
+      [string] $PackageSeed, [string] $VerifyReleaseZip, [string] $MergedTestDirectory,
+      [string] $MergeSampleInventory, [string] $MergeAuditDirectory, [string] $MergedDatabase, [switch]$MergeAuditHost)
 $ErrorActionPreference = 'Stop'
 # 失败重导本身也是验收项，命令退出码由 Invoke-Search 明确检查。
 $PSNativeCommandUseErrorActionPreference = $false
@@ -202,27 +203,30 @@ function Checksum([byte[]]$Bytes) {
 function Block([byte[]]$Bytes) {
     return ,([byte[]]((BigEndian 0) + (BigEndian (Checksum $Bytes)) + $Bytes))
 }
-function Write-Mdx([string]$Path, [Collections.IDictionary]$Entries) {
+function Write-Mdx([string]$Path, [Collections.IDictionary]$Entries, [switch]$Resource) {
     $utf8 = [Text.Encoding]::UTF8
+    $keyEncoding = if ($Resource) { [Text.Encoding]::Unicode } else { $utf8 }
+    $terminator = $keyEncoding.GetBytes([string][char]0)
     $keys = [byte[]]@()
     $records = [byte[]]@()
     $sizes = [byte[]]@()
     $offset = 0
     foreach ($pair in $Entries.GetEnumerator()) {
-        $body = $utf8.GetBytes($pair.Value)
+        $body = if ($Resource) { ,([byte[]]$pair.Value) } else { ,$utf8.GetBytes($pair.Value) }
         $packed = Block $body
-        $keys += (BigEndian $offset) + $utf8.GetBytes($pair.Key) + [byte]0
+        $keys += (BigEndian $offset) + $keyEncoding.GetBytes($pair.Key) + $terminator
         $sizes += (BigEndian $packed.Length) + (BigEndian $body.Length)
         $records += $packed
         $offset += $body.Length
     }
     $header = [Text.Encoding]::Unicode.GetBytes('<Dictionary GeneratedByEngineVersion="1.2" Encoding="UTF-8"/>')
+    if ($Resource) { $header = [Text.Encoding]::Unicode.GetBytes('<Library_Data GeneratedByEngineVersion="1.2" Encoding="UTF-16"/>') }
     $packedKeys = Block $keys
     $names = @($Entries.Keys)
-    $first = $utf8.GetBytes($names[0])
-    $last = $utf8.GetBytes($names[-1])
+    $first = $keyEncoding.GetBytes($names[0])
+    $last = $keyEncoding.GetBytes($names[-1])
     $count = BigEndian $Entries.Count
-    $index = $count + [byte]$first.Length + $first + [byte]$last.Length + $last +
+    $index = $count + [byte]($first.Length / $terminator.Length) + $first + [byte]($last.Length / $terminator.Length) + $last +
         (BigEndian $packedKeys.Length) + (BigEndian $keys.Length)
     $headerChecksum = [BitConverter]::GetBytes((Checksum $header))
     $data = (BigEndian $header.Length) + $header + $headerChecksum + (BigEndian 1) + $count +
@@ -232,6 +236,262 @@ function Write-Mdx([string]$Path, [Collections.IDictionary]$Entries) {
 }
 function Assert-Equal($Actual, $Expected, $Scenario) {
     if ($Actual -cne $Expected) { throw "$Scenario 预期「$Expected」，实际「$Actual」" }
+}
+
+function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly) {
+    $dir = [IO.Directory]::CreateDirectory((Join-Path $Directory ([guid]::NewGuid().ToString('N')))).FullName
+    $previous = $env:E_SEARCH_DB
+    try {
+        $env:E_SEARCH_DB = Join-Path $dir 'isolated.db'
+        $en = Join-Path $dir 'E_search-zh-en.mdx'
+        $ja = Join-Path $dir 'E_search-zh-ja.mdx'
+        $mdd = Join-Path $dir 'E_search-zh-ja.mdd'
+        $sources = [ordered]@{oxford=1; hanying=1; shogakukan=2; sanseido=1; shinseiki=1; sango=1; eijiro=1; 'shogakukan-zhja'=1}
+        function Article($rows, [string]$html) {
+            $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $rows -Compress -Depth 4))
+            "<!--ESMERGE1:$([Convert]::ToBase64String($bytes))-->$html"
+        }
+        $enRows = @(@('oxford',1,'sample','中文'), @('hanying',1,'sample','英文'))
+        Write-Mdx $en ([ordered]@{sample=(Article $enRows '<p>两份原文</p>'); 'helper'='<!--ESHELP1--><p>指定来源</p>'})
+        $jaRows = @(@('shogakukan',1,'test','たべる<br>【食べる】<br>吃'), @('sanseido',1,'test','食べる'), @('shinseiki',1,'test','食べる'),
+            @('sango',1,'test','食べる'), @('eijiro',1,'test','<br>日语释义'), @('shogakukan-zhja',1,'test','<br>訳'))
+        $appTarget = 'esappref-shinseiki-' + ('a' * 64)
+        $appLink = '<a href="entry://' + $appTarget + '">E_Search 补充跳转</a>'
+        $japanesePages = [ordered]@{test=(Article $jaRows '<p>主书及补充</p>'); alias=(Article (,@('shogakukan',2,'alias','@@@LINK=test')) $appLink)}
+        $japanesePages[$appTarget] = '<!--ESHELP1--><p>新世纪的实体补救候选</p>'
+        Write-Mdx $ja $japanesePages
+        $manifest = [ordered]@{format=1; files=[ordered]@{'E_search-zh-en.mdx'=(Get-FileHash -LiteralPath $en).Hash; 'E_search-zh-ja.mdx'=(Get-FileHash -LiteralPath $ja).Hash}; sources=$sources}
+        $manifestFile = Join-Path $dir 'E_search-merge.json'
+        $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestFile -Encoding utf8
+        Invoke-Search @('import-merged',$dir) 1 | Out-Null
+        Write-Mdx $mdd ([ordered]@{'\es\shinseiki\sample.bin'=[byte[]](0,255,17)}) -Resource
+        $manifest.files['E_search-zh-ja.mdd'] = (Get-FileHash -LiteralPath $mdd).Hash
+        $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestFile -Encoding utf8
+        Invoke-Search @('import-merged',$dir) | Out-Null
+        Assert-Equal @(Invoke-Search @('list')).Count 8 '双卷导入还原八个检索域'
+        Assert-Equal @(Invoke-Search @('query','sample','zh-en')).Count 2 '中英卷内保留两个来源命中'
+        Assert-Equal @(Invoke-Search @('query','sample','zh-ja')).Count 0 '日语卷不混入中英卷命中'
+        Assert-Equal @(Invoke-Search @('query','helper','zh-en')).Count 0 '来源专用辅助页不作为公开搜索结果'
+        $hit = @(Invoke-Search @('query','alias','shogakukan')) -join ' '
+        Assert-Equal ($hit -like '*shogakukan:1*') $true '重定向留在原书内'
+        Assert-Equal (@(Invoke-Search @('query','taberu','shogakukan')) -join ' ' -like '*食べる*') $true '保留日语来源的罗马字读音'
+        Assert-Equal (@(Invoke-Search @('article','zh-en','sample')) -join ' ') '<p>两份原文</p>' '公开页正文移除内嵌清单'
+        Assert-Equal (@(Invoke-Search @('article','zh-en','helper')) -join ' ') '<p>指定来源</p>' '辅助页可按卷内精确键打开'
+        if ($Assembly) {
+            # 使用实际详情窗的 URL 改写入口，再用改写后的卷内键读取合成原生实体补救页。
+            $rewrite = $Assembly.GetType('ESearch.SearchWindow',$true).GetMethod('RewriteMergedLinks',[Reflection.BindingFlags]'Static,NonPublic')
+            Assert-Equal ($null -ne $rewrite) $true '详情窗包含同源补充跳转绑定'
+            $sourceHtml = @(Invoke-Search @('article','zh-ja','alias')) -join ' '
+            $navigation = $rewrite.Invoke($null,@($sourceHtml,'/page-2'))
+            $url = [regex]::Match($navigation,'href="([^"]+)"').Groups[1].Value
+            Assert-Equal $url ("/page-2/lookup/" + $appTarget) 'E_Search 实体补救链接改写为该文档的内部路径'
+            $target = [Uri]::UnescapeDataString($url.Substring('/page-2/lookup/'.Length))
+            Assert-Equal (@(Invoke-Search @('article','zh-ja',$target)) -join ' ') '<p>新世纪的实体补救候选</p>' '从真实路由目标取回所属卷的补充富文本'
+            # 复制数据库和内容寻址的 MDD，验证旧绝对路径及新相对路径都只定位到搬家后的同级缓存。
+            $moved = [IO.Directory]::CreateDirectory((Join-Path $dir 'relocated')).FullName
+            $cache = [IO.Directory]::CreateDirectory((Join-Path $moved 'merged-resources')).FullName
+            $name = $manifest.files['E_search-zh-ja.mdd'].ToUpperInvariant()+'.mdd'
+            $originalArchive = Join-Path (Join-Path $dir 'merged-resources') $name
+            $movedArchive = Join-Path $cache $name
+            [IO.File]::Copy($originalArchive,$movedArchive)
+            $movedDb = Join-Path $moved 'isolated.db'
+            [IO.File]::Copy($env:E_SEARCH_DB,$movedDb)
+            $store = $Assembly.GetType('DictionaryStore',$true).GetConstructor([type[]]@([string],[bool])).Invoke([object[]]@([string]$movedDb,$false))
+            try {
+                $connection = $store.GetType().GetField('db',[Reflection.BindingFlags]'Instance,NonPublic').GetValue($store)
+                $check = $connection.CreateCommand()
+                $check.CommandText = "SELECT resource FROM merged_volumes WHERE volume='zh-ja'"
+                Assert-Equal ([IO.Path]::IsPathFullyQualified([string]$check.ExecuteScalar())) $false '新索引保存相对资源路径'
+                Assert-Equal $store.MergedArticleByKey('zh-ja','test').ResourceArchive $movedArchive '双卷移动后使用同级 MDD'
+                $check.CommandText = 'UPDATE merged_volumes SET resource=$path WHERE volume=''zh-ja'''
+                [void]$check.Parameters.AddWithValue('$path',$originalArchive)
+                [void]$check.ExecuteNonQuery()
+                Assert-Equal $store.MergedArticleByKey('zh-ja','test').ResourceArchive $movedArchive '历史绝对路径也回到当前缓存'
+                $check.Parameters['$path'].Value = "../merged-resources/$name"
+                [void]$check.ExecuteNonQuery()
+                $rejected = $false
+                try { $null = $store.MergedArticleByKey('zh-ja','test') } catch { $rejected = $true }
+                Assert-Equal $rejected $true '越界相对路径不能打开'
+                $check.Dispose()
+            } finally { $store.Dispose() }
+        }
+        $saved = Join-Path $dir 'valid-resource.saved'
+        [IO.File]::Move($mdd,$saved)
+        Invoke-Search @('import-merged',$dir) 1 | Out-Null
+        [IO.File]::WriteAllBytes($mdd,[byte[]](1,2))
+        Invoke-Search @('import-merged',$dir) 1 | Out-Null
+        $validHash = $manifest.files['E_search-zh-ja.mdd']
+        $manifest.files['E_search-zh-ja.mdd'] = (Get-FileHash -LiteralPath $mdd).Hash
+        $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestFile -Encoding utf8
+        Invoke-Search @('import-merged',$dir) 1 | Out-Null
+        $manifest.files['E_search-zh-ja.mdd'] = $validHash
+        [IO.File]::Move($mdd,(Join-Path $dir 'damaged-resource.bin'))
+        [IO.File]::Move($saved,$mdd)
+        $manifest.sources.shogakukan = 3
+        $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestFile -Encoding utf8
+        Invoke-Search @('import-merged',$dir) 1 | Out-Null
+        Assert-Equal (@(Invoke-Search @('article','zh-en','sample')) -join ' ') '<p>两份原文</p>' '缺卷、资源校验或来源对账失败后旧快照可查'
+    } finally { $env:E_SEARCH_DB = $previous }
+    Write-Output 'PASS 双卷来源、原书检索、富文本与失败回滚'
+}
+if ($MergedTestDirectory) { Test-MergedPackage $MergedTestDirectory; return }
+
+if ($MergeSampleInventory) {
+    # 从八份原 MDX 直接确定样本。以 UTF-8 原词头分组，独立于合并产物，避免缺失的词条在取样时也消失。
+    $sampleProgram = @'
+import hashlib, itertools, json, random, sqlite3, sys
+from collections import defaultdict
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from mdict_io import read_entries
+inventory = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+destination = Path(sys.argv[3])
+destination.mkdir(parents=True, exist_ok=True)
+primary = {"zh-en":"oxford", "zh-ja":"shogakukan"}
+seed = 20261123
+population, samples, generators = defaultdict(int), defaultdict(list), {}
+edges = []
+def consider(kind, limit, group, key, members, source=None):
+    bucket = kind + "/" + (source or group)
+    population[bucket] += 1
+    index = population[bucket] - 1
+    if index >= limit:
+        if bucket not in generators: generators[bucket] = random.Random(f"{seed}:{bucket}")
+        index = generators[bucket].randrange(index + 1)
+        if index >= limit: return
+    row = dict(kind=kind, group=group, key=key, scope=source, origins=members)
+    if index == len(samples[bucket]): samples[bucket].append(row)
+    else: samples[bucket][index] = row
+with sqlite3.connect("") as scratch:
+    scratch.execute("CREATE TABLE physical(g,head,s,n,kind)")
+    for source, spec in inventory["sources"].items():
+        group = "zh-en" if source in ("oxford","hanying") else "zh-ja"
+        path = Path(inventory["input_root"]) / spec["filename"]
+        with path.open("rb") as inp:
+            assert hashlib.file_digest(inp,"sha256").hexdigest().lower() == spec["sha256"].lower(), source
+        sizes = [0, "", 0]
+        def physical():
+            for ord_, key, body in read_entries(path):
+                if ord_ in (1,spec["records"]):
+                    edges.append(dict(kind="first" if ord_==1 else "last",group=group,key=key,scope=source,origins=[[source,ord_]]))
+                if len(body) > sizes[0]: sizes[:] = [len(body),key,ord_]
+                text = body.strip(b"\x00 \r\n\t")
+                kind = 0 if not text else 1 if text[:8].upper()==b"@@@LINK=" else 2
+                yield group,key,source,ord_,kind
+        scratch.executemany("INSERT INTO physical VALUES(?,?,?,?,?)", physical())
+        assert sizes[2]
+        edges.append(dict(kind="longest",group=group,key=sizes[1],scope=source,origins=[[source,sizes[2]]],bytes=sizes[0]))
+    # 一次外部排序，依来源及原序号枚举精确词头；每一类独立作固定种子蓄水池取样。
+    rows = scratch.execute("SELECT g,head,s,n,kind FROM physical ORDER BY g,head,s,n")
+    for (group,key), bucket in itertools.groupby(rows, key=lambda row:row[:2]):
+        by_source = defaultdict(list)
+        for _,_,source,ord_,kind in bucket: by_source[source].append((ord_,kind))
+        origins = [[s,n] for s,values in by_source.items() for n,_ in values]
+        for s,values in by_source.items():
+            ordinary = next((n for n,k in values if k==2),None)
+            if ordinary is not None: consider("ordinary",100,group,key,[[s,ordinary]],s)
+            if any(k==0 for _,k in values): consider("empty",3,group,key,[[s,n] for n,k in values if k==0],s)
+            if len(values)>1: consider("duplicate",3,group,key,[[s,n] for n,_ in values],s)
+        if len(by_source)>1: consider("overlap",20,group,key,origins)
+        if primary[group] not in by_source: consider("supplement",20,group,key,origins)
+        if any(k==1 for values in by_source.values() for _,k in values): consider("alias",20,group,key,origins)
+for g in primary:
+    for k in ("overlap","supplement","alias"): population.setdefault(k+"/"+g,0)
+out = dict(seed=seed,population=population,samples=[*itertools.chain.from_iterable(samples.values()),*edges],
+           original_hashes={s:v["sha256"] for s,v in inventory["sources"].items()})
+(destination/"d09-samples.json").write_text(json.dumps(out,ensure_ascii=False,indent=1),encoding="utf-8")
+print(len(out["samples"]), "source cases;",dict(population))
+'@
+    & python -c $sampleProgram $PSScriptRoot $MergeSampleInventory $MergeAuditDirectory
+    if ($LASTEXITCODE) { throw '真实原书样本生成失败' }
+    return
+}
+
+if ($MergeAuditDirectory) {
+    if (!$MergeAuditHost) {
+        # 工程的 .NET 10 宿主加载相同程序集，循环直接走界面调用的 Search 方法，计时排除启动 CLI 的时间。
+        $psDll = Join-Path $PSHOME 'pwsh.dll'
+        $config = Join-Path $PSScriptRoot 'bin/Release/net10.0/E_Search.runtimeconfig.json'
+        & $dotnet exec --runtimeconfig $config --depsfile (Join-Path (Split-Path $psDll) 'pwsh.deps.json') $psDll -NoProfile -NonInteractive -File $PSCommandPath -MergeAuditHost -MergeAuditDirectory $MergeAuditDirectory -RealDatabase $RealDatabase -MergedDatabase $MergedDatabase
+        if ($LASTEXITCODE) { throw '真实词书查询对照未通过' }
+        return
+    }
+    foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search') {
+        $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot "bin/Release/net10.0/$lib.dll"))
+    }
+    [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+    $ctor = $assembly.GetType('DictionaryStore',$true).GetConstructor([type[]]@([string],[bool]))
+    $baseline = $ctor.Invoke(@([string]$RealDatabase,$true))
+    $candidate = $ctor.Invoke(@([string]$MergedDatabase,$true))
+    $inventory = Get-Content -Raw -Encoding utf8 -LiteralPath (Join-Path $MergeAuditDirectory 'd09-samples.json') | ConvertFrom-Json -AsHashtable
+    $observations = [Collections.Generic.List[object]]::new()
+    function Fingerprint($hits, $case) {
+        $insideScope = $true
+        $data = @(foreach ($h in $hits) {
+            $en = $h.Entry.DictionaryId -in 'oxford','hanying'
+            if (($case.scope -and $case.scope -cne $h.Entry.DictionaryId) -or (($case.group -eq 'zh-en') -ne $en)) { $insideScope = $false }
+            ,@($h.Entry.DictionaryId,$h.Entry.EntryId,$h.Term,$h.Method,$h.Display,$h.Entry.Headword,$h.Entry.Reading,$h.Entry.Gloss)
+        })
+        $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $data -Depth 4 -Compress))
+        [ordered]@{count=$data.Count; inside_scope=$insideScope; sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)); ids=@($data | ForEach-Object { "$($_[0]):$($_[1])" })}
+    }
+    try {
+        foreach ($book in $baseline.ListDictionaries()) { Assert-Equal $book.Sha256.ToLowerInvariant() $inventory.original_hashes[$book.Id] "基准输入 $($book.Id)" }
+        $token = [Threading.CancellationToken]::None
+        $cases = @($inventory.samples)
+        foreach ($group in 'zh-en','zh-ja') {
+            $archiveReport = Join-Path $MergeAuditDirectory "d11-archive-$group.json"
+            if (Test-Path -LiteralPath $archiveReport) {
+                $longest = (Get-Content -Encoding utf8 -Raw -LiteralPath $archiveReport | ConvertFrom-Json).categories.public.longest_html
+                $cases += [ordered]@{kind='longest-public-html';group=$group;scope=$null;key=$longest[0];origins=@();html_bytes=$longest[1]}
+            }
+        }
+        foreach ($case in $cases) {
+            $scope = if ($case.scope) { [string]$case.scope } else { [string]$case.group }
+            $base = Fingerprint ($baseline.Search($case.key,$scope,$token)) $case
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            $hits = $candidate.Search($case.key,$scope,$token)
+            $first = $watch.Elapsed.TotalMilliseconds
+            $watch.Restart()
+            $again = $candidate.Search($case.key,$scope,$token)
+            $repeat = $watch.Elapsed.TotalMilliseconds
+            $current = Fingerprint $hits $case
+            $second = Fingerprint $again $case
+            $sameBody = $true
+            foreach ($origin in $case.origins) {
+                $expectedBody = $baseline.Detail($origin[0],$origin[1]).Item2
+                $actualBody = $candidate.Detail($origin[0],$origin[1]).Item2
+                if ($expectedBody -cne $actualBody) { $sameBody = $false }
+            }
+            $article = $candidate.MergedArticleByKey($case.group,$case.key)
+            if ($observations.Count -eq 0 -and $null -ne $article) {
+                Assert-Equal ($null -eq $candidate.MergedArticleByKey($case.group,$case.key,"obsolete-revision")) $true '旧版本文章链接不跨卷版本跳转'
+                Assert-Equal $candidate.MergedArticleByKey($case.group,$case.key,$article.Revision).Html $article.Html '当前版本文章链接可用'
+            }
+            $ok = $sameBody -and $null -ne $article -and $base.inside_scope -and $current.inside_scope -and
+                $current.sha256 -eq $base.sha256 -and $second.sha256 -eq $base.sha256
+            if ($case.html_bytes -and $null -ne $article) { $ok = $ok -and [Text.Encoding]::UTF8.GetByteCount($article.Html) -eq $case.html_bytes }
+            $observations.Add([ordered]@{group=$case.group;key=$case.key;kind=$case.kind;scope=$case.scope;origins=$case.origins;ok=$ok
+                same_raw=$sameBody;article_available=($null -ne $article);baseline=$base;actual=$current;first_ms=$first;repeat_ms=$repeat})
+        }
+    } finally { $baseline.Dispose(); $candidate.Dispose() }
+    $mismatches=@($observations | Where-Object { !$_.ok })
+    $latency = [ordered]@{}
+    foreach ($group in 'zh-en','zh-ja') {
+        $items = @($observations | Where-Object group -eq $group)
+        if (!$items.Count) { continue }
+        $latency[$group] = [ordered]@{samples=$items.Count}
+        foreach ($field in 'first_ms','repeat_ms') {
+            $sorted = @($items | ForEach-Object { $_[$field] } | Sort-Object)
+            $latency[$group][$field] = [ordered]@{median=$sorted[[Math]::Ceiling($sorted.Count*.5)-1]; p95=$sorted[[Math]::Ceiling($sorted.Count*.95)-1]; max=$sorted[-1]}
+        }
+    }
+    $report = [ordered]@{seed=$inventory.seed;population=$inventory.population;total=$observations.Count;differences=$mismatches.Count
+        latency_note="同一进程及读连接对各样本第一次查询、紧接着的重复查询；计时仅含 Search，未清空操作系统文件缓存。";latency=$latency;observations=$observations}
+    $report | ConvertTo-Json -Depth 9 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $MergeAuditDirectory 'd09-reader-comparison.json')
+    if ($mismatches.Count) { throw "$($mismatches.Count) 个真实查询存在差异，见 d09-reader-comparison.json" }
+    Write-Output "PASS $($observations.Count) 个原书与双卷真实查询、重复命中及原文核对"
+    return
 }
 
 function Test-Calculation([Reflection.Assembly]$Assembly) {
@@ -1909,6 +2169,7 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
             $window.Topmost = $false
             $window.Opacity = 0
             $window.Show()
+            Assert-Equal ($null -eq $window.FindName('MergedWebHost').Content) $true '普通旧库窗口不创建双卷浏览器'
             [Threading.SynchronizationContext]::SetSynchronizationContext([Windows.Threading.DispatcherSynchronizationContext]::new($window.Dispatcher))
             foreach ($inputWord in 'receive','recieve') {
                 $query.Text = $inputWord
@@ -3249,6 +3510,7 @@ if ($BackendTestDirectory) {
     Assert-Equal $url ('https://chatgpt.com/?q=' + [Uri]::EscapeDataString($prompt)) '中文与 URL 特殊字符'
     Write-Output 'PASS AI 前缀、空提示词与 ChatGPT 链接编码'
     Test-ImportIdentity $BackendTestDirectory $assembly
+    Test-MergedPackage $BackendTestDirectory $assembly
     Test-WindowsImportPaths $BackendTestDirectory $assembly
     Test-AdditionalDictionaries $BackendTestDirectory $assembly
     Test-EverythingRecovery $BackendTestDirectory $assembly

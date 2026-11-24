@@ -8,6 +8,9 @@
     <DefaultItemExcludes>$(DefaultItemExcludes);.tools/**;.data/**</DefaultItemExcludes>
   </PropertyGroup>
   <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0-windows'">
+    <!-- 透明 WPF 浮窗的 WebView2 合成控件需要 Windows 10 1809 WinRT 投影。 -->
+    <TargetPlatformIdentifier>Windows</TargetPlatformIdentifier>
+    <TargetPlatformVersion>10.0.17763.0</TargetPlatformVersion>
     <OutputType>WinExe</OutputType>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
@@ -16,6 +19,10 @@
     <AppHostRelativeDotNet Condition="'$(SelfContained)' != 'true'">../../../../.tools/dotnet</AppHostRelativeDotNet>
   </PropertyGroup>
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0-windows'">
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3537.50" GeneratePathProperty="true" />
+    <Content Include="$(PkgMicrosoft_Web_WebView2)/LICENSE.txt;$(PkgMicrosoft_Web_WebView2)/NOTICE.txt"
+             Condition="'$(PkgMicrosoft_Web_WebView2)' != ''" Link="licenses/WebView2-%(Filename)%(Extension)"
+             CopyToPublishDirectory="PreserveNewest" />
     <Using Remove="System.Windows.Forms;System.Drawing" />
     <Using Include="System.IO" />
     <Content Include=".tools/everything/dll/Everything32.dll;.tools/everything/dll/Everything64.dll;.tools/everything/dll/EverythingARM64.dll"

@@ -169,6 +169,8 @@ public partial class SettingsWindow : Window
         sample = [];
         if (ImportButton == null) return;
         ImportButton.IsEnabled = false;
+        ImportButton.Content = "导入词库";
+        ImportTarget.IsEnabled = ImportLanguage.IsEnabled = true;
         TablePanel.Visibility = Visibility.Collapsed;
         PreviewGrid.ItemsSource = null;
         Message(ImportStatus, "");
@@ -212,8 +214,12 @@ public partial class SettingsWindow : Window
                 if (known != null) SelectLanguage(known.Language);
             }
             preparedPath = path;
+            bool merged = DictionaryStore.IsMergedVolume(path);
+            ImportTarget.IsEnabled = ImportLanguage.IsEnabled = !merged;
+            ImportButton.Content = merged ? "打开独立双卷词库" : "导入词库";
             ImportButton.IsEnabled = true;
-            Message(ImportStatus, rows.Count > 0 ? "请核对样例行和列映射，再导入词库。" : "已选择 MDX 文件，可以导入。");
+            Message(ImportStatus, merged ? "将校验同目录两卷，在独立词库中打开八本来源。" :
+                rows.Count > 0 ? "请核对样例行和列映射，再导入词库。" : "已选择 MDX 文件，可以导入。");
         }
         catch (Exception ex)
         {
@@ -307,6 +313,31 @@ public partial class SettingsWindow : Window
         Message(ImportStatus, "正在导入词条并建立索引…");
         try
         {
+            if (DictionaryStore.IsMergedVolume(path))
+            {
+                string merged = DictionaryStore.MergedDatabasePath(databasePath);
+                var progress = new Progress<(string Group, int Pages)>(p =>
+                {
+                    if (!closed && busy) Message(ImportStatus, $"正在导入 {p.Group}，已读 {p.Pages:N0} 个词页。");
+                });
+                await Task.Run(() =>
+                {
+                    using var store = new DictionaryStore(merged);
+                    store.ImportMerged(Path.GetDirectoryName(path)!, (group, pages) =>
+                        ((IProgress<(string,int)>)progress).Report((group,pages)));
+                });
+                if (closed) return;
+                // 开发构建可由 dotnet E_Search.dll 承载，发布构建则直接由 apphost 启动。
+                var launch = new System.Diagnostics.ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false };
+                if (Path.GetFileNameWithoutExtension(launch.FileName).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+                    launch.ArgumentList.Add(typeof(SettingsWindow).Assembly.Location);
+                launch.ArgumentList.Add("gui-merged");
+                launch.ArgumentList.Add(merged);
+                launch.ArgumentList.Add(Path.GetFileName(path).Equals("E_search-zh-en.mdx", StringComparison.OrdinalIgnoreCase) ? "zh-en" : "zh-ja");
+                using var process = System.Diagnostics.Process.Start(launch);
+                Message(ImportStatus, "已打开独立双卷词库。");
+                return;
+            }
             var (book, books) = await Task.Run(() =>
             {
                 using var store = new DictionaryStore(databasePath);

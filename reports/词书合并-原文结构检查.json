@@ -1,0 +1,25 @@
+{
+  "method": "在严格解码的全部原文中筛查属性或标签。命中是静态结构线索，非渲染结论。",
+  "sources": {
+    "eijiro": {
+      "inline_css_url": {
+        "records": 2,
+        "examples": [
+          391387,
+          391695
+        ]
+      }
+    },
+    "shinseiki": {
+      "javascript_link": {
+        "records": 9560,
+        "examples": [
+          145,
+          239,
+          265,
+          380
+        ]
+      }
+    }
+  }
+}

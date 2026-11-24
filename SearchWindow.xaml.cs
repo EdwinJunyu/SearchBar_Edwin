@@ -16,6 +16,8 @@ using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Threading;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.Wpf;
 using Forms = System.Windows.Forms;
 
 namespace ESearch;
@@ -47,6 +49,13 @@ public partial class SearchWindow : Window
     private bool navigatingFiles;
     private CancellationTokenSource? pending;
     private CancellationTokenSource? pendingPreview;
+    private readonly Stack<(MergedArticle Page, string Fragment)> mergedHistory = new();
+    private (MergedArticle Page, string Fragment)? mergedCurrent;
+    private Task? mergedBrowserReady;
+    private WebView2CompositionControl? mergedWeb;
+    private string? mergedResourcePath, mergedDocumentPath;
+    private byte[] mergedDocument = [];
+    private Dictionary<string, byte[]> mergedAssets = new(StringComparer.Ordinal);
 
     public SearchWindow(string databasePath, string? dictionaryId = null)
     {
@@ -975,6 +984,9 @@ public partial class SearchWindow : Window
     private void CloseDetails()
     {
         detailRevision++;
+        mergedCurrent = null;
+        mergedHistory.Clear();
+        mergedDocumentPath = null;
         CandidatePicker.IsDropDownOpen = false;
         DetailsPanel.Visibility = Visibility.Collapsed;
         EntryText.Text = "";
@@ -1032,6 +1044,145 @@ public partial class SearchWindow : Window
     }
 
     private sealed record DetailBody(string Text, EntryAnchor? Anchor);
+
+    private const string DictionaryOrigin = "https://dictionary.invalid";
+
+    private async Task ConfigureMergedBrowser()
+    {
+        string cache = Path.Combine(Path.GetDirectoryName(databasePath)!, "WebView2");
+        var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: cache);
+        if (exiting || !DetailsPanel.IsVisible || !MergedDetail.IsVisible) throw new OperationCanceledException();
+        // Collapsed 的 WPF 子控件仍收到 Loaded；普通词库只创建 XAML 宿主。
+        var control = new WebView2CompositionControl();
+        AutomationProperties.SetAutomationId(control, "MergedWeb");
+        AutomationProperties.SetName(control, "合并词书原文");
+        mergedWeb = control;
+        MergedWebHost.Content = control;
+        try { await control.EnsureCoreWebView2Async(environment); }
+        catch
+        {
+            MergedWebHost.Content = null;
+            mergedWeb = null;
+            control.Dispose();
+            throw;
+        }
+        var browser = control.CoreWebView2;
+        browser.Settings.IsScriptEnabled = false;
+        browser.Settings.AreHostObjectsAllowed = false;
+        browser.Settings.IsWebMessageEnabled = false;
+        browser.Settings.AreDefaultContextMenusEnabled = false;
+        browser.NewWindowRequested += (_, args) => args.Handled = true;
+        browser.PermissionRequested += (_, args) => args.State = CoreWebView2PermissionState.Deny;
+        browser.DownloadStarting += (_, args) => args.Cancel = true;
+        browser.LaunchingExternalUriScheme += (_, args) => args.Cancel = true;
+        // 使用虚拟来源提供正文与 MDD 字节。浏览器不接触磁盘路径，也不执行原书内联脚本。
+        browser.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
+        browser.WebResourceRequested += (_, args) =>
+        {
+            byte[]? data = null;
+            string mime = "application/octet-stream";
+            if (Uri.TryCreate(args.Request.Uri, UriKind.Absolute, out var url) &&
+                url.GetLeftPart(UriPartial.Authority) == DictionaryOrigin)
+            {
+                if (url.AbsolutePath == mergedDocumentPath)
+                {
+                    data = mergedDocument;
+                    mime = "text/html; charset=utf-8";
+                }
+                else if (url.AbsolutePath.StartsWith("/es/", StringComparison.Ordinal))
+                {
+                    string key = Uri.UnescapeDataString(url.AbsolutePath).Replace('/', '\\');
+                    mergedAssets.TryGetValue(key, out data);
+                    mime = Path.GetExtension(key).ToLowerInvariant() switch {
+                        ".jpg" or ".jpeg" => "image/jpeg", ".png" => "image/png", ".gif" => "image/gif",
+                        ".svg" => "image/svg+xml", ".css" => "text/css; charset=utf-8",
+                        ".mp3" => "audio/mpeg", ".wav" => "audio/wav", ".woff" => "font/woff",
+                        ".woff2" => "font/woff2", _ => "application/octet-stream"
+                    };
+                }
+            }
+            string headers = $"Content-Type: {mime}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n" +
+                "Content-Security-Policy: default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; " +
+                "font-src 'self' data:; media-src 'self' data:; object-src 'none'; frame-src 'none'; base-uri 'self'";
+            args.Response = environment.CreateWebResourceResponse(new MemoryStream(data ?? [], writable: false),
+                data == null ? 404 : 200, data == null ? "Not Found" : "OK", headers);
+        };
+        browser.NavigationStarting += (_, args) =>
+        {
+            if (!Uri.TryCreate(args.Uri, UriKind.Absolute, out var uri)) { args.Cancel = true; return; }
+            if (uri.GetLeftPart(UriPartial.Authority) == DictionaryOrigin && uri.AbsolutePath == mergedDocumentPath) return;
+            args.Cancel = true;
+            // 每个已显示页面有自己的导航前缀；已替换文档的迟到点击不应作用在新候选上。
+            string prefix = mergedDocumentPath + "/lookup/";
+            if (mergedDocumentPath != null && uri.GetLeftPart(UriPartial.Authority) == DictionaryOrigin &&
+                uri.AbsolutePath.StartsWith(prefix, StringComparison.Ordinal))
+                _ = FollowMergedLink(Uri.UnescapeDataString(uri.AbsolutePath[prefix.Length..]), uri.Fragment);
+        };
+    }
+
+    private async Task FollowMergedLink(string key, string fragment)
+    {
+        if (mergedCurrent is not { } current) return;
+        long request = ++detailRevision;
+        try
+        {
+            var next = await Task.Run(() => {
+                using var store = new DictionaryStore(databasePath, readOnly: true);
+                return store.MergedArticleByKey(current.Page.Group, key, current.Page.Revision);
+            });
+            if (request != detailRevision || !DetailsPanel.IsVisible) return;
+            if (next == null) { SetStatus("原书中未找到该跳转的目标。"); return; }
+            await DisplayMerged(next, fragment, request, () => mergedHistory.Push(current));
+        }
+        catch (Exception ex) { if (request == detailRevision && DetailsPanel.IsVisible) SetStatus("词条跳转失败：" + ex.Message); }
+    }
+
+    private async void MergedBackClick(object sender, RoutedEventArgs args)
+    {
+        if (!mergedHistory.TryPeek(out var previous)) return;
+        long request = ++detailRevision;
+        try { await DisplayMerged(previous.Page, previous.Fragment, request, () => mergedHistory.Pop()); }
+        catch (Exception ex) { if (request == detailRevision && DetailsPanel.IsVisible) SetStatus("无法返回词条：" + ex.Message); }
+    }
+
+    private async Task DisplayMerged(MergedArticle article, string fragment, long request, Action? commitHistory = null)
+    {
+        if (request != detailRevision || !DetailsPanel.IsVisible) return;
+        DetailScroll.Visibility = Visibility.Collapsed;
+        MergedDetail.Visibility = Visibility.Visible;
+        var ready = mergedBrowserReady ??= ConfigureMergedBrowser();
+        try { await ready; }
+        catch { if (ReferenceEquals(mergedBrowserReady, ready)) mergedBrowserReady = null; throw; }
+        if (request != detailRevision || !DetailsPanel.IsVisible) return;
+        if (!string.Equals(mergedResourcePath, article.ResourceArchive, StringComparison.Ordinal))
+        {
+            var assets = await Task.Run(() => article.ResourceArchive is null ? new Dictionary<string, byte[]>(StringComparer.Ordinal)
+                : MdxReader.ReadResources(article.ResourceArchive).ToDictionary(a => a.Key, a => a.Data.ToArray(), StringComparer.Ordinal));
+            if (request != detailRevision || !DetailsPanel.IsVisible) return;
+            mergedAssets = assets;
+            mergedResourcePath = article.ResourceArchive;
+        }
+        commitHistory?.Invoke();
+        mergedCurrent = (article, fragment);
+        mergedDocumentPath = "/page-" + request;
+        MergedBack.Visibility = mergedHistory.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        string body = RewriteMergedLinks(article.Html, mergedDocumentPath);
+        string html = """<!doctype html><html lang="zh"><meta charset="utf-8"><base href="https://dictionary.invalid/"><style>body{font:15px/1.55 "Segoe UI","Yu Gothic UI",sans-serif;margin:4px 8px;color:#172c39;overflow-wrap:anywhere}.es-source+.es-source{margin-top:14px}.es-label{font-size:12px;color:#24646b;margin:0 0 5px}</style><body>"""
+            + body + "</body></html>";
+        mergedDocument = Encoding.UTF8.GetBytes(html);
+        // 相对资源从站点根目录加载；页内跳转须保留当前文章的路径。
+        if (body.Contains("href=\"#", StringComparison.OrdinalIgnoreCase) || body.Contains("href='#", StringComparison.OrdinalIgnoreCase))
+            mergedDocument = Encoding.UTF8.GetBytes(html.Replace("<base href=\"https://dictionary.invalid/\">", "", StringComparison.Ordinal));
+        mergedWeb!.CoreWebView2.Navigate(DictionaryOrigin + mergedDocumentPath + fragment);
+    }
+
+    private static string RewriteMergedLinks(string html, string documentPath)
+    {
+        // 三类跨词条链接共享当前文档的版本前缀，包括按 E_Search 原书索引补充的落点。
+        string body = Regex.Replace(html, @"(?i)(\bhref\s*=\s*[""'])entry://(?=es(?:ref|appref|missing)-)",
+            "$1" + documentPath + "/lookup/");
+        return Regex.Replace(body, @"(?i)(\bhref\s*=\s*[""'])entry://#", "$1#");
+    }
 
     private static DetailBody FormatDetail(string raw, EntryAnchor? anchor)
     {
@@ -1109,6 +1260,11 @@ public partial class SearchWindow : Window
     {
         if (CandidatePicker.SelectedItem is not Candidate chosen) return;
         long request = ++detailRevision;
+        mergedHistory.Clear();
+        mergedCurrent = null;
+        mergedDocumentPath = null;
+        MergedDetail.Visibility = Visibility.Collapsed;
+        DetailScroll.Visibility = Visibility.Visible;
         EntryText.Text = "正在读取词条…";
         ReadingPreferencePanel.Visibility = Visibility.Collapsed;
         var reading = DictionaryStore.PreferenceReading(chosen.Hit);
@@ -1118,8 +1274,9 @@ public partial class SearchWindow : Window
             {
                 using var store = new DictionaryStore(databasePath, readOnly: true);
                 var raw = store.CurrentBody(chosen.Hit.Entry);
-                if (raw == null) return (Body: (DetailBody?)null, Preferred: (string?)null);
-                return (Body: FormatDetail(raw, chosen.Hit.Entry.Anchor), Preferred: reading == null ? null : store.ReadReadingPreference(reading));
+                if (raw == null) return (Body: (DetailBody?)null, Merged: (MergedArticle?)null, Preferred: (string?)null);
+                var merged = store.MergedArticleFor(chosen.Hit.Entry);
+                return (Body: FormatDetail(raw, chosen.Hit.Entry.Anchor), Merged: merged, Preferred: reading == null ? null : store.ReadReadingPreference(reading));
             });
             if (request != detailRevision || !DetailsPanel.IsVisible) return;
             if (full.Body == null)
@@ -1128,6 +1285,18 @@ public partial class SearchWindow : Window
                 return;
             }
             DisplayDetail(full.Body);
+            if (full.Merged != null)
+            {
+                try { await DisplayMerged(full.Merged, "", request); }
+                catch (Exception ex)
+                {
+                    if (request != detailRevision) return;
+                    MergedDetail.Visibility = Visibility.Collapsed;
+                    DetailScroll.Visibility = Visibility.Visible;
+                    SetStatus("无法显示词书排版，已显示本来源原文。" + ex.Message);
+                }
+                if (request != detailRevision) return;
+            }
             if (reading != null)
             {
                 bool current = Lookup.Normalize(chosen.Hit.Entry.Headword) == full.Preferred;
@@ -1137,7 +1306,7 @@ public partial class SearchWindow : Window
                 ReadingPreferencePanel.Visibility = Visibility.Visible;
             }
         }
-        catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or InvalidOperationException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or InvalidDataException or InvalidOperationException or UnauthorizedAccessException)
         {
             if (request == detailRevision && DetailsPanel.IsVisible) EntryText.Text = "正文读取失败：" + ex.Message;
         }
@@ -1166,6 +1335,7 @@ public partial class SearchWindow : Window
         revision++;
         detailRevision++;
         pendingPreview?.Cancel();
+        mergedWeb?.Dispose();
         debounce.Stop();
         pending?.Cancel();
         if (registered) UnregisterHotKey(hwnd, hotkeyId);

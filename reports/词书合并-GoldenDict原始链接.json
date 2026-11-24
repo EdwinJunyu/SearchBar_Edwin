@@ -1,0 +1,387 @@
+{
+  "fixed_commit": "bd959482644d7cfa57743a5143d2a5d0462e382d",
+  "qt": "4.8.6.0",
+  "physical_comparison": {
+    "hanying": {
+      "classes": {
+        "same_nonempty": {
+          "references": 231792,
+          "target_sets": 30865
+        }
+      },
+      "examples": {},
+      "source_keys_over_256": 10,
+      "different_target_sets": [],
+      "goldendict_executable_generated_index": {
+        "file": "115555ddb467851b81161104bbd371ed",
+        "sha256": "3a1a9747b5b9aed43862d6591d1fd194ccb73b446b2ff3c3133b101a6c720d2b",
+        "leaf_blocks": 881,
+        "chains": 774235,
+        "references_same_order": 231792,
+        "mismatches": []
+      }
+    },
+    "oxford": {
+      "classes": {
+        "same_empty": {
+          "references": 4330,
+          "target_sets": 2547
+        },
+        "same_nonempty": {
+          "references": 35707,
+          "target_sets": 16140
+        }
+      },
+      "examples": {},
+      "source_keys_over_256": 0,
+      "different_target_sets": [],
+      "goldendict_executable_generated_index": {
+        "file": "136706fae1d37f14605ad17b327dee9f",
+        "sha256": "bc60196b5b69bc2dec5f6e221397bf6f55002423efe2c77f7d9cc582bbd167ce",
+        "leaf_blocks": 211,
+        "chains": 43958,
+        "references_same_order": 40037,
+        "mismatches": []
+      },
+      "original_pages_for_client_check": [
+        {
+          "source_ordinal": 7371,
+          "source_search_key": "come",
+          "original_href_excerpt": "<a href=\"entry://how come?\">how c",
+          "target": "how come?",
+          "goldendict_physical_ids": [],
+          "classification": "URL 尾问号可能构成空查询"
+        }
+      ],
+      "url_query_interpretation": {
+        "how come": [],
+        "how come?": []
+      }
+    },
+    "sanseido": {
+      "classes": {
+        "same_empty": {
+          "references": 504243,
+          "target_sets": 195984
+        },
+        "same_nonempty": {
+          "references": 34074,
+          "target_sets": 14965
+        }
+      },
+      "examples": {},
+      "source_keys_over_256": 0,
+      "different_target_sets": [],
+      "goldendict_executable_generated_index": {
+        "file": "2759d91dea6039e97f0287171c857897",
+        "sha256": "d68de16bc123d314a96ad763f7c4563457fc0f2bb72f407bc80d297f6211ec48",
+        "leaf_blocks": 670,
+        "chains": 446716,
+        "references_same_order": 538317,
+        "mismatches": []
+      },
+      "original_pages_for_client_check": [
+        {
+          "source_ordinal": 23,
+          "source_search_key": "AAA",
+          "original_href_excerpt": "<a href=\"entry://AALA\">AALA<",
+          "target": "AALA",
+          "goldendict_physical_ids": [
+            33,
+            34
+          ],
+          "classification": "原始物理精确词头"
+        },
+        {
+          "source_ordinal": 16772,
+          "source_search_key": "DC",
+          "original_href_excerpt": "<a href=\"entry://AC\">AC</a",
+          "target": "AC",
+          "goldendict_physical_ids": [
+            291,
+            292,
+            294,
+            296,
+            83274
+          ],
+          "classification": "原始大小写及首尾空白等价"
+        },
+        {
+          "source_ordinal": 22025,
+          "source_search_key": "ERM",
+          "original_href_excerpt": "<a href=\"entry://イーアールエム\">イーアール",
+          "target": "イーアールエム",
+          "goldendict_physical_ids": [],
+          "classification": "带标点的另一个物理键"
+        },
+        {
+          "source_ordinal": 314755,
+          "source_search_key": "スーク",
+          "original_href_excerpt": "<a href=\"entry://バザール<font color=\"#00800",
+          "target": "バザール<font color=",
+          "goldendict_physical_ids": [],
+          "classification": "畸形的原 href"
+        },
+        {
+          "source_ordinal": 333118,
+          "source_search_key": "レンズ",
+          "original_href_excerpt": "<a href=\"entry://電子レンズ\">電子レンズ",
+          "target": "電子レンズ",
+          "goldendict_physical_ids": [],
+          "classification": "正文展示头与物理词头不同"
+        },
+        {
+          "source_ordinal": 215181,
+          "source_search_key": "ちゃ",
+          "original_href_excerpt": "<a href=\"entry://お茶\">お茶</a",
+          "target": "お茶",
+          "goldendict_physical_ids": [],
+          "classification": "应用解析后的源展示头"
+        },
+        {
+          "source_ordinal": 104823,
+          "source_search_key": "え・い",
+          "original_href_excerpt": "<a href=\"entry://えし\">えし</a",
+          "target": "えし",
+          "goldendict_physical_ids": [],
+          "classification": "应用读音索引"
+        },
+        {
+          "source_ordinal": 83491,
+          "source_search_key": "　<i>l</i>　体・　L　体",
+          "original_href_excerpt": "<a href=\"entry://<i>d</i>　体\"><i>d<",
+          "target": "<i>d</i>　体",
+          "goldendict_physical_ids": [],
+          "classification": "原 href 包含 HTML"
+        },
+        {
+          "source_ordinal": 334090,
+          "source_search_key": " ・ 点菩提",
+          "original_href_excerpt": "<a href=\"entry://ささぼさつ\">ささぼさつ</a></font>\r\n",
+          "target": "ささぼさつ",
+          "goldendict_physical_ids": [],
+          "classification": "真实 Qt 原索引在反混淆筛选时保留标点，用户链接本身无直接命中。",
+          "native_btree_exact": {
+            "coarse_bucket_entries": 1,
+            "exact_ordered_results": []
+          },
+          "nearby_distinct_original": {
+            "key": "ささ－ぼさつ",
+            "native_btree_exact": {
+              "coarse_bucket_entries": 1,
+              "exact_ordered_results": [
+                [
+                  162537,
+                  "ささ－ぼさつ"
+                ]
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "shinseiki": {
+      "classes": {
+        "same_nonempty": {
+          "references": 249189,
+          "target_sets": 133200
+        },
+        "same_empty": {
+          "references": 1,
+          "target_sets": 1
+        }
+      },
+      "examples": {},
+      "source_keys_over_256": 0,
+      "different_target_sets": [],
+      "goldendict_executable_generated_index": {
+        "file": "004cba43cb8d5bb42e5de09802be2479",
+        "sha256": "482649538b81d796ea7fe968667afe3fa0f47f79a30ab86e46fce20f700a0e42",
+        "leaf_blocks": 641,
+        "chains": 408836,
+        "references_same_order": 249190,
+        "mismatches": []
+      }
+    }
+  },
+  "runtime_observations": [
+    {
+      "reader": "GoldenDict 1.5.0-RC2-254-gbd95948, Qt 4.8.6",
+      "scope": "独立便携八部原书 GUI，查 DC，选来源段，点击该段 AC，并核对实际显示",
+      "source": "sanseido",
+      "from": "DC",
+      "to": "AC",
+      "visible_results": [
+        "alternating current",
+        "actinium",
+        "adaptive control",
+        "Advertising Council",
+        "エーシー"
+      ],
+      "screenshots": [
+        {
+          "file": ".data/gd-merge-review/original-sanseido-DC.png",
+          "sha256": "99ea9ee46e86f24271cdffa4beaf21718ddf20ffdc2d1fb7b034a3aaf421be6d"
+        },
+        {
+          "file": ".data/gd-merge-review/original-sanseido-AC.png",
+          "sha256": "c8de21c9309d24cd313f805914c8e1724d9ef3b2230a9313e4d5b2a6a98087fc"
+        }
+      ]
+    },
+    {
+      "reader": "GoldenDict 1.5.0-RC2-254-gbd95948, Qt 4.8.6",
+      "scope": "独立便携八部原书 GUI，查 DC，选来源段，点击该段 AC，并核对实际显示",
+      "source": "oxford",
+      "from": "DC",
+      "to": "AC",
+      "visible_results": [
+        "air conditioning",
+        "alternating current"
+      ],
+      "screenshots": [
+        {
+          "file": ".data/gd-merge-review/original-DC-to-AC.png",
+          "sha256": "4c2cbb41e2087c389af57e71bef4819634db341aa4d6806d89255104d67b2d1e"
+        }
+      ]
+    }
+  ],
+  "runtime_observations_scope": "此脚本离线读档及比较固定版源码；此列只收录独立完成的界面点击。未记录的样本不作界面实测结论。",
+  "scope": "同源物理候选，按 NFC + 原版 1041 项 simple fold 比较并保留物理原序。客户端实例显示、外部词典组、词形提示及相同正文显示去重另行实测。",
+  "upstream": {
+    "qt4_entry_url": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/mdx.cc#L1180-L1255",
+    "show_definition": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/articleview.cc#L1081-L1120",
+    "word_trim": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/article_maker.cc#L366-L388",
+    "index_head": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/mdx.cc#L1314-L1344",
+    "candidate_fold": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/folding.cc#L33-L90",
+    "final_filter": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/btreeidx.cc#L912-L925",
+    "nfc": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/wstring_qt.cc#L37-L39",
+    "simple_fold_table": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/inc_case_folding.hh",
+    "mdx_native": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/mdx.cc#L640-L677",
+    "header": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/mdictparser.cc#L369-L431",
+    "miss_and_suggestions": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/article_maker.cc#L768-L784",
+    "key_length_limit": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/btreeidx.hh#L260",
+    "actual_anchor_selection": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/articleview.cc#L496-L535",
+    "single_instance": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/main.cc#L278-L305",
+    "command_line": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/main.cc#L165-L197",
+    "diagnostic_log": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/main.cc#L364-L380",
+    "single_instance_windows_session": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/qtsingleapplication/src/qtlocalpeer.cpp#L70-L107"
+  },
+  "qt_sources": [
+    "https://github.com/qt/qt/blob/v4.8.6/src/corelib/tools/qunicodetables_p.h#L62",
+    "https://github.com/qt/qt/blob/v4.8.6/src/corelib/tools/qchar.cpp#L543-L550",
+    "https://github.com/qt/qt/blob/v4.8.6/src/corelib/tools/qstring.cpp#L4214-L4236"
+  ],
+  "sanseido_physical_and_application_index": {
+    "basis": "A 初版逐字词头、再 SQLite trim(head) ASCII NOCASE。下面的应用索引/markup 分项只统计这两项皆未命中的目标；索引类别可重叠。",
+    "application_index_source": "0AB9F10A785E179BDD6AD11CC23F865BF3B7FB1B22F5D8D04E48CAAF5088AA36",
+    "application_index_path": "D:\\D_Main\\EdwinSoftware\\E_Search\\.data\\dictionary-merge-20261123-reader\\baseline.db",
+    "normalization": "NFKC + trim + lowercase，拉丁字母间的 ‘ ’ ʼ ‐ 折叠；读音键平假名化。展示头来自同源 entries.head，词头/读音分别来自 terms.kind=0/1。",
+    "markup_pattern": "</?[A-Za-z]|\\b(?:font|href|color)\\s*=",
+    "categories": {
+      "neither_legacy_physical_rule": {
+        "references": 504331,
+        "distinct_targets": 196014
+      },
+      "contains_markup": {
+        "references": 1913,
+        "distinct_targets": 867
+      },
+      "exact_physical_head": {
+        "references": 33942,
+        "distinct_targets": 14916
+      },
+      "display_head": {
+        "references": 839,
+        "distinct_targets": 349
+      },
+      "index_head": {
+        "references": 877,
+        "distinct_targets": 368
+      },
+      "any_index": {
+        "references": 2844,
+        "distinct_targets": 1348
+      },
+      "legacy_trim_ascii_only": {
+        "references": 44,
+        "distinct_targets": 19
+      },
+      "index_reading": {
+        "references": 1967,
+        "distinct_targets": 980
+      }
+    }
+  },
+  "reference_totals": {
+    "same_nonempty": 550762,
+    "same_empty": 508574
+  },
+  "references_compared": 1059336,
+  "audited_build": "最终 A5 / B5。A5 的链接账本来自独立 A4 暂存。A5 只新增 1 个公开词头兼容入口，未改变任何逐位置链接。",
+  "previous_implementation_comparison": {
+    "archive": "归档-最终验收前/词书合并-GoldenDict原始链接.json",
+    "reference_totals": {
+      "same_nonempty": 550255,
+      "same_empty": 508573,
+      "published_omits_candidates": 507,
+      "published_adds_candidates": 1
+    },
+    "fixed_candidates": 507,
+    "fixed_extra_target": 1
+  },
+  "raw_source_reference_census": {
+    "method": "原书 C# 逐条对照过的 orig，逐字扫描所有大小写的 entry:// 及原生 @@@LINK 引导，按原物理词身 Unicode 字符位置与发布账本依序对照。另列没有 href 属性前缀的字面片段。",
+    "sources": {
+      "eijiro": {
+        "records": 1604742,
+        "matched_references": 0
+      },
+      "hanying": {
+        "records": 376636,
+        "html_href": 231792,
+        "matched_references": 231792
+      },
+      "oxford": {
+        "records": 42481,
+        "html_href": 40037,
+        "matched_references": 40037
+      },
+      "sango": {
+        "records": 172761,
+        "matched_references": 0
+      },
+      "sanseido": {
+        "records": 520678,
+        "matched_references": 538317,
+        "html_href": 538317
+      },
+      "shinseiki": {
+        "records": 403511,
+        "matched_references": 249190,
+        "native": 249190
+      },
+      "shogakukan": {
+        "records": 70307,
+        "matched_references": 0
+      },
+      "shogakukan-zhja": {
+        "records": 79965,
+        "matched_references": 0
+      }
+    },
+    "differences": []
+  },
+  "separate_application_native_override": {
+    "source": "shinseiki",
+    "ordinal": 140837,
+    "GoldenDict_target_literal": "た·つ【裁つ】&lt;",
+    "GoldenDict_direct_ordinals": [],
+    "E_Search_target": "た·つ【裁つ】<",
+    "E_Search_direct_ordinals": [
+      137258
+    ],
+    "effect": "公开页标注原书无直接目标，另列 E_Search 补充跳转。"
+  }
+}

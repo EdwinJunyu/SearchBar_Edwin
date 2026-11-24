@@ -1,0 +1,349 @@
+{
+  "fixed_commit": "bd959482644d7cfa57743a5143d2a5d0462e382d",
+  "source": {
+    "oxford": {
+      "file": "136706fae1d37f14605ad17b327dee9f",
+      "sha256": "bc60196b5b69bc2dec5f6e221397bf6f55002423efe2c77f7d9cc582bbd167ce",
+      "leaf_blocks": 211,
+      "chains": 43958,
+      "physical_records": 42481,
+      "reachable_records": 42481,
+      "unreachable": []
+    },
+    "hanying": {
+      "file": "115555ddb467851b81161104bbd371ed",
+      "sha256": "3a1a9747b5b9aed43862d6591d1fd194ccb73b446b2ff3c3133b101a6c720d2b",
+      "leaf_blocks": 881,
+      "chains": 774235,
+      "physical_records": 376636,
+      "reachable_records": 376626,
+      "unreachable": [
+        {
+          "ordinal": 15,
+          "head": " advance secretly by [along] an unknown path; act before another is aware; do a thing in secret; do one thing under cover of another; do sth. behind the facade of ...; pretend to prepare to advance along one path while secretly going along another; steal a march upon ...",
+          "trimmed_length": 270
+        },
+        {
+          "ordinal": 62030,
+          "head": "厂长负责制 system of overall responsibility by factory manager; system of overall leadership by the factory director; system of factory director's responsibility; system in which factory assumes full responsibility; Factory director takes responsibility for production.; the responsibility system of factory directors;",
+          "trimmed_length": 313
+        },
+        {
+          "ordinal": 80470,
+          "head": " (喜欢做某件事) be willing to; be happy to; be in high [fine; full; good] feather; be in high spirits; tread [walk] on air; be transported with joy; be in great form; rejoice at [over] sth.; be of good cheer; be pleased; be glad; jolly along; be happy; enjoy the happiness of sth.; fill with delight; with all the pleasure in life; have the time of one's life; brim over with high spirits; be mad with joy:",
+          "trimmed_length": 399
+        },
+        {
+          "ordinal": 111374,
+          "head": "家庭联产承包责任制 {农} system of contracted responsibilities on the household basis with remuneration linked to output; contracted responsibility system based on the household, with remuneration linked to output; system of contracted household responsibility related to output; household contract responisbility system;",
+          "trimmed_length": 310
+        },
+        {
+          "ordinal": 229352,
+          "head": "独立核算、国家征税、自负盈亏 conduct business accounting independently, paying taxes to the state and assuming sole responsibility for profits and losses; conduct independent business accounting, pay taxes instead of turning over their profits to the state, and assume full responsibility for their profits and losses;",
+          "trimmed_length": 304
+        },
+        {
+          "ordinal": 311507,
+          "head": " {语} （六书之一） associative compounds, one of the six categories of Chinese characters, which are formed by combining two or more elements, each with a meaning of its own, to create a new meaning, e.g. 信, a character made up of 人 (man) and 言 (word), meaning a message or sth. that can be believed or trusted",
+          "trimmed_length": 302
+        },
+        {
+          "ordinal": 324965,
+          "head": "辅助设备 accessory equipment; accessories; additional equipment; adjustage; aid; auxiliary apparatus; auxiliary device; auxiliary equipment; auxiliary facility; auxiliary installation; auxiliary means; auxiliaries; maintenance facility; service equipment; slaving;",
+          "trimmed_length": 260
+        },
+        {
+          "ordinal": 372973,
+          "head": " （保释人） bail;保证热耗 guaranteed heat consumption; heat rate guarantee;保证试剂 guaranteed reagents;保证书 guarantee bond; letter of guarantee; written pledge; guarantee; guaranty; {律} recognizance;保证条款 engagement clause; safeguard clause; warranty;保证物 security;保证效率 guaranteed efficiency;保证信托公司 guaranty trust company;保证性能 guaranteed performance;保证应力 proof stress;保证有限公司 company limited by guarantee;保证债券 surety bond",
+          "trimmed_length": 404
+        },
+        {
+          "ordinal": 373559,
+          "head": " （在关键地方加上少许字句使文章更贴切， 更生动） add a word or two to clinch the point; a crucial touch which drives home a point otherwise difficult to explain; put in the eye pupil in painting a dragon -- the critical touch; put life into ...， like dotting the eyeball in painting a dragon; put the finishing touches on [to] one's work; round off [out] a picture:",
+          "trimmed_length": 341
+        },
+        {
+          "ordinal": 374479,
+          "head": " （指五种罪恶） “five evils” (bribery, tax evasion, theft of state property, cheating on government contracts and stealing of economic information); “five poisons” (a campaign was launched in 1952 against capitalist bribery of government employees, tax evasion, theft of state property, cheating on government contracts and stealing economic information for speculation)",
+          "trimmed_length": 362
+        }
+      ]
+    },
+    "shogakukan": {
+      "file": "73751bb9fc34e8cc7f31fad51b2ea400",
+      "sha256": "4bd6cbd5c7212caac5a6fbed6335b8f673d318f065bee8062e34a0d0f9103f21",
+      "leaf_blocks": 265,
+      "chains": 69417,
+      "physical_records": 70307,
+      "reachable_records": 70307,
+      "unreachable": []
+    },
+    "sanseido": {
+      "file": "2759d91dea6039e97f0287171c857897",
+      "sha256": "d68de16bc123d314a96ad763f7c4563457fc0f2bb72f407bc80d297f6211ec48",
+      "leaf_blocks": 670,
+      "chains": 446716,
+      "physical_records": 520678,
+      "reachable_records": 520668,
+      "unreachable": [
+        {
+          "ordinal": 520473,
+          "head": "－い",
+          "trimmed_length": 2
+        },
+        {
+          "ordinal": 520537,
+          "head": "－し",
+          "trimmed_length": 2
+        },
+        {
+          "ordinal": 520538,
+          "head": "－し",
+          "trimmed_length": 2
+        },
+        {
+          "ordinal": 520549,
+          "head": "－じょう",
+          "trimmed_length": 4
+        },
+        {
+          "ordinal": 520550,
+          "head": "－じょう",
+          "trimmed_length": 4
+        },
+        {
+          "ordinal": 520551,
+          "head": "－じょう",
+          "trimmed_length": 4
+        },
+        {
+          "ordinal": 520552,
+          "head": "－じょう",
+          "trimmed_length": 4
+        },
+        {
+          "ordinal": 520562,
+          "head": "－せい",
+          "trimmed_length": 3
+        },
+        {
+          "ordinal": 520563,
+          "head": "－せい",
+          "trimmed_length": 3
+        },
+        {
+          "ordinal": 520601,
+          "head": "－とう",
+          "trimmed_length": 3
+        }
+      ]
+    },
+    "shinseiki": {
+      "file": "004cba43cb8d5bb42e5de09802be2479",
+      "sha256": "482649538b81d796ea7fe968667afe3fa0f47f79a30ab86e46fce20f700a0e42",
+      "leaf_blocks": 641,
+      "chains": 408836,
+      "physical_records": 403511,
+      "reachable_records": 403511,
+      "unreachable": []
+    },
+    "sango": {
+      "file": "46d511fe476b5898ed254deb951576db",
+      "sha256": "eadeb2a982b4921767ec48f903c72cd28d7eb81d218b2d7481d1371cc6bc23c2",
+      "leaf_blocks": 400,
+      "chains": 158785,
+      "physical_records": 172761,
+      "reachable_records": 172761,
+      "unreachable": []
+    },
+    "eijiro": {
+      "file": "2755e62efb66897679a25bc302b35834",
+      "sha256": "d1be856d30964c72c2b426b5e479019b49ebb78872bb0f75a29948410f31dd16",
+      "leaf_blocks": 1512,
+      "chains": 2282125,
+      "physical_records": 1604742,
+      "reachable_records": 1604742,
+      "unreachable": []
+    },
+    "shogakukan-zhja": {
+      "file": "477cd9f4dee4a0f5e4cb8a977e052f3b",
+      "sha256": "e32c9f6f98e6a7381538697b0f9f797e8c0d75c11f0e6fe627c807379cc7e9f5",
+      "leaf_blocks": 284,
+      "chains": 79946,
+      "physical_records": 79965,
+      "reachable_records": 79965,
+      "unreachable": []
+    }
+  },
+  "merged": {
+    "zh-en": {
+      "file": "84a3d5ae190d785f8574c66f024ac6d4",
+      "sha256": "08ac5bf6bae6642a4aeb89c13f8e2236703d1091ddb30304b2b556c6bf76b2db",
+      "leaf_blocks": 973,
+      "chains": 944207,
+      "physical_records": 464715,
+      "reachable_records": 464705,
+      "unreachable": [
+        {
+          "ordinal": 23,
+          "head": " (喜欢做某件事) be willing to; be happy to; be in high [fine; full; good] feather; be in high spirits; tread [walk] on air; be transported with joy; be in great form; rejoice at [over] sth.; be of good cheer; be pleased; be glad; jolly along; be happy; enjoy the happiness of sth.; fill with delight; with all the pleasure in life; have the time of one's life; brim over with high spirits; be mad with joy:",
+          "trimmed_length": 399
+        },
+        {
+          "ordinal": 383,
+          "head": " advance secretly by [along] an unknown path; act before another is aware; do a thing in secret; do one thing under cover of another; do sth. behind the facade of ...; pretend to prepare to advance along one path while secretly going along another; steal a march upon ...",
+          "trimmed_length": 270
+        },
+        {
+          "ordinal": 669,
+          "head": " {语} （六书之一） associative compounds, one of the six categories of Chinese characters, which are formed by combining two or more elements, each with a meaning of its own, to create a new meaning, e.g. 信, a character made up of 人 (man) and 言 (word), meaning a message or sth. that can be believed or trusted",
+          "trimmed_length": 302
+        },
+        {
+          "ordinal": 1245,
+          "head": " （保释人） bail;保证热耗 guaranteed heat consumption; heat rate guarantee;保证试剂 guaranteed reagents;保证书 guarantee bond; letter of guarantee; written pledge; guarantee; guaranty; {律} recognizance;保证条款 engagement clause; safeguard clause; warranty;保证物 security;保证效率 guaranteed efficiency;保证信托公司 guaranty trust company;保证性能 guaranteed performance;保证应力 proof stress;保证有限公司 company limited by guarantee;保证债券 surety bond",
+          "trimmed_length": 404
+        },
+        {
+          "ordinal": 1815,
+          "head": " （在关键地方加上少许字句使文章更贴切， 更生动） add a word or two to clinch the point; a crucial touch which drives home a point otherwise difficult to explain; put in the eye pupil in painting a dragon -- the critical touch; put life into ...， like dotting the eyeball in painting a dragon; put the finishing touches on [to] one's work; round off [out] a picture:",
+          "trimmed_length": 341
+        },
+        {
+          "ordinal": 2665,
+          "head": " （指五种罪恶） “five evils” (bribery, tax evasion, theft of state property, cheating on government contracts and stealing of economic information); “five poisons” (a campaign was launched in 1952 against capitalist bribery of government employees, tax evasion, theft of state property, cheating on government contracts and stealing economic information for speculation)",
+          "trimmed_length": 362
+        },
+        {
+          "ordinal": 155866,
+          "head": "厂长负责制 system of overall responsibility by factory manager; system of overall leadership by the factory director; system of factory director's responsibility; system in which factory assumes full responsibility; Factory director takes responsibility for production.; the responsibility system of factory directors;",
+          "trimmed_length": 313
+        },
+        {
+          "ordinal": 204848,
+          "head": "家庭联产承包责任制 {农} system of contracted responsibilities on the household basis with remuneration linked to output; contracted responsibility system based on the household, with remuneration linked to output; system of contracted household responsibility related to output; household contract responisbility system;",
+          "trimmed_length": 310
+        },
+        {
+          "ordinal": 322190,
+          "head": "独立核算、国家征税、自负盈亏 conduct business accounting independently, paying taxes to the state and assuming sole responsibility for profits and losses; conduct independent business accounting, pay taxes instead of turning over their profits to the state, and assume full responsibility for their profits and losses;",
+          "trimmed_length": 304
+        },
+        {
+          "ordinal": 417335,
+          "head": "辅助设备 accessory equipment; accessories; additional equipment; adjustage; aid; auxiliary apparatus; auxiliary device; auxiliary equipment; auxiliary facility; auxiliary installation; auxiliary means; auxiliaries; maintenance facility; service equipment; slaving;",
+          "trimmed_length": 260
+        }
+      ],
+      "comparison": {
+        "public": 417710,
+        "public_original_reachable": 417700,
+        "public_merged_reachable": 417700,
+        "helpers": 47005,
+        "helpers_reachable": 47005
+      },
+      "reachability_differences": []
+    },
+    "zh-ja": {
+      "file": "34b4019e0c2f8f7cf481cb3f267aff8d",
+      "sha256": "5f8bc757b5447d91527bd5a808821c525e4b52455a36b5a0dce80e64b7cf7769",
+      "leaf_blocks": 1861,
+      "chains": 3457606,
+      "physical_records": 2526348,
+      "reachable_records": 2526345,
+      "unreachable": [
+        {
+          "ordinal": 2526090,
+          "head": "－in",
+          "trimmed_length": 3
+        },
+        {
+          "ordinal": 2526125,
+          "head": "－い",
+          "trimmed_length": 2
+        },
+        {
+          "ordinal": 2526184,
+          "head": "－し",
+          "trimmed_length": 2
+        }
+      ],
+      "comparison": {
+        "public": 2378182,
+        "public_original_reachable": 2378177,
+        "public_merged_reachable": 2378179,
+        "helpers": 148166,
+        "helpers_reachable": 148166
+      },
+      "reachability_differences": [
+        {
+          "key": "－in",
+          "members": [
+            [
+              "sanseido",
+              520436
+            ]
+          ],
+          "original_reachable": true,
+          "merged_reachable": false
+        },
+        {
+          "key": "－じょう",
+          "members": [
+            [
+              "sanseido",
+              520549
+            ],
+            [
+              "sanseido",
+              520550
+            ],
+            [
+              "sanseido",
+              520551
+            ],
+            [
+              "sanseido",
+              520552
+            ]
+          ],
+          "original_reachable": false,
+          "merged_reachable": true
+        },
+        {
+          "key": "－せい",
+          "members": [
+            [
+              "sanseido",
+              520562
+            ],
+            [
+              "sanseido",
+              520563
+            ]
+          ],
+          "original_reachable": false,
+          "merged_reachable": true
+        },
+        {
+          "key": "－とう",
+          "members": [
+            [
+              "sanseido",
+              520601
+            ]
+          ],
+          "original_reachable": false,
+          "merged_reachable": true
+        }
+      ]
+    }
+  },
+  "upstream": {
+    "index": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/btreeidx.cc#L937-L1109",
+    "record_address": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/chunkedstorage.cc#L30-L48",
+    "record_shape": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/mdictparser.hh#L101-L109"
+  },
+  "scope": "比较某物理原序是否在以自身原词头检索的真实 B-tree 桶；空白按 Qt 去首尾。全部声明可达的原序还逐一核对保存的词头 SHA256。"
+}

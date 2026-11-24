@@ -1,0 +1,3341 @@
+{
+  "fixed_commit": "bd959482644d7cfa57743a5143d2a5d0462e382d",
+  "qt": "4.8.6.0",
+  "physical_comparison": {
+    "hanying": {
+      "classes": {
+        "same_nonempty": {
+          "references": 231792,
+          "target_sets": 30865
+        }
+      },
+      "examples": {},
+      "source_keys_over_256": 10,
+      "different_target_sets": [],
+      "goldendict_executable_generated_index": {
+        "file": "115555ddb467851b81161104bbd371ed",
+        "sha256": "3a1a9747b5b9aed43862d6591d1fd194ccb73b446b2ff3c3133b101a6c720d2b",
+        "leaf_blocks": 881,
+        "chains": 774235,
+        "references_same_order": 231792,
+        "mismatches": []
+      }
+    },
+    "oxford": {
+      "classes": {
+        "same_empty": {
+          "references": 4330,
+          "target_sets": 2547
+        },
+        "same_nonempty": {
+          "references": 35493,
+          "target_sets": 16058
+        },
+        "published_omits_candidates": {
+          "references": 214,
+          "target_sets": 82
+        }
+      },
+      "examples": {
+        "published_omits_candidates": [
+          {
+            "raw_target": "A",
+            "ledger_target": "A",
+            "from": [
+              2461,
+              "B"
+            ],
+            "published": [
+              1
+            ],
+            "source_key_matches": [
+              1,
+              3
+            ],
+            "physical_heads": [
+              [
+                1,
+                "A"
+              ],
+              [
+                3,
+                "a"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "AD",
+            "ledger_target": "AD",
+            "from": [
+              744,
+              "AH"
+            ],
+            "published": [
+              373
+            ],
+            "source_key_matches": [
+              372,
+              373
+            ],
+            "physical_heads": [
+              [
+                372,
+                "ad"
+              ],
+              [
+                373,
+                "AD"
+              ]
+            ],
+            "references": 5
+          },
+          {
+            "raw_target": "AH",
+            "ledger_target": "AH",
+            "from": [
+              373,
+              "AD"
+            ],
+            "published": [
+              744
+            ],
+            "source_key_matches": [
+              743,
+              744
+            ],
+            "physical_heads": [
+              [
+                743,
+                "ah"
+              ],
+              [
+                744,
+                "AH"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "AM",
+            "ledger_target": "AM",
+            "from": [
+              34057,
+              "simulcast"
+            ],
+            "published": [
+              1119
+            ],
+            "source_key_matches": [
+              1119,
+              1120
+            ],
+            "physical_heads": [
+              [
+                1119,
+                "AM"
+              ],
+              [
+                1120,
+                "am"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "BEd",
+            "ledger_target": "BEd",
+            "from": [
+              2502,
+              "bachelor"
+            ],
+            "published": [
+              3165
+            ],
+            "source_key_matches": [
+              3164,
+              3165
+            ],
+            "physical_heads": [
+              [
+                3164,
+                "bed"
+              ],
+              [
+                3165,
+                "BEd"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "Bob",
+            "ledger_target": "Bob",
+            "from": [
+              39437,
+              "uncle"
+            ],
+            "published": [
+              4069
+            ],
+            "source_key_matches": [
+              4068,
+              4069
+            ],
+            "physical_heads": [
+              [
+                4068,
+                "bob"
+              ],
+              [
+                4069,
+                "Bob"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "CALL",
+            "ledger_target": "CALL",
+            "from": [
+              5253,
+              "CAL"
+            ],
+            "published": [
+              5290
+            ],
+            "source_key_matches": [
+              5289,
+              5290
+            ],
+            "physical_heads": [
+              [
+                5289,
+                "call"
+              ],
+              [
+                5290,
+                "CALL"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "Cavalier",
+            "ledger_target": "Cavalier",
+            "from": [
+              31832,
+              "Roundhead"
+            ],
+            "published": [
+              5863
+            ],
+            "source_key_matches": [
+              5863,
+              5864
+            ],
+            "physical_heads": [
+              [
+                5863,
+                "Cavalier"
+              ],
+              [
+                5864,
+                "cavalier"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "Coke",
+            "ledger_target": "Coke",
+            "from": [
+              7210,
+              "cola"
+            ],
+            "published": [
+              7206
+            ],
+            "source_key_matches": [
+              7205,
+              7206
+            ],
+            "physical_heads": [
+              [
+                7205,
+                "coke"
+              ],
+              [
+                7206,
+                "Coke"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "ETA",
+            "ledger_target": "ETA",
+            "from": [
+              12618,
+              "ETD"
+            ],
+            "published": [
+              12612
+            ],
+            "source_key_matches": [
+              12611,
+              12612
+            ],
+            "physical_heads": [
+              [
+                12611,
+                "eta"
+              ],
+              [
+                12612,
+                "ETA"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "Higher",
+            "ledger_target": "Higher",
+            "from": [
+              32519,
+              "SCE"
+            ],
+            "published": [
+              17493
+            ],
+            "source_key_matches": [
+              17493,
+              17494
+            ],
+            "physical_heads": [
+              [
+                17493,
+                "Higher"
+              ],
+              [
+                17494,
+                "higher"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "Job",
+            "ledger_target": "Job",
+            "from": [
+              26952,
+              "patience"
+            ],
+            "published": [
+              20056
+            ],
+            "source_key_matches": [
+              20055,
+              20056
+            ],
+            "physical_heads": [
+              [
+                20055,
+                "job"
+              ],
+              [
+                20056,
+                "Job"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "MA",
+            "ledger_target": "MA",
+            "from": [
+              22671,
+              "master"
+            ],
+            "published": [
+              22123
+            ],
+            "source_key_matches": [
+              22123,
+              22124
+            ],
+            "physical_heads": [
+              [
+                22123,
+                "MA"
+              ],
+              [
+                22124,
+                "ma"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "ME",
+            "ledger_target": "ME",
+            "from": [
+              6578,
+              "chronic fatigue syndrome"
+            ],
+            "published": [
+              22804
+            ],
+            "source_key_matches": [
+              22803,
+              22804
+            ],
+            "physical_heads": [
+              [
+                22803,
+                "me"
+              ],
+              [
+                22804,
+                "ME"
+              ]
+            ],
+            "references": 3
+          },
+          {
+            "raw_target": "Mass",
+            "ledger_target": "Mass",
+            "from": [
+              7490,
+              "communion"
+            ],
+            "published": [
+              22655
+            ],
+            "source_key_matches": [
+              22654,
+              22655
+            ],
+            "physical_heads": [
+              [
+                22654,
+                "mass"
+              ],
+              [
+                22655,
+                "Mass"
+              ]
+            ],
+            "references": 3
+          },
+          {
+            "raw_target": "Ms",
+            "ledger_target": "Ms",
+            "from": [
+              23567,
+              "miss"
+            ],
+            "published": [
+              24127
+            ],
+            "source_key_matches": [
+              24127,
+              24128
+            ],
+            "physical_heads": [
+              [
+                24127,
+                "Ms"
+              ],
+              [
+                24128,
+                "MS"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "Orient",
+            "ledger_target": "Orient",
+            "from": [
+              25409,
+              "Occident"
+            ],
+            "published": [
+              25952
+            ],
+            "source_key_matches": [
+              25952,
+              25953
+            ],
+            "physical_heads": [
+              [
+                25952,
+                "Orient"
+              ],
+              [
+                25953,
+                "orient"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "PAL",
+            "ledger_target": "PAL",
+            "from": [
+              25192,
+              "NTSC"
+            ],
+            "published": [
+              26504
+            ],
+            "source_key_matches": [
+              26504,
+              26505
+            ],
+            "physical_heads": [
+              [
+                26504,
+                "PAL"
+              ],
+              [
+                26505,
+                "pal"
+              ]
+            ],
+            "references": 2
+          }
+        ]
+      },
+      "source_keys_over_256": 0,
+      "different_target_sets": [
+        [
+          "A",
+          "A",
+          "1",
+          "1,3",
+          2
+        ],
+        [
+          "AD",
+          "AD",
+          "373",
+          "372,373",
+          5
+        ],
+        [
+          "AH",
+          "AH",
+          "744",
+          "743,744",
+          2
+        ],
+        [
+          "AM",
+          "AM",
+          "1119",
+          "1119,1120",
+          1
+        ],
+        [
+          "BEd",
+          "BEd",
+          "3165",
+          "3164,3165",
+          1
+        ],
+        [
+          "Bob",
+          "Bob",
+          "4069",
+          "4068,4069",
+          1
+        ],
+        [
+          "CALL",
+          "CALL",
+          "5290",
+          "5289,5290",
+          1
+        ],
+        [
+          "Cavalier",
+          "Cavalier",
+          "5863",
+          "5863,5864",
+          1
+        ],
+        [
+          "Coke",
+          "Coke",
+          "7206",
+          "7205,7206",
+          1
+        ],
+        [
+          "ETA",
+          "ETA",
+          "12612",
+          "12611,12612",
+          1
+        ],
+        [
+          "Higher",
+          "Higher",
+          "17493",
+          "17493,17494",
+          1
+        ],
+        [
+          "Job",
+          "Job",
+          "20056",
+          "20055,20056",
+          1
+        ],
+        [
+          "MA",
+          "MA",
+          "22123",
+          "22123,22124",
+          1
+        ],
+        [
+          "ME",
+          "ME",
+          "22804",
+          "22803,22804",
+          3
+        ],
+        [
+          "Mass",
+          "Mass",
+          "22655",
+          "22654,22655",
+          3
+        ],
+        [
+          "Ms",
+          "Ms",
+          "24127",
+          "24127,24128",
+          2
+        ],
+        [
+          "Orient",
+          "Orient",
+          "25952",
+          "25952,25953",
+          1
+        ],
+        [
+          "PAL",
+          "PAL",
+          "26504",
+          "26504,26505",
+          2
+        ],
+        [
+          "PIN",
+          "PIN",
+          "27819",
+          "27819,27820",
+          1
+        ],
+        [
+          "PT",
+          "PT",
+          "29553",
+          "29552,29553",
+          2
+        ],
+        [
+          "RAM",
+          "RAM",
+          "30182",
+          "30181,30182",
+          2
+        ],
+        [
+          "RIP",
+          "RIP",
+          "31532",
+          "31532,31533",
+          1
+        ],
+        [
+          "SAT",
+          "SAT",
+          "32357",
+          "32356,32357",
+          1
+        ],
+        [
+          "Scotch",
+          "Scotch",
+          "32649",
+          "32648,32649",
+          2
+        ],
+        [
+          "Sec.",
+          "Sec.",
+          "32878",
+          "32878,32879",
+          1
+        ],
+        [
+          "Sellotape",
+          "Sellotape",
+          "33142",
+          "33141,33142",
+          4
+        ],
+        [
+          "Tarmac",
+          "Tarmac",
+          "37280",
+          "37279,37280",
+          2
+        ],
+        [
+          "VAT",
+          "VAT",
+          "40461",
+          "40461,40462",
+          2
+        ],
+        [
+          "WAN",
+          "WAN",
+          "41029",
+          "41029,41030",
+          2
+        ],
+        [
+          "Xerox",
+          "Xerox",
+          "42237",
+          "42236,42237",
+          1
+        ],
+        [
+          "Yank",
+          "Yank",
+          "42266",
+          "42266,42267",
+          1
+        ],
+        [
+          "a",
+          "a",
+          "3",
+          "1,3",
+          1
+        ],
+        [
+          "act",
+          "act",
+          "325",
+          "324,325",
+          9
+        ],
+        [
+          "ad",
+          "ad",
+          "372",
+          "372,373",
+          7
+        ],
+        [
+          "add",
+          "add",
+          "387",
+          "386,387",
+          3
+        ],
+        [
+          "as",
+          "as",
+          "1952",
+          "1951,1952",
+          6
+        ],
+        [
+          "ash",
+          "ash",
+          "1974",
+          "1973,1974",
+          3
+        ],
+        [
+          "basic",
+          "basic",
+          "2967",
+          "2966,2967",
+          4
+        ],
+        [
+          "bed",
+          "bed",
+          "3164",
+          "3164,3165",
+          4
+        ],
+        [
+          "call",
+          "call",
+          "5289",
+          "5289,5290",
+          21
+        ],
+        [
+          "cam",
+          "cam",
+          "5328",
+          "5327,5328",
+          1
+        ],
+        [
+          "cap",
+          "cap",
+          "5465",
+          "5464,5465",
+          6
+        ],
+        [
+          "chink",
+          "chink",
+          "6442",
+          "6441,6442",
+          2
+        ],
+        [
+          "cod",
+          "cod",
+          "7129",
+          "7129,7130",
+          3
+        ],
+        [
+          "con",
+          "con",
+          "7630",
+          "7630,7631",
+          2
+        ],
+        [
+          "creek",
+          "creek",
+          "8733",
+          "8732,8733",
+          1
+        ],
+        [
+          "crow",
+          "crow",
+          "8908",
+          "8908,8909",
+          8
+        ],
+        [
+          "dip",
+          "dip",
+          "10372",
+          "10371,10372",
+          3
+        ],
+        [
+          "doe",
+          "doe",
+          "10875",
+          "10874,10875",
+          4
+        ],
+        [
+          "doh",
+          "doh",
+          "10912",
+          "10912,10913",
+          1
+        ],
+        [
+          "elf",
+          "elf",
+          "12002",
+          "12002,12003",
+          2
+        ],
+        [
+          "emu",
+          "emu",
+          "12148",
+          "12148,12149",
+          1
+        ],
+        [
+          "equity",
+          "equity",
+          "12488",
+          "12488,12489",
+          1
+        ],
+        [
+          "er",
+          "er",
+          "12495",
+          "12494,12495",
+          1
+        ],
+        [
+          "he",
+          "he",
+          "17111",
+          "17110,17111",
+          1
+        ],
+        [
+          "hoover",
+          "hoover",
+          "17915",
+          "17914,17915",
+          1
+        ],
+        [
+          "id",
+          "id",
+          "18420",
+          "18419,18420,18421",
+          2
+        ],
+        [
+          "italic",
+          "italic",
+          "19826",
+          "19826,19827",
+          1
+        ],
+        [
+          "job",
+          "job",
+          "20055",
+          "20055,20056",
+          13
+        ],
+        [
+          "mac",
+          "mac",
+          "22129",
+          "22128,22129",
+          2
+        ],
+        [
+          "mace",
+          "mace",
+          "22139",
+          "22139,22140",
+          1
+        ],
+        [
+          "march",
+          "march",
+          "22519",
+          "22518,22519",
+          2
+        ],
+        [
+          "mass",
+          "mass",
+          "22654",
+          "22654,22655",
+          1
+        ],
+        [
+          "me",
+          "me",
+          "22803",
+          "22803,22804",
+          2
+        ],
+        [
+          "med",
+          "med",
+          "22858",
+          "22857,22858",
+          1
+        ],
+        [
+          "mercury",
+          "mercury",
+          "23042",
+          "23041,23042",
+          4
+        ],
+        [
+          "methuselah",
+          "methuselah",
+          "23135",
+          "23135,23136",
+          2
+        ],
+        [
+          "mod",
+          "mod",
+          "23669",
+          "23669,23670",
+          1
+        ],
+        [
+          "mud",
+          "mud",
+          "24145",
+          "24144,24145",
+          1
+        ],
+        [
+          "nod",
+          "nod",
+          "24932",
+          "24931,24932",
+          2
+        ],
+        [
+          "orient",
+          "orient",
+          "25953",
+          "25952,25953",
+          2
+        ],
+        [
+          "oriental",
+          "oriental",
+          "25954",
+          "25954,25955",
+          1
+        ],
+        [
+          "pal",
+          "pal",
+          "26505",
+          "26504,26505",
+          1
+        ],
+        [
+          "pet",
+          "pet",
+          "27479",
+          "27479,27480",
+          3
+        ],
+        [
+          "pin",
+          "pin",
+          "27820",
+          "27819,27820",
+          2
+        ],
+        [
+          "punch",
+          "punch",
+          "29671",
+          "29671,29672",
+          3
+        ],
+        [
+          "ram",
+          "ram",
+          "30181",
+          "30181,30182",
+          3
+        ],
+        [
+          "rip",
+          "rip",
+          "31533",
+          "31532,31533",
+          4
+        ],
+        [
+          "sin",
+          "sin",
+          "34061",
+          "34060,34061",
+          9
+        ],
+        [
+          "sob",
+          "sob",
+          "34711",
+          "34710,34711",
+          1
+        ],
+        [
+          "wasp",
+          "wasp",
+          "41143",
+          "41143,41144",
+          1
+        ],
+        [
+          "welsh",
+          "welsh",
+          "41457",
+          "41457,41458",
+          1
+        ]
+      ],
+      "goldendict_executable_generated_index": {
+        "file": "136706fae1d37f14605ad17b327dee9f",
+        "sha256": "bc60196b5b69bc2dec5f6e221397bf6f55002423efe2c77f7d9cc582bbd167ce",
+        "leaf_blocks": 211,
+        "chains": 43958,
+        "references_same_order": 40037,
+        "mismatches": []
+      },
+      "original_pages_for_client_check": [
+        {
+          "source_ordinal": 7371,
+          "source_search_key": "come",
+          "original_href_excerpt": "<a href=\"entry://how come?\">how c",
+          "target": "how come?",
+          "goldendict_physical_ids": [],
+          "classification": "URL 尾问号可能构成空查询"
+        }
+      ],
+      "url_query_interpretation": {
+        "how come": [],
+        "how come?": []
+      }
+    },
+    "sanseido": {
+      "classes": {
+        "same_empty": {
+          "references": 504243,
+          "target_sets": 195984
+        },
+        "published_omits_candidates": {
+          "references": 276,
+          "target_sets": 106
+        },
+        "same_nonempty": {
+          "references": 33798,
+          "target_sets": 14859
+        }
+      },
+      "examples": {
+        "published_omits_candidates": [
+          {
+            "raw_target": "A",
+            "ledger_target": "A",
+            "from": [
+              4809,
+              "A型"
+            ],
+            "published": [
+              11,
+              12,
+              16
+            ],
+            "source_key_matches": [
+              9,
+              10,
+              11,
+              12,
+              13,
+              15,
+              16
+            ],
+            "physical_heads": [
+              [
+                9,
+                "a"
+              ],
+              [
+                10,
+                "a"
+              ],
+              [
+                11,
+                "A"
+              ],
+              [
+                12,
+                "A"
+              ],
+              [
+                13,
+                "a"
+              ],
+              [
+                15,
+                "a"
+              ],
+              [
+                16,
+                "A"
+              ]
+            ],
+            "references": 3
+          },
+          {
+            "raw_target": "ABC",
+            "ledger_target": "ABC",
+            "from": [
+              32749,
+              "IFABC"
+            ],
+            "published": [
+              77,
+              78,
+              79,
+              80,
+              81,
+              82
+            ],
+            "source_key_matches": [
+              77,
+              78,
+              79,
+              80,
+              81,
+              82,
+              83265
+            ],
+            "physical_heads": [
+              [
+                77,
+                "ABC"
+              ],
+              [
+                78,
+                "ABC"
+              ],
+              [
+                79,
+                "ABC"
+              ],
+              [
+                80,
+                "ABC"
+              ],
+              [
+                81,
+                "ABC"
+              ],
+              [
+                82,
+                "ABC"
+              ],
+              [
+                83265,
+                "　ABC　"
+              ]
+            ],
+            "references": 4
+          },
+          {
+            "raw_target": "AC",
+            "ledger_target": "AC",
+            "from": [
+              16772,
+              "DC"
+            ],
+            "published": [
+              291,
+              294,
+              296
+            ],
+            "source_key_matches": [
+              291,
+              292,
+              294,
+              296,
+              83274
+            ],
+            "physical_heads": [
+              [
+                291,
+                "AC"
+              ],
+              [
+                292,
+                "Ac"
+              ],
+              [
+                294,
+                "AC"
+              ],
+              [
+                296,
+                "AC"
+              ],
+              [
+                83274,
+                "　AC　"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "ADR",
+            "ledger_target": "ADR",
+            "from": [
+              83405,
+              "　EDR　"
+            ],
+            "published": [
+              855
+            ],
+            "source_key_matches": [
+              855,
+              83276
+            ],
+            "physical_heads": [
+              [
+                855,
+                "ADR"
+              ],
+              [
+                83276,
+                "　ADR　"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "AD　変換器",
+            "ledger_target": "AD　変換器",
+            "from": [
+              83378,
+              "　DA　変換器"
+            ],
+            "published": [],
+            "source_key_matches": [
+              83278
+            ],
+            "physical_heads": [
+              [
+                83278,
+                "　AD　変換器"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "AID",
+            "ledger_target": "AID",
+            "from": [
+              1358,
+              "AIH"
+            ],
+            "published": [
+              1338,
+              1339
+            ],
+            "source_key_matches": [
+              1338,
+              1339,
+              1340,
+              1341,
+              1342
+            ],
+            "physical_heads": [
+              [
+                1338,
+                "AID"
+              ],
+              [
+                1339,
+                "AID"
+              ],
+              [
+                1340,
+                "aid"
+              ],
+              [
+                1341,
+                "aid"
+              ],
+              [
+                1342,
+                "aid"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "AM　放送",
+            "ledger_target": "AM　放送",
+            "from": [
+              83439,
+              "　FM　放送"
+            ],
+            "published": [],
+            "source_key_matches": [
+              83289
+            ],
+            "physical_heads": [
+              [
+                83289,
+                "　AM　放送"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "ATM",
+            "ledger_target": "ATM",
+            "from": [
+              647,
+              "AD"
+            ],
+            "published": [
+              4215,
+              4217,
+              4218
+            ],
+            "source_key_matches": [
+              4215,
+              4216,
+              4217,
+              4218,
+              83295
+            ],
+            "physical_heads": [
+              [
+                4215,
+                "ATM"
+              ],
+              [
+                4216,
+                "atm"
+              ],
+              [
+                4217,
+                "ATM"
+              ],
+              [
+                4218,
+                "ATM"
+              ],
+              [
+                83295,
+                "　ATM　"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "A　判",
+            "ledger_target": "A　判",
+            "from": [
+              83261,
+              "　A4　判"
+            ],
+            "published": [],
+            "source_key_matches": [
+              83303
+            ],
+            "physical_heads": [
+              [
+                83303,
+                "　A　判"
+              ]
+            ],
+            "references": 10
+          },
+          {
+            "raw_target": "A　電源",
+            "ledger_target": "A　電源",
+            "from": [
+              83333,
+              "　B　電源"
+            ],
+            "published": [],
+            "source_key_matches": [
+              83306
+            ],
+            "physical_heads": [
+              [
+                83306,
+                "　A　電源"
+              ]
+            ],
+            "references": 4
+          },
+          {
+            "raw_target": "B",
+            "ledger_target": "B",
+            "from": [
+              9219,
+              "B型"
+            ],
+            "published": [
+              4819,
+              4822,
+              4823
+            ],
+            "source_key_matches": [
+              4819,
+              4820,
+              4821,
+              4822,
+              4823
+            ],
+            "physical_heads": [
+              [
+                4819,
+                "B"
+              ],
+              [
+                4820,
+                "b"
+              ],
+              [
+                4821,
+                "b"
+              ],
+              [
+                4822,
+                "B"
+              ],
+              [
+                4823,
+                "B"
+              ]
+            ],
+            "references": 8
+          },
+          {
+            "raw_target": "B　判",
+            "ledger_target": "B　判",
+            "from": [
+              83303,
+              "　A　判"
+            ],
+            "published": [],
+            "source_key_matches": [
+              83329
+            ],
+            "physical_heads": [
+              [
+                83329,
+                "　B　判"
+              ]
+            ],
+            "references": 8
+          },
+          {
+            "raw_target": "B　細胞",
+            "ledger_target": "B　細胞",
+            "from": [
+              83770,
+              "　T　細胞"
+            ],
+            "published": [],
+            "source_key_matches": [
+              83332
+            ],
+            "physical_heads": [
+              [
+                83332,
+                "　B　細胞"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "B　電源",
+            "ledger_target": "B　電源",
+            "from": [
+              83306,
+              "　A　電源"
+            ],
+            "published": [],
+            "source_key_matches": [
+              83333
+            ],
+            "physical_heads": [
+              [
+                83333,
+                "　B　電源"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "CAI　",
+            "ledger_target": "CAI　",
+            "from": [
+              14912,
+              "courseware"
+            ],
+            "published": [
+              9366,
+              9367,
+              9368
+            ],
+            "source_key_matches": [
+              9366,
+              9367,
+              9368,
+              83334
+            ],
+            "physical_heads": [
+              [
+                9366,
+                "CAI"
+              ],
+              [
+                9367,
+                "CAI"
+              ],
+              [
+                9368,
+                "CAI"
+              ],
+              [
+                83334,
+                "　CAI　"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "CD",
+            "ledger_target": "CD",
+            "from": [
+              647,
+              "AD"
+            ],
+            "published": [
+              10533,
+              10535,
+              10536,
+              10537,
+              10538,
+              10540
+            ],
+            "source_key_matches": [
+              10533,
+              10534,
+              10535,
+              10536,
+              10537,
+              10538,
+              10539,
+              10540,
+              10541,
+              83345
+            ],
+            "physical_heads": [
+              [
+                10533,
+                "CD"
+              ],
+              [
+                10534,
+                "Cd"
+              ],
+              [
+                10535,
+                "CD"
+              ],
+              [
+                10536,
+                "CD"
+              ],
+              [
+                10537,
+                "CD"
+              ],
+              [
+                10538,
+                "CD"
+              ],
+              [
+                10539,
+                "Cd"
+              ],
+              [
+                10540,
+                "CD"
+              ],
+              [
+                10541,
+                "cd"
+              ],
+              [
+                83345,
+                "　CD　"
+              ]
+            ],
+            "references": 4
+          },
+          {
+            "raw_target": "CGS　単位系",
+            "ledger_target": "CGS　単位系",
+            "from": [
+              83589,
+              "　MKS　単位系"
+            ],
+            "published": [],
+            "source_key_matches": [
+              83347
+            ],
+            "physical_heads": [
+              [
+                83347,
+                "　CGS　単位系"
+              ]
+            ],
+            "references": 2
+          },
+          {
+            "raw_target": "CIF",
+            "ledger_target": "CIF",
+            "from": [
+              9607,
+              "C.&amp;F.，　C&amp;F"
+            ],
+            "published": [
+              11885,
+              11886,
+              11887
+            ],
+            "source_key_matches": [
+              11885,
+              11886,
+              11887,
+              83352
+            ],
+            "physical_heads": [
+              [
+                11885,
+                "CIF"
+              ],
+              [
+                11886,
+                "CIF"
+              ],
+              [
+                11887,
+                "CIF"
+              ],
+              [
+                83352,
+                "　CIF　"
+              ]
+            ],
+            "references": 2
+          }
+        ]
+      },
+      "source_keys_over_256": 0,
+      "different_target_sets": [
+        [
+          "A",
+          "A",
+          "11,12,16",
+          "9,10,11,12,13,15,16",
+          3
+        ],
+        [
+          "ABC",
+          "ABC",
+          "77,78,79,80,81,82",
+          "77,78,79,80,81,82,83265",
+          4
+        ],
+        [
+          "AC",
+          "AC",
+          "291,294,296",
+          "291,292,294,296,83274",
+          2
+        ],
+        [
+          "ADR",
+          "ADR",
+          "855",
+          "855,83276",
+          2
+        ],
+        [
+          "AD　変換器",
+          "AD　変換器",
+          "",
+          "83278",
+          2
+        ],
+        [
+          "AID",
+          "AID",
+          "1338,1339",
+          "1338,1339,1340,1341,1342",
+          2
+        ],
+        [
+          "AM　放送",
+          "AM　放送",
+          "",
+          "83289",
+          2
+        ],
+        [
+          "ATM",
+          "ATM",
+          "4215,4217,4218",
+          "4215,4216,4217,4218,83295",
+          2
+        ],
+        [
+          "A　判",
+          "A　判",
+          "",
+          "83303",
+          10
+        ],
+        [
+          "A　電源",
+          "A　電源",
+          "",
+          "83306",
+          4
+        ],
+        [
+          "B",
+          "B",
+          "4819,4822,4823",
+          "4819,4820,4821,4822,4823",
+          8
+        ],
+        [
+          "B　判",
+          "B　判",
+          "",
+          "83329",
+          8
+        ],
+        [
+          "B　細胞",
+          "B　細胞",
+          "",
+          "83332",
+          2
+        ],
+        [
+          "B　電源",
+          "B　電源",
+          "",
+          "83333",
+          2
+        ],
+        [
+          "CAI　",
+          "CAI　",
+          "9366,9367,9368",
+          "9366,9367,9368,83334",
+          2
+        ],
+        [
+          "CD",
+          "CD",
+          "10533,10535,10536,10537,10538,10540",
+          "10533,10534,10535,10536,10537,10538,10539,10540,10541,83345",
+          4
+        ],
+        [
+          "CGS　単位系",
+          "CGS　単位系",
+          "",
+          "83347",
+          2
+        ],
+        [
+          "CIF",
+          "CIF",
+          "11885,11886,11887",
+          "11885,11886,11887,83352",
+          2
+        ],
+        [
+          "COD　",
+          "COD　",
+          "12712,12713,12714",
+          "12712,12713,12714,83358",
+          2
+        ],
+        [
+          "CPU",
+          "CPU",
+          "15050",
+          "15050,83360",
+          2
+        ],
+        [
+          "CT　",
+          "CT　",
+          "15612",
+          "15612,83368",
+          2
+        ],
+        [
+          "CU",
+          "CU",
+          "15626,15627,15631",
+          "15626,15627,15628,15630,15631",
+          2
+        ],
+        [
+          "C　型肝炎",
+          "C　型肝炎",
+          "",
+          "83373",
+          2
+        ],
+        [
+          "DA　変換器",
+          "DA　変換器",
+          "",
+          "83378",
+          2
+        ],
+        [
+          "DC",
+          "DC",
+          "16772,16773,16774,16775,16776,16777,16778",
+          "16772,16773,16774,16775,16776,16777,16778,83381",
+          4
+        ],
+        [
+          "DTP",
+          "DTP",
+          "19824",
+          "19824,83399",
+          2
+        ],
+        [
+          "E",
+          "E",
+          "20373,20374",
+          "20373,20374,20375",
+          1
+        ],
+        [
+          "ECSC",
+          "ECSC",
+          "20598",
+          "20598,83402",
+          2
+        ],
+        [
+          "EDR",
+          "EDR",
+          "20683",
+          "20683,83405",
+          2
+        ],
+        [
+          "EDTV",
+          "EDTV",
+          "20686",
+          "20686,83406",
+          2
+        ],
+        [
+          "EMS",
+          "EMS",
+          "21386,21387,21388",
+          "21386,21387,21388,83412",
+          2
+        ],
+        [
+          "ESP",
+          "ESP",
+          "22184,22185,22187",
+          "22184,22185,22187,83420",
+          2
+        ],
+        [
+          "ESP　",
+          "ESP　",
+          "22184,22185,22187",
+          "22184,22185,22187,83420",
+          2
+        ],
+        [
+          "ETA",
+          "ETA",
+          "22275,22277",
+          "22275,22276,22277",
+          2
+        ],
+        [
+          "F",
+          "F",
+          "23251,23252,23253",
+          "23248,23249,23250,23251,23252,23253",
+          5
+        ],
+        [
+          "FAO　",
+          "FAO　",
+          "23524",
+          "23524,83426",
+          2
+        ],
+        [
+          "FAS",
+          "FAS",
+          "23576,23577,23578",
+          "23576,23577,23578,83428",
+          2
+        ],
+        [
+          "FAS　",
+          "FAS　",
+          "23576,23577,23578",
+          "23576,23577,23578,83428",
+          2
+        ],
+        [
+          "FM　放送",
+          "FM　放送",
+          "",
+          "83439",
+          2
+        ],
+        [
+          "FOB",
+          "FOB",
+          "24988,24989",
+          "24988,24989,83440",
+          6
+        ],
+        [
+          "FRP",
+          "FRP",
+          "26051",
+          "26051,83443",
+          6
+        ],
+        [
+          "H",
+          "H",
+          "29395,29396,29397",
+          "29395,29396,29397,29398,29399",
+          6
+        ],
+        [
+          "HB",
+          "HB",
+          "30101,30102,30103,30104,30105",
+          "30101,30102,30103,30104,30105,83464",
+          3
+        ],
+        [
+          "HDTV",
+          "HDTV",
+          "30122",
+          "30122,83467",
+          2
+        ],
+        [
+          "ICU",
+          "ICU",
+          "32642,32643",
+          "32642,32643,83483",
+          2
+        ],
+        [
+          "IMF",
+          "IMF",
+          "32973,32974,32975",
+          "32973,32974,32975,83498",
+          2
+        ],
+        [
+          "IPA",
+          "IPA",
+          "35238,35239,35240,35241",
+          "35238,35239,35240,35241,83506",
+          2
+        ],
+        [
+          "IQ　制",
+          "IQ　制",
+          "",
+          "83512",
+          2
+        ],
+        [
+          "ISDN",
+          "ISDN",
+          "35494",
+          "35494,83517",
+          2
+        ],
+        [
+          "ISF",
+          "ISF",
+          "35495",
+          "35495,83518",
+          2
+        ],
+        [
+          "IT",
+          "IT",
+          "35615,35617,35618",
+          "35613,35614,35615,35616,35617,35618",
+          2
+        ],
+        [
+          "L",
+          "L",
+          "38084,38087",
+          "38084,38086,38087",
+          3
+        ],
+        [
+          "L.",
+          "L.",
+          "38083",
+          "38083,38085",
+          1
+        ],
+        [
+          "LBO",
+          "LBO",
+          "38686",
+          "38686,83561",
+          2
+        ],
+        [
+          "LL",
+          "LL",
+          "39748,39749",
+          "39748,39749,83569",
+          3
+        ],
+        [
+          "LSI",
+          "LSI",
+          "40295,40296",
+          "40295,40296,83576",
+          2
+        ],
+        [
+          "L　判",
+          "L　判",
+          "",
+          "83579",
+          6
+        ],
+        [
+          "M",
+          "M",
+          "40879,40880",
+          "40877,40878,40879,40880",
+          4
+        ],
+        [
+          "MARC",
+          "MARC",
+          "41559,41561",
+          "41559,41560,41561",
+          2
+        ],
+        [
+          "MKS　単位系",
+          "MKS　単位系",
+          "",
+          "83589",
+          2
+        ],
+        [
+          "MK　鋼",
+          "MK　鋼",
+          "",
+          "83590",
+          2
+        ],
+        [
+          "MMA",
+          "MMA",
+          "43652,43653",
+          "43652,43653,83591",
+          2
+        ],
+        [
+          "MMF",
+          "MMF",
+          "43657,43658",
+          "43657,43658,83593",
+          2
+        ],
+        [
+          "MPEG",
+          "MPEG",
+          "44470",
+          "44470,83596",
+          2
+        ],
+        [
+          "M　判",
+          "M　判",
+          "",
+          "83609",
+          6
+        ],
+        [
+          "M　字型労働",
+          "M　字型労働",
+          "",
+          "83610",
+          2
+        ],
+        [
+          "N",
+          "N",
+          "45284,45286,45287",
+          "45284,45285,45286,45287,45288",
+          1
+        ],
+        [
+          "NG",
+          "NG",
+          "46152,46154,46155,46156",
+          "46152,46154,46155,46156,83620",
+          2
+        ],
+        [
+          "NGO",
+          "NGO",
+          "46160,46161,46162",
+          "46160,46161,46162,83619",
+          2
+        ],
+        [
+          "NGO　",
+          "NGO　",
+          "46160,46161,46162",
+          "46160,46161,46162,83619",
+          2
+        ],
+        [
+          "NOC",
+          "NOC",
+          "46498",
+          "46498,83625",
+          2
+        ],
+        [
+          "OL",
+          "OL",
+          "47841,47842,47843",
+          "47841,47842,47843,83650",
+          2
+        ],
+        [
+          "OPP",
+          "OPP",
+          "48199",
+          "48199,83652",
+          2
+        ],
+        [
+          "PHS",
+          "PHS",
+          "51473,51474",
+          "51473,51474,83666",
+          2
+        ],
+        [
+          "PKO　",
+          "PKO　",
+          "52032",
+          "52032,83669",
+          2
+        ],
+        [
+          "POW",
+          "POW",
+          "53269,53271",
+          "53269,53270,53271",
+          2
+        ],
+        [
+          "PPM",
+          "PPM",
+          "53322,53325",
+          "53321,53322,53323,53324,53325",
+          2
+        ],
+        [
+          "PP　反応",
+          "PP　反応",
+          "",
+          "83679",
+          2
+        ],
+        [
+          "PS",
+          "PS",
+          "54644,54645",
+          "54644,54645,83682",
+          2
+        ],
+        [
+          "P　波",
+          "P　波",
+          "",
+          "83691",
+          2
+        ],
+        [
+          "Q",
+          "Q",
+          "55607,55609",
+          "55607,55608,55609",
+          1
+        ],
+        [
+          "R",
+          "R",
+          "56001,56002,56004",
+          "56001,56002,56003,56004",
+          2
+        ],
+        [
+          "R.",
+          "R.",
+          "55999,56005",
+          "55999,56000,56005",
+          2
+        ],
+        [
+          "RA",
+          "RA",
+          "56011,56012,56013",
+          "56007,56008,56009,56010,56011,56012,56013",
+          4
+        ],
+        [
+          "RAM",
+          "RAM",
+          "56272,56273,56275",
+          "56272,56273,56274,56275,56276,56277",
+          2
+        ],
+        [
+          "RGB　信号",
+          "RGB　信号",
+          "",
+          "83701",
+          2
+        ],
+        [
+          "Rh　因子",
+          "Rh　因子",
+          "",
+          "83702",
+          2
+        ],
+        [
+          "S",
+          "S",
+          "59784,59785",
+          "59782,59783,59784,59785",
+          4
+        ],
+        [
+          "SN　比",
+          "SN　比",
+          "",
+          "83724",
+          2
+        ],
+        [
+          "Sv",
+          "Sv",
+          "67814",
+          "67812,67813,67814",
+          2
+        ],
+        [
+          "S　波",
+          "S　波",
+          "",
+          "83740",
+          4
+        ],
+        [
+          "TB",
+          "TB",
+          "69168,69170,69171",
+          "69166,69167,69168,69169,69170,69171,83744,83745",
+          2
+        ],
+        [
+          "TCA　回路",
+          "TCA　回路",
+          "",
+          "83746",
+          4
+        ],
+        [
+          "T　細胞",
+          "T　細胞",
+          "",
+          "83770",
+          2
+        ],
+        [
+          "V",
+          "V",
+          "74443,74446,74447",
+          "74443,74445,74446,74447",
+          2
+        ],
+        [
+          "VHS",
+          "VHS",
+          "75047",
+          "75047,83794",
+          2
+        ],
+        [
+          "W",
+          "W",
+          "75778,75781,75782,75783",
+          "75778,75779,75780,75781,75782,75783",
+          6
+        ],
+        [
+          "X　染色体",
+          "X　染色体",
+          "",
+          "83816",
+          2
+        ],
+        [
+          "X　脚",
+          "X　脚",
+          "",
+          "83824",
+          2
+        ],
+        [
+          "Y　染色体",
+          "Y　染色体",
+          "",
+          "83829",
+          2
+        ],
+        [
+          "k",
+          "k",
+          "37107,37109",
+          "37104,37105,37107,37108,37109",
+          1
+        ],
+        [
+          "n　形半導体",
+          "n　形半導体",
+          "",
+          "83633",
+          2
+        ],
+        [
+          "p　形半導体",
+          "p　形半導体",
+          "",
+          "83690",
+          2
+        ],
+        [
+          "　BOD",
+          "　BOD",
+          "7361,7362",
+          "7361,7362,83320",
+          2
+        ],
+        [
+          "　FOB",
+          "　FOB",
+          "24988,24989",
+          "24988,24989,83440",
+          2
+        ],
+        [
+          "　IMF",
+          "　IMF",
+          "32973,32974,32975",
+          "32973,32974,32975,83498",
+          2
+        ]
+      ],
+      "goldendict_executable_generated_index": {
+        "file": "2759d91dea6039e97f0287171c857897",
+        "sha256": "d68de16bc123d314a96ad763f7c4563457fc0f2bb72f407bc80d297f6211ec48",
+        "leaf_blocks": 670,
+        "chains": 446716,
+        "references_same_order": 538317,
+        "mismatches": []
+      },
+      "original_pages_for_client_check": [
+        {
+          "source_ordinal": 23,
+          "source_search_key": "AAA",
+          "original_href_excerpt": "<a href=\"entry://AALA\">AALA<",
+          "target": "AALA",
+          "goldendict_physical_ids": [
+            33,
+            34
+          ],
+          "classification": "原始物理精确词头"
+        },
+        {
+          "source_ordinal": 16772,
+          "source_search_key": "DC",
+          "original_href_excerpt": "<a href=\"entry://AC\">AC</a",
+          "target": "AC",
+          "goldendict_physical_ids": [
+            291,
+            292,
+            294,
+            296,
+            83274
+          ],
+          "classification": "原始大小写及首尾空白等价"
+        },
+        {
+          "source_ordinal": 22025,
+          "source_search_key": "ERM",
+          "original_href_excerpt": "<a href=\"entry://イーアールエム\">イーアール",
+          "target": "イーアールエム",
+          "goldendict_physical_ids": [],
+          "classification": "带标点的另一个物理键"
+        },
+        {
+          "source_ordinal": 314755,
+          "source_search_key": "スーク",
+          "original_href_excerpt": "<a href=\"entry://バザール<font color=\"#00800",
+          "target": "バザール<font color=",
+          "goldendict_physical_ids": [],
+          "classification": "畸形的原 href"
+        },
+        {
+          "source_ordinal": 333118,
+          "source_search_key": "レンズ",
+          "original_href_excerpt": "<a href=\"entry://電子レンズ\">電子レンズ",
+          "target": "電子レンズ",
+          "goldendict_physical_ids": [],
+          "classification": "正文展示头与物理词头不同"
+        },
+        {
+          "source_ordinal": 215181,
+          "source_search_key": "ちゃ",
+          "original_href_excerpt": "<a href=\"entry://お茶\">お茶</a",
+          "target": "お茶",
+          "goldendict_physical_ids": [],
+          "classification": "应用解析后的源展示头"
+        },
+        {
+          "source_ordinal": 104823,
+          "source_search_key": "え・い",
+          "original_href_excerpt": "<a href=\"entry://えし\">えし</a",
+          "target": "えし",
+          "goldendict_physical_ids": [],
+          "classification": "应用读音索引"
+        },
+        {
+          "source_ordinal": 83491,
+          "source_search_key": "　<i>l</i>　体・　L　体",
+          "original_href_excerpt": "<a href=\"entry://<i>d</i>　体\"><i>d<",
+          "target": "<i>d</i>　体",
+          "goldendict_physical_ids": [],
+          "classification": "原 href 包含 HTML"
+        },
+        {
+          "source_ordinal": 334090,
+          "source_search_key": " ・ 点菩提",
+          "original_href_excerpt": "<a href=\"entry://ささぼさつ\">ささぼさつ</a></font>\r\n",
+          "target": "ささぼさつ",
+          "goldendict_physical_ids": [],
+          "classification": "真实 Qt 原索引在反混淆筛选时保留标点，用户链接本身无直接命中。",
+          "native_btree_exact": {
+            "coarse_bucket_entries": 1,
+            "exact_ordered_results": []
+          },
+          "nearby_distinct_original": {
+            "key": "ささ－ぼさつ",
+            "native_btree_exact": {
+              "coarse_bucket_entries": 1,
+              "exact_ordered_results": [
+                [
+                  162537,
+                  "ささ－ぼさつ"
+                ]
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "shinseiki": {
+      "classes": {
+        "same_nonempty": {
+          "references": 249172,
+          "target_sets": 133183
+        },
+        "published_omits_candidates": {
+          "references": 17,
+          "target_sets": 17
+        },
+        "published_adds_candidates": {
+          "references": 1,
+          "target_sets": 1
+        }
+      },
+      "examples": {
+        "published_omits_candidates": [
+          {
+            "raw_target": "AMEX[アメックス]",
+            "ledger_target": "AMEX[アメックス]",
+            "from": [
+              872,
+              "AMEX"
+            ],
+            "published": [
+              874
+            ],
+            "source_key_matches": [
+              874,
+              875
+            ],
+            "physical_heads": [
+              [
+                874,
+                "AMEX[アメックス]"
+              ],
+              [
+                875,
+                "Amex[アメックス]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "Amex[アメックス]",
+            "ledger_target": "Amex[アメックス]",
+            "from": [
+              873,
+              "Amex"
+            ],
+            "published": [
+              875
+            ],
+            "source_key_matches": [
+              874,
+              875
+            ],
+            "physical_heads": [
+              [
+                874,
+                "AMEX[アメックス]"
+              ],
+              [
+                875,
+                "Amex[アメックス]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "TACAN[タカン]",
+            "ledger_target": "TACAN[タカン]",
+            "from": [
+              21348,
+              "TACAN"
+            ],
+            "published": [
+              21349
+            ],
+            "source_key_matches": [
+              21349,
+              21350
+            ],
+            "physical_heads": [
+              [
+                21349,
+                "TACAN[タカン]"
+              ],
+              [
+                21350,
+                "tacan[タカン]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "UNRRA[アンラ]",
+            "ledger_target": "UNRRA[アンラ]",
+            "from": [
+              22840,
+              "UNRRA"
+            ],
+            "published": [
+              22842
+            ],
+            "source_key_matches": [
+              22842,
+              22843
+            ],
+            "physical_heads": [
+              [
+                22842,
+                "UNRRA[アンラ]"
+              ],
+              [
+                22843,
+                "Unrra[アンラ]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "Unrra[アンラ]",
+            "ledger_target": "Unrra[アンラ]",
+            "from": [
+              22841,
+              "Unrra"
+            ],
+            "published": [
+              22843
+            ],
+            "source_key_matches": [
+              22842,
+              22843
+            ],
+            "physical_heads": [
+              [
+                22842,
+                "UNRRA[アンラ]"
+              ],
+              [
+                22843,
+                "Unrra[アンラ]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "tacan[タカン]",
+            "ledger_target": "tacan[タカン]",
+            "from": [
+              21347,
+              "tacan"
+            ],
+            "published": [
+              21350
+            ],
+            "source_key_matches": [
+              21349,
+              21350
+            ],
+            "physical_heads": [
+              [
+                21349,
+                "TACAN[タカン]"
+              ],
+              [
+                21350,
+                "tacan[タカン]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "アルゴル[ALGOL]",
+            "ledger_target": "アルゴル[ALGOL]",
+            "from": [
+              714,
+              "ALGOL"
+            ],
+            "published": [
+              230806
+            ],
+            "source_key_matches": [
+              230806,
+              230807
+            ],
+            "physical_heads": [
+              [
+                230806,
+                "アルゴル[ALGOL]"
+              ],
+              [
+                230807,
+                "アルゴル[Algol]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "アルゴル[Algol]",
+            "ledger_target": "アルゴル[Algol]",
+            "from": [
+              716,
+              "Algol"
+            ],
+            "published": [
+              230807
+            ],
+            "source_key_matches": [
+              230806,
+              230807
+            ],
+            "physical_heads": [
+              [
+                230806,
+                "アルゴル[ALGOL]"
+              ],
+              [
+                230807,
+                "アルゴル[Algol]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "サターン[SATURN]",
+            "ledger_target": "サターン[SATURN]",
+            "from": [
+              19232,
+              "SATURN"
+            ],
+            "published": [
+              247865
+            ],
+            "source_key_matches": [
+              247864,
+              247865
+            ],
+            "physical_heads": [
+              [
+                247864,
+                "サターン[Saturn]"
+              ],
+              [
+                247865,
+                "サターン[SATURN]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "サターン[Saturn]",
+            "ledger_target": "サターン[Saturn]",
+            "from": [
+              19233,
+              "Saturn"
+            ],
+            "published": [
+              247864
+            ],
+            "source_key_matches": [
+              247864,
+              247865
+            ],
+            "physical_heads": [
+              [
+                247864,
+                "サターン[Saturn]"
+              ],
+              [
+                247865,
+                "サターン[SATURN]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "セム[SEM]",
+            "ledger_target": "セム[SEM]",
+            "from": [
+              19543,
+              "SEM"
+            ],
+            "published": [
+              255184
+            ],
+            "source_key_matches": [
+              255183,
+              255184
+            ],
+            "physical_heads": [
+              [
+                255183,
+                "セム[Sem]"
+              ],
+              [
+                255184,
+                "セム[SEM]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "セム[Sem]",
+            "ledger_target": "セム[Sem]",
+            "from": [
+              19542,
+              "Sem"
+            ],
+            "published": [
+              255183
+            ],
+            "source_key_matches": [
+              255183,
+              255184
+            ],
+            "physical_heads": [
+              [
+                255183,
+                "セム[Sem]"
+              ],
+              [
+                255184,
+                "セム[SEM]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "ソーホー[SOHO]",
+            "ledger_target": "ソーホー[SOHO]",
+            "from": [
+              20341,
+              "SOHO"
+            ],
+            "published": [
+              256251
+            ],
+            "source_key_matches": [
+              256249,
+              256250,
+              256251
+            ],
+            "physical_heads": [
+              [
+                256249,
+                "ソーホー[Soho]"
+              ],
+              [
+                256250,
+                "ソーホー[SoHo]"
+              ],
+              [
+                256251,
+                "ソーホー[SOHO]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "ソーホー[SoHo]",
+            "ledger_target": "ソーホー[SoHo]",
+            "from": [
+              20342,
+              "SoHo"
+            ],
+            "published": [
+              256250
+            ],
+            "source_key_matches": [
+              256249,
+              256250,
+              256251
+            ],
+            "physical_heads": [
+              [
+                256249,
+                "ソーホー[Soho]"
+              ],
+              [
+                256250,
+                "ソーホー[SoHo]"
+              ],
+              [
+                256251,
+                "ソーホー[SOHO]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "ソーホー[Soho]",
+            "ledger_target": "ソーホー[Soho]",
+            "from": [
+              20343,
+              "Soho"
+            ],
+            "published": [
+              256249
+            ],
+            "source_key_matches": [
+              256249,
+              256250,
+              256251
+            ],
+            "physical_heads": [
+              [
+                256249,
+                "ソーホー[Soho]"
+              ],
+              [
+                256250,
+                "ソーホー[SoHo]"
+              ],
+              [
+                256251,
+                "ソーホー[SOHO]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "ミューズ[MUSE]",
+            "ledger_target": "ミューズ[MUSE]",
+            "from": [
+              14769,
+              "MUSE"
+            ],
+            "published": [
+              282189
+            ],
+            "source_key_matches": [
+              282188,
+              282189
+            ],
+            "physical_heads": [
+              [
+                282188,
+                "ミューズ[Muse]"
+              ],
+              [
+                282189,
+                "ミューズ[MUSE]"
+              ]
+            ],
+            "references": 1
+          },
+          {
+            "raw_target": "ミューズ[Muse]",
+            "ledger_target": "ミューズ[Muse]",
+            "from": [
+              14767,
+              "Muse"
+            ],
+            "published": [
+              282188
+            ],
+            "source_key_matches": [
+              282188,
+              282189
+            ],
+            "physical_heads": [
+              [
+                282188,
+                "ミューズ[Muse]"
+              ],
+              [
+                282189,
+                "ミューズ[MUSE]"
+              ]
+            ],
+            "references": 1
+          }
+        ],
+        "published_adds_candidates": [
+          {
+            "raw_target": "た·つ【裁つ】&lt;",
+            "ledger_target": "た·つ【裁つ】<",
+            "from": [
+              140837,
+              "たつ"
+            ],
+            "published": [
+              137258
+            ],
+            "source_key_matches": [],
+            "physical_heads": [
+              [
+                137258,
+                "た·つ【裁つ】<"
+              ]
+            ],
+            "references": 1
+          }
+        ]
+      },
+      "source_keys_over_256": 0,
+      "different_target_sets": [
+        [
+          "AMEX[アメックス]",
+          "AMEX[アメックス]",
+          "874",
+          "874,875",
+          1
+        ],
+        [
+          "Amex[アメックス]",
+          "Amex[アメックス]",
+          "875",
+          "874,875",
+          1
+        ],
+        [
+          "TACAN[タカン]",
+          "TACAN[タカン]",
+          "21349",
+          "21349,21350",
+          1
+        ],
+        [
+          "UNRRA[アンラ]",
+          "UNRRA[アンラ]",
+          "22842",
+          "22842,22843",
+          1
+        ],
+        [
+          "Unrra[アンラ]",
+          "Unrra[アンラ]",
+          "22843",
+          "22842,22843",
+          1
+        ],
+        [
+          "tacan[タカン]",
+          "tacan[タカン]",
+          "21350",
+          "21349,21350",
+          1
+        ],
+        [
+          "アルゴル[ALGOL]",
+          "アルゴル[ALGOL]",
+          "230806",
+          "230806,230807",
+          1
+        ],
+        [
+          "アルゴル[Algol]",
+          "アルゴル[Algol]",
+          "230807",
+          "230806,230807",
+          1
+        ],
+        [
+          "サターン[SATURN]",
+          "サターン[SATURN]",
+          "247865",
+          "247864,247865",
+          1
+        ],
+        [
+          "サターン[Saturn]",
+          "サターン[Saturn]",
+          "247864",
+          "247864,247865",
+          1
+        ],
+        [
+          "セム[SEM]",
+          "セム[SEM]",
+          "255184",
+          "255183,255184",
+          1
+        ],
+        [
+          "セム[Sem]",
+          "セム[Sem]",
+          "255183",
+          "255183,255184",
+          1
+        ],
+        [
+          "ソーホー[SOHO]",
+          "ソーホー[SOHO]",
+          "256251",
+          "256249,256250,256251",
+          1
+        ],
+        [
+          "ソーホー[SoHo]",
+          "ソーホー[SoHo]",
+          "256250",
+          "256249,256250,256251",
+          1
+        ],
+        [
+          "ソーホー[Soho]",
+          "ソーホー[Soho]",
+          "256249",
+          "256249,256250,256251",
+          1
+        ],
+        [
+          "ミューズ[MUSE]",
+          "ミューズ[MUSE]",
+          "282189",
+          "282188,282189",
+          1
+        ],
+        [
+          "ミューズ[Muse]",
+          "ミューズ[Muse]",
+          "282188",
+          "282188,282189",
+          1
+        ],
+        [
+          "た·つ【裁つ】&lt;",
+          "た·つ【裁つ】<",
+          "137258",
+          "",
+          1
+        ]
+      ],
+      "goldendict_executable_generated_index": {
+        "file": "004cba43cb8d5bb42e5de09802be2479",
+        "sha256": "482649538b81d796ea7fe968667afe3fa0f47f79a30ab86e46fce20f700a0e42",
+        "leaf_blocks": 641,
+        "chains": 408836,
+        "references_same_order": 249190,
+        "mismatches": []
+      }
+    }
+  },
+  "runtime_observations": [
+    {
+      "reader": "GoldenDict 1.5.0-RC2-254-gbd95948, Qt 4.8.6",
+      "scope": "独立便携八部原书 GUI，查 DC，选来源段，点击该段 AC，并核对实际显示",
+      "source": "sanseido",
+      "from": "DC",
+      "to": "AC",
+      "visible_results": [
+        "alternating current",
+        "actinium",
+        "adaptive control",
+        "Advertising Council",
+        "エーシー"
+      ],
+      "screenshots": [
+        {
+          "file": ".data/gd-merge-review/original-sanseido-DC.png",
+          "sha256": "99ea9ee46e86f24271cdffa4beaf21718ddf20ffdc2d1fb7b034a3aaf421be6d"
+        },
+        {
+          "file": ".data/gd-merge-review/original-sanseido-AC.png",
+          "sha256": "c8de21c9309d24cd313f805914c8e1724d9ef3b2230a9313e4d5b2a6a98087fc"
+        }
+      ]
+    },
+    {
+      "reader": "GoldenDict 1.5.0-RC2-254-gbd95948, Qt 4.8.6",
+      "scope": "独立便携八部原书 GUI，查 DC，选来源段，点击该段 AC，并核对实际显示",
+      "source": "oxford",
+      "from": "DC",
+      "to": "AC",
+      "visible_results": [
+        "air conditioning",
+        "alternating current"
+      ],
+      "screenshots": [
+        {
+          "file": ".data/gd-merge-review/original-DC-to-AC.png",
+          "sha256": "4c2cbb41e2087c389af57e71bef4819634db341aa4d6806d89255104d67b2d1e"
+        }
+      ]
+    }
+  ],
+  "runtime_observations_scope": "此脚本离线读档及比较固定版源码；此列只收录独立完成的界面点击。未记录的样本不作界面实测结论。",
+  "scope": "同源物理候选，按 NFC + 原版 1041 项 simple fold 比较并保留物理原序。客户端实例显示、外部词典组、词形提示及相同正文显示去重另行实测。",
+  "upstream": {
+    "qt4_entry_url": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/mdx.cc#L1180-L1255",
+    "show_definition": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/articleview.cc#L1081-L1120",
+    "word_trim": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/article_maker.cc#L366-L388",
+    "index_head": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/mdx.cc#L1314-L1344",
+    "candidate_fold": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/folding.cc#L33-L90",
+    "final_filter": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/btreeidx.cc#L912-L925",
+    "nfc": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/wstring_qt.cc#L37-L39",
+    "simple_fold_table": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/inc_case_folding.hh",
+    "mdx_native": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/mdx.cc#L640-L677",
+    "header": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/mdictparser.cc#L369-L431",
+    "miss_and_suggestions": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/article_maker.cc#L768-L784",
+    "key_length_limit": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/btreeidx.hh#L260",
+    "actual_anchor_selection": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/articleview.cc#L496-L535",
+    "single_instance": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/main.cc#L278-L305",
+    "command_line": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/main.cc#L165-L197",
+    "diagnostic_log": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/main.cc#L364-L380",
+    "single_instance_windows_session": "https://github.com/goldendict/goldendict/blob/bd959482644d7cfa57743a5143d2a5d0462e382d/qtsingleapplication/src/qtlocalpeer.cpp#L70-L107"
+  },
+  "qt_sources": [
+    "https://github.com/qt/qt/blob/v4.8.6/src/corelib/tools/qunicodetables_p.h#L62",
+    "https://github.com/qt/qt/blob/v4.8.6/src/corelib/tools/qchar.cpp#L543-L550",
+    "https://github.com/qt/qt/blob/v4.8.6/src/corelib/tools/qstring.cpp#L4214-L4236"
+  ],
+  "sanseido_physical_and_application_index": {
+    "basis": "A 初版逐字词头、再 SQLite trim(head) ASCII NOCASE。下面的应用索引/markup 分项只统计这两项皆未命中的目标；索引类别可重叠。",
+    "application_index_source": "0AB9F10A785E179BDD6AD11CC23F865BF3B7FB1B22F5D8D04E48CAAF5088AA36",
+    "application_index_path": "D:\\D_Main\\EdwinSoftware\\E_Search\\.data\\dictionary-merge-20261123-reader\\baseline.db",
+    "normalization": "NFKC + trim + lowercase，拉丁字母间的 ‘ ’ ʼ ‐ 折叠；读音键平假名化。展示头来自同源 entries.head，词头/读音分别来自 terms.kind=0/1。",
+    "markup_pattern": "</?[A-Za-z]|\\b(?:font|href|color)\\s*=",
+    "categories": {
+      "neither_legacy_physical_rule": {
+        "references": 504331,
+        "distinct_targets": 196014
+      },
+      "contains_markup": {
+        "references": 1913,
+        "distinct_targets": 867
+      },
+      "exact_physical_head": {
+        "references": 33942,
+        "distinct_targets": 14916
+      },
+      "display_head": {
+        "references": 839,
+        "distinct_targets": 349
+      },
+      "index_head": {
+        "references": 877,
+        "distinct_targets": 368
+      },
+      "any_index": {
+        "references": 2844,
+        "distinct_targets": 1348
+      },
+      "legacy_trim_ascii_only": {
+        "references": 44,
+        "distinct_targets": 19
+      },
+      "index_reading": {
+        "references": 1967,
+        "distinct_targets": 980
+      }
+    }
+  },
+  "reference_totals": {
+    "same_nonempty": 550255,
+    "same_empty": 508573,
+    "published_omits_candidates": 507,
+    "published_adds_candidates": 1
+  },
+  "references_compared": 1059336
+}
