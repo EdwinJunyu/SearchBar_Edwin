@@ -1,11 +1,14 @@
 #nullable enable
 using System;
 using System.Buffers.Binary;
+using System.Buffers;
+using System.Buffers.Text;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -45,6 +48,302 @@ public static class MdxReader
     }
 
     public static IndexedReader OpenIndexed(string path) => Open(path, null);
+
+    // MDXP 是分发容器。首次安装恢复标准 MDX 后，SQLite 块偏移、原书哈希和查词路径均可沿用。
+    private const int DeliveryBlockLimit = 2 * 1024 * 1024;
+    private const long DeliveryFileLimit = 16L << 30;
+    private static ReadOnlySpan<byte> DeliveryMagic => "ESMDXP01"u8;
+    private static ReadOnlySpan<byte> MetadataPrefix => "<!--ESMERGE1:"u8;
+
+    [DllImport("es-zlib-ng.dll", EntryPoint = "compress2", CallingConvention = CallingConvention.Cdecl)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+    private static extern int CompressDeliveryNative([Out] byte[] destination, ref uint length,
+        byte[] source, uint sourceLength, int level);
+
+    // 源 MDX 由 zlib-ng 2.2.4 的级别 6 写入。只有重压字节逐一相等的块才进入紧凑模式。
+    private static byte[] CompressDelivery(byte[] plain)
+    {
+        uint n = (uint)plain.Length;
+        uint bound = n + (n >> 12) + (n >> 14) + (n >> 25) + 13;
+        byte[] output = new byte[bound];
+        try
+        {
+            Require(CompressDeliveryNative(output, ref bound, plain, n, 6) == 0, "MDXP zlib 压缩失败。");
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
+        {
+            throw new InvalidDataException("恢复紧凑词卷需要随包的 Windows x64 es-zlib-ng.dll。", ex);
+        }
+        Array.Resize(ref output, checked((int)bound));
+        return output;
+    }
+
+    private static byte[]? ShapeDelivery(byte[] raw)
+    {
+        // 用长度描述原文 JSON 与 HTML，便于压缩器跨两者复用文字。未知或过大的记录安全回退。
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream);
+        ReadOnlySpan<byte> remaining = raw;
+        bool foundMetadata = false;
+        while (!remaining.IsEmpty)
+        {
+            int end = remaining.IndexOf((byte)0);
+            if (end < 0) return null;
+            var html = remaining[..end];
+            remaining = remaining[(end + 1)..];
+            byte[] metadata = [];
+            int length = 0;
+            if (html.StartsWith(MetadataPrefix))
+            {
+                html = html[MetadataPrefix.Length..];
+                int stop = html.IndexOf("-->"u8);
+                if (stop <= 0) return null;
+                metadata = new byte[Base64.GetMaxDecodedFromUtf8Length(stop)];
+                if (Base64.DecodeFromUtf8(html[..stop], metadata, out int consumed, out length) != OperationStatus.Done ||
+                    consumed != stop || length == 0 || Base64.GetMaxEncodedToUtf8Length(length) != stop) return null;
+                html = html[(stop + 3)..];
+                foundMetadata = true;
+            }
+            if (stream.Length + 8L + length + html.Length > DeliveryBlockLimit) return null;
+            writer.Write(length);
+            writer.Write(html.Length);
+            writer.Write(metadata, 0, length);
+            writer.Write(html);
+        }
+        return foundMetadata ? stream.ToArray() : null;
+    }
+
+    private static byte[] UnshapeDelivery(ReadOnlySpan<byte> data, int rawLength)
+    {
+        var raw = new byte[rawLength];
+        int pos = 0;
+        while (!data.IsEmpty)
+        {
+            Require(data.Length >= 8, "MDXP 记录长度截断。");
+            int meta = BinaryPrimitives.ReadInt32LittleEndian(data);
+            int html = BinaryPrimitives.ReadInt32LittleEndian(data[4..]);
+            data = data[8..];
+            Require(meta >= 0 && meta <= data.Length && html >= 0 && html <= data.Length - meta, "MDXP 记录越界。");
+            int encoded = Base64.GetMaxEncodedToUtf8Length(meta);
+            int prefixSize = meta == 0 ? 0 : MetadataPrefix.Length + encoded + 3;
+            Require((long)prefixSize + html + 1 <= raw.Length - pos, "MDXP 原文超过块长。");
+            if (meta != 0)
+            {
+                MetadataPrefix.CopyTo(raw.AsSpan(pos));
+                pos += MetadataPrefix.Length;
+                Require(Base64.EncodeToUtf8(data[..meta], raw.AsSpan(pos, encoded), out _, out _) == OperationStatus.Done,
+                    "MDXP 原文编码失败。");
+                pos += encoded;
+                "-->"u8.CopyTo(raw.AsSpan(pos));
+                pos += 3;
+            }
+            data.Slice(meta, html).CopyTo(raw.AsSpan(pos));
+            pos += html + 1; // 零初始化数组已含词条终止符。
+            data = data[(meta + html)..];
+        }
+        Require(pos == raw.Length, "MDXP 还原块长度不一致。");
+        return raw;
+    }
+
+    private static void CopyDeliveryBytes(Stream source, Stream destination, long count, byte[] buffer)
+    {
+        Require(count >= 0 && count <= source.Length - source.Position, "MDXP 流区间越界。");
+        while (count > 0)
+        {
+            int n = (int)Math.Min(count, buffer.Length);
+            source.ReadExactly(buffer.AsSpan(0, n));
+            destination.Write(buffer, 0, n);
+            count -= n;
+        }
+    }
+
+    private static void WriteDelivery(string destination, Action<FileStream> write)
+    {
+        string path = Path.GetFullPath(destination);
+        if (File.Exists(path)) throw new IOException($"目标已存在：{path}");
+        string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        var output = new FileStream(temp, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
+        try
+        {
+            using (output)
+            {
+                write(output);
+                output.Flush(true);
+            }
+            File.Move(temp, path, overwrite: false);
+        }
+        finally
+        {
+            File.Delete(temp); // 仅清理本次独占创建的临时产物，既有词库不会被覆盖。
+        }
+    }
+
+    public static void PackDelivery(string mdxPath, string payloadPath, string expectedSha256)
+    {
+        byte[] hash = SourceDigest(expectedSha256);
+        using var input = File.OpenRead(mdxPath);
+        Require(input.Length <= DeliveryFileLimit && SHA256.HashData(input).AsSpan().SequenceEqual(hash),
+            "MDXP 输入词卷长度或 SHA-256 不符。");
+        input.Position = 0;
+        using var layout = ReadDirectory(input, expectedSha256, includeKeys: false);
+        var blocks = layout.DeliveryBlocks;
+        long prefix = blocks.Count == 0 ? input.Length : blocks[0].FileOffset;
+        WriteDelivery(payloadPath, output =>
+        {
+            using var writer = new BinaryWriter(output, Encoding.UTF8, leaveOpen: true);
+            writer.Write(DeliveryMagic);
+            writer.Write(hash);
+            writer.Write(input.Length);
+            writer.Write(prefix);
+            writer.Write(blocks.Count);
+            input.Position = 0;
+            byte[] buffer = new byte[65536];
+            CopyDeliveryBytes(input, output, prefix, buffer);
+            foreach (var block in blocks)
+            {
+                if (block.Plain <= DeliveryBlockLimit && block.Packed <= DeliveryBlockLimit)
+                {
+                    byte[] original = ReadBytes(input, block.Packed);
+                    if (BinaryPrimitives.ReadUInt32LittleEndian(original) == 2)
+                    {
+                        byte[] plain = Unpack(original, block.Plain);
+                        byte[]? shaped = ShapeDelivery(plain);
+                        if (shaped != null && UnshapeDelivery(shaped, plain.Length).AsSpan().SequenceEqual(plain))
+                        {
+                            byte[] compressed = CompressDelivery(shaped);
+                            if (compressed.Length + 8 < original.Length &&
+                                CompressDelivery(plain).AsSpan().SequenceEqual(original.AsSpan(8)))
+                            {
+                                writer.Write((byte)1);
+                                writer.Write(compressed.Length);
+                                writer.Write(plain.Length);
+                                writer.Write(shaped.Length);
+                                writer.Write(compressed);
+                                continue;
+                            }
+                        }
+                    }
+                    input.Position = block.FileOffset;
+                }
+                writer.Write((byte)0);
+                writer.Write(block.Packed);
+                CopyDeliveryBytes(input, output, block.Packed, buffer);
+            }
+            CopyDeliveryBytes(input, output, input.Length - input.Position, buffer);
+        });
+    }
+
+    private readonly record struct DeliveryFrame(byte[] Bytes, int RawLength, int ShapedLength);
+
+    private static (byte[] Bytes, uint? Checksum) RestoreFrame(DeliveryFrame frame)
+    {
+        if (frame.RawLength == 0) return (frame.Bytes, null);
+        using var compressed = new MemoryStream(frame.Bytes);
+        using var decoder = new ZLibStream(compressed, CompressionMode.Decompress);
+        byte[] shaped = new byte[frame.ShapedLength];
+        decoder.ReadExactly(shaped);
+        Require(decoder.ReadByte() == -1, "MDXP 变换流多出正文。");
+        byte[] plain = UnshapeDelivery(shaped, frame.RawLength);
+        return (CompressDelivery(plain), Adler(plain));
+    }
+
+    public static void RestoreDelivery(string payloadPath, string mdxPath, string expectedSha256)
+    {
+        byte[] hash = SourceDigest(expectedSha256);
+        using var input = File.OpenRead(payloadPath);
+        using var reader = new BinaryReader(input);
+        Require(reader.ReadBytes(DeliveryMagic.Length).AsSpan().SequenceEqual(DeliveryMagic) &&
+            reader.ReadBytes(HashSize).AsSpan().SequenceEqual(hash), "MDXP 版本或目标 SHA-256 不符。");
+        long total = reader.ReadInt64(), prefix = reader.ReadInt64();
+        int count = reader.ReadInt32();
+        Require(total is > 0 and <= DeliveryFileLimit && prefix >= 0 && prefix <= total &&
+            count >= 0 && count <= (total - prefix) / 8 && count <= (input.Length - input.Position) / 5,
+            "MDXP 文件尺寸或块数无效。");
+        WriteDelivery(mdxPath, output =>
+        {
+            byte[] buffer = new byte[65536];
+            CopyDeliveryBytes(input, output, prefix, buffer);
+            const int batchBudget = 8 * 1024 * 1024;
+            var batch = new List<DeliveryFrame>(32);
+            int batchCost = 0;
+            int maxWorkers = Math.Clamp(Environment.ProcessorCount - 1, 1, 6);
+
+            void FlushBatch()
+            {
+                if (batch.Count == 0) return;
+                var results = new (byte[] Bytes, uint? Checksum)[batch.Count];
+                // 每个工作线程一次处理多块，输入与输出顺序只由当前线程管理。
+                int lanes = Math.Min(maxWorkers, (batch.Count + 2) / 3);
+                void DecodeLane(int lane)
+                {
+                    for (int j = lane; j < batch.Count; j += lanes)
+                        results[j] = RestoreFrame(batch[j]);
+                }
+                if (lanes == 1) DecodeLane(0);
+                else
+                {
+                    try { System.Threading.Tasks.Parallel.For(0, lanes, DecodeLane); }
+                    catch (AggregateException ex)
+                    {
+                        throw new InvalidDataException("MDXP 批次恢复失败。", ex.Flatten().InnerExceptions[0]);
+                    }
+                }
+                Span<byte> header = stackalloc byte[8];
+                BinaryPrimitives.WriteUInt32LittleEndian(header, 2);
+                foreach (var (bytes, checksum) in results)
+                {
+                    int headerLength = checksum.HasValue ? 8 : 0;
+                    Require(bytes.Length + (long)headerLength <= total - output.Position, "MDXP 还原结果超过目标大小。");
+                    if (checksum is uint adler)
+                    {
+                        BinaryPrimitives.WriteUInt32BigEndian(header[4..], adler);
+                        output.Write(header);
+                    }
+                    output.Write(bytes);
+                }
+                batch.Clear();
+                batchCost = 0;
+            }
+
+            for (int i = 0; i < count; i++)
+            {
+                byte kind = reader.ReadByte();
+                int size = reader.ReadInt32();
+                int raw = 0, shapedLength = 0;
+                if (kind == 0)
+                {
+                    Require(size is >= 8 and <= SizeLimit && size <= total - output.Position, "MDXP 原样块越界。");
+                    // 大原样块直接流式复制，避免把它们驻留到底层并行作业完成。
+                    if (size > buffer.Length)
+                    {
+                        FlushBatch();
+                        Require(size <= total - output.Position, "MDXP 原样块越界。");
+                        CopyDeliveryBytes(input, output, size, buffer);
+                        continue;
+                    }
+                }
+                else
+                {
+                    Require(kind == 1 && size is > 0 and <= DeliveryBlockLimit, "MDXP 块类型或压缩长度无效。");
+                    raw = reader.ReadInt32();
+                    shapedLength = reader.ReadInt32();
+                    Require(raw is > 0 and <= DeliveryBlockLimit && shapedLength is > 0 and <= DeliveryBlockLimit,
+                        "MDXP 正文尺寸无效。");
+                }
+                Require(size <= input.Length - input.Position, "MDXP 块被截断。");
+                // 预算包含压缩输入、展开数据、还原原文和压缩器的输出缓冲。超预算的单块单独处理。
+                int cost = size + shapedLength + 3 * raw + 1024;
+                if (batch.Count == 32 || batchCost + cost > batchBudget) FlushBatch();
+                batch.Add(new DeliveryFrame(ReadBytes(input, size), raw, shapedLength));
+                batchCost += cost;
+            }
+            FlushBatch();
+            Require(input.Length - input.Position == total - output.Position, "MDXP 尾部长度不符。");
+            CopyDeliveryBytes(input, output, total - output.Position, buffer);
+            output.Position = 0;
+            Require(SHA256.HashData(output).AsSpan().SequenceEqual(hash), "MDXP 恢复后的整卷 SHA-256 不符。");
+        });
+    }
 
     public static IndexedReader OpenRecords(string path, string sourceSha256)
     {
@@ -285,6 +584,7 @@ public static class MdxReader
         private readonly string identity;
         private readonly Encoding encoding;
         private readonly RecordBlock[] blocks;
+        internal IReadOnlyList<RecordBlock> DeliveryBlocks => blocks;
         private readonly ReadOnlyMemory<byte>? blockHashes;
         private readonly long total;
         public IReadOnlyList<Entry> Entries { get; }

@@ -176,13 +176,13 @@ static async Task ReceiveLaunchesAsync(string pipeName, Action<string?> activate
 
 #endif
 
-static string FindDatabase(bool readOnly = false, bool resolveOnly = false)
+static string FindDatabase(bool readOnly = false, bool resolveOnly = false, bool personalOnly = false)
 {
     var configured = Environment.GetEnvironmentVariable("E_SEARCH_DB");
-    if (!string.IsNullOrWhiteSpace(configured)) return Path.GetFullPath(configured);
+    if (!personalOnly && !string.IsNullOrWhiteSpace(configured)) return Path.GetFullPath(configured);
     string seed = Path.Combine(AppContext.BaseDirectory, "Data", "dictionaries.db");
     bool hasSeed = File.Exists(seed);
-    if (!hasSeed)
+    if (!hasSeed && !personalOnly)
     {
         // 工程内的开发输出沿用项目词库；独立安装的位置与启动时的工作目录无关。
         for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
@@ -194,9 +194,26 @@ static string FindDatabase(bool readOnly = false, bool resolveOnly = false)
     string directory = Path.Combine(profile, "E_Search");
     string database = Path.Combine(directory, "dictionaries.db");
     if (resolveOnly || !hasSeed || File.Exists(database)) return database;
-    // 尚无个人副本时，查询可直接读取随包词库；首次写入才需要复制。
+    // 只读查询直接读随包索引。只有真正打开压缩卷的正文时才使用个人缓存。
     if (readOnly) return seed;
     Directory.CreateDirectory(directory);
+    // 同一用户并发运行命令行和浮窗时只还原一次大卷。进程中断后，下个调用可重新安装。
+    string lockId = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+        Encoding.UTF8.GetBytes(Path.GetFullPath(database).ToUpperInvariant())));
+    using var installation = new Mutex(false, "E_Search.Seed." + lockId);
+    try { installation.WaitOne(); }
+    catch (AbandonedMutexException) { } // 此时调用方已取得锁。
+    try
+    {
+        if (!File.Exists(database)) InstallSeed(seed, database);
+    }
+    finally { installation.ReleaseMutex(); }
+    return database;
+}
+
+static void InstallSeed(string seed, string database)
+{
+    string directory = Path.GetDirectoryName(database)!;
     string temporary = Path.Combine(directory, $"dictionaries-{Guid.NewGuid():N}.tmp");
     try
     {
@@ -213,7 +230,6 @@ static string FindDatabase(bool readOnly = false, bool resolveOnly = false)
         catch (IOException) when (File.Exists(database)) { }
     }
     finally { File.Delete(temporary); }
-    return database;
 }
 
 Console.OutputEncoding = new UTF8Encoding(false);
@@ -239,6 +255,10 @@ if (args is [] or ["help"] or ["--help"])
         import-indexed --language <ja|en|zh> <MDX路径>  按需读取自选词典
                                     搬迁或备份时请同时保留数据库及其同名 .sources 目录
         indexed-sources             列出当前数据库引用的 MDX 内容哈希
+        indexed-ja-source           输出合并日语卷的原始 MDX 哈希（没有则留空）
+        install-seed                首次安装随包词典到个人目录，并输出可使用的数据库路径
+        pack-ja <MDX> <MDXP>        创建日语词典分发文件
+        restore-ja <MDXP> <MDX> <SHA256>  还原并校验原始日语词典
         merged-resources            列出当前合并卷引用的 MDD 资源哈希
         compact                     整理现有数据库，回收重导后空闲的 SQLite 页
         import-merged <双卷目录>     校验两个卷及其资源，原子导入独立库（可用 E_SEARCH_DB 指定）
@@ -293,6 +313,28 @@ try
     }
     switch (args)
     {
+        case ["install-seed"]:
+        {
+            // 此显式命令与桌面首装使用同一个人目录；E_SEARCH_DB 仍供普通查询选择独立库。
+            string installed = FindDatabase(personalOnly: true);
+            if (!File.Exists(installed)) throw new FileNotFoundException("未找到个人词库或可供安装的随包种子。", installed);
+            Console.WriteLine(installed);
+            break;
+        }
+        case ["pack-ja",var input,var output]:
+        {
+            using var source = File.OpenRead(input);
+            string hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(source));
+            MdxReader.PackDelivery(input, output, hash);
+            break;
+        }
+        case ["restore-ja",var packed,var restored,var expectedHash]:
+            MdxReader.RestoreDelivery(packed, restored, expectedHash);
+            break;
+        case ["indexed-ja-source"]:
+            using (var store = OpenReader())
+                if (store.JapaneseVolumeHash() is string japaneseHash) Console.WriteLine(japaneseHash);
+            break;
         case ["import-merged",var package]:
         {
             string path = MergedDatabase();

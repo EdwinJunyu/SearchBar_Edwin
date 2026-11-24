@@ -8,6 +8,26 @@
     <DefaultItemExcludes>$(DefaultItemExcludes);.tools/**;.data/**</DefaultItemExcludes>
     <ReverseModelDirectory Condition="'$(ReverseModelDirectory)' == ''">$(E_SEARCH_REVERSE_MODEL)</ReverseModelDirectory>
   </PropertyGroup>
+  <!-- 发行时及首次安装时需要相同的 DEFLATE 编码器，才能逐字节还原 MDX。
+       固定上游 x64 构建和哈希；日常查词继续使用原来的 MDX 读取器。 -->
+  <PropertyGroup Condition="'$(OS)' == 'Windows_NT' and ('$(RuntimeIdentifier)' == 'win-x64' or ('$(RuntimeIdentifier)' == '' and '$(NETCoreSdkPortableRuntimeIdentifier)' == 'win-x64'))">
+    <_DeliveryCodec>$(MSBuildProjectDirectory)/.tools/zlib-ng-2.2.4</_DeliveryCodec>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(_DeliveryCodec)' != ''">
+    <Content Include="$(_DeliveryCodec)/bin/zlib1.dll" Link="es-zlib-ng.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="$(_DeliveryCodec)/LICENSE.md" Link="licenses/zlib-ng-LICENSE.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="PrepareDeliveryCodec" BeforeTargets="PrepareForBuild" Condition="'$(_DeliveryCodec)' != ''">
+    <PropertyGroup>
+      <_CodecZip>$(_DeliveryCodec)/zlib-ng-win-x86-64-compat.zip</_CodecZip>
+    </PropertyGroup>
+    <MakeDir Directories="$(_DeliveryCodec)" />
+    <DownloadFile SourceUrl="https://github.com/zlib-ng/zlib-ng/releases/download/2.2.4/zlib-ng-win-x86-64-compat.zip"
+                  DestinationFolder="$(_DeliveryCodec)" DestinationFileName="zlib-ng-win-x86-64-compat.zip" Condition="!Exists('$(_CodecZip)')" />
+    <VerifyFileHash File="$(_CodecZip)" Algorithm="SHA256" Hash="D622DAB74FD595663103E8E9E208B4FDC2B66F4C0FDB567B7729113D1677C103" />
+    <Unzip SourceFiles="$(_CodecZip)" DestinationFolder="$(_DeliveryCodec)" Include="bin/zlib1.dll;LICENSE.md" SkipUnchangedFiles="true" />
+    <VerifyFileHash File="$(_DeliveryCodec)/bin/zlib1.dll" Algorithm="SHA256" Hash="5C4684731C4AA5489240AB59EF18AA2A223E641AFDDCD4095AB86FEB6FB5EDE6" />
+  </Target>
   <!-- 仅显式指定时随包交付已核验的模型目录。限制复制文件名，避免带入用户缓存、测试数据或其它权重。 -->
   <ItemGroup Condition="'$(ReverseModelDirectory)' != ''">
     <_ReverseModelFile Include="$(ReverseModelDirectory)/model.onnx;$(ReverseModelDirectory)/vocab.txt;$(ReverseModelDirectory)/LICENSE.txt;$(ReverseModelDirectory)/provenance.json" />

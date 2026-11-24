@@ -104,6 +104,39 @@ function Test-ReleaseZip([string]$Archive, [string]$Cache) {
         }
         if ((Get-ReleaseFingerprint $manifest.sourceFiles) -cne $manifest.sourceSha256 -or
             (Get-FileHash -LiteralPath $seed).Hash -cne $manifest.seedSha256) { throw 'ZIP 的源码清单或种子与发布记录不一致' }
+        if ($manifest.japaneseDelivery) {
+            $japanese = $manifest.japaneseDelivery
+            $hash = $japanese.sourceSha256
+            if ($hash -cnotmatch '^[0-9A-F]{64}$' -or $hash -cnotin $manifest.indexedSources) {
+                throw '发布清单的日语卷没有对应的种子引用'
+            }
+            $packed = Join-Path ($seed + '.sources') "$hash.mdxp"
+            if ((Test-Path -LiteralPath (Join-Path ($seed + '.sources') "$hash.mdx")) -or
+                (Get-FileHash -LiteralPath $packed).Hash -cne $japanese.packedSha256) {
+                throw '日语卷须仅以经过校验的分发文件交付'
+            }
+            if ((Get-FileHash -LiteralPath (Join-Path $directory 'es-zlib-ng.dll')).Hash -cne $japanese.codecSha256) {
+                throw '日语卷还原组件与发布清单不一致'
+            }
+            # 使用与桌面首启相同的个人库安装入口。每次复验使用新目录，避免误用旧 MDX。
+            $profileDirectory = Join-Path $Cache ('profile-' + [guid]::NewGuid().ToString('N'))
+            $previousProfile = $env:LOCALAPPDATA
+            $previousDb = $env:E_SEARCH_DB
+            try {
+                $env:LOCALAPPDATA = $profileDirectory
+                $env:E_SEARCH_DB = $null
+                $timer = [Diagnostics.Stopwatch]::StartNew()
+                $paths = @(& (Join-Path $directory 'E_Search.exe') install-seed | ForEach-Object { $_ })
+                if ($LASTEXITCODE -ne 0) { throw '新用户安装日语卷失败' }
+                $seed = Join-Path $profileDirectory 'E_Search/dictionaries.db'
+                if ($paths.Count -ne 1 -or $paths[0] -ne [IO.Path]::GetFullPath($seed) -or
+                    !(Test-Path -LiteralPath (Join-Path ($seed + '.sources') "$hash.mdx"))) { throw '首启没有生成个人日语 MDX' }
+                Write-Output ("PASS 首次创建个人词库 {0:N2} 秒" -f $timer.Elapsed.TotalSeconds)
+            } finally {
+                $env:LOCALAPPDATA = $previousProfile
+                $env:E_SEARCH_DB = $previousDb
+            }
+        }
         if ($manifest.ContainsKey('indexedSources') -and
             ((@(Get-IndexedSeedHashes $directory $seed) -join ',') -cne ($manifest.indexedSources -join ','))) {
             throw 'ZIP 的 MDX 与种子引用清单不一致'
@@ -173,6 +206,27 @@ if ($PackageSeed -or $VerifyReleaseZip) {
         binaries=(Get-ReleaseBinaries $directory)
         seedSha256=(Get-FileHash -LiteralPath $seed).Hash
         indexedSources=$indexedSources; mergedResources=$mergedResources; verified=$evidence }
+    # 通过种子库的卷标识选择日语卷；中英卷和普通单书仍按原格式交付。
+    $previousDb = $env:E_SEARCH_DB
+    try {
+        $env:E_SEARCH_DB = $seed
+        $japaneseHashes = @(& (Join-Path $directory 'E_Search.exe') indexed-ja-source | ForEach-Object { $_ })
+        if ($LASTEXITCODE -ne 0 -or $japaneseHashes.Count -gt 1) { throw '无法识别种子的日语合并卷' }
+    } finally { $env:E_SEARCH_DB = $previousDb }
+    $japaneseHash = $null
+    if ($japaneseHashes.Count) {
+        $japaneseHash = $japaneseHashes[0]
+        if ($japaneseHash -cnotmatch '^[0-9A-F]{64}$' -or $japaneseHash -cnotin $indexedSources) { throw '日语卷与种子引用不符' }
+        $packed = Join-Path $work "$japaneseHash.mdxp"
+        $japaneseSource = Join-Path ($seed + '.sources') "$japaneseHash.mdx"
+        & (Join-Path $directory 'E_Search.exe') pack-ja $japaneseSource $packed | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw '日语卷分发编码失败' }
+        $manifest.japaneseDelivery = [ordered]@{
+            sourceSha256=$japaneseHash
+            packedSha256=(Get-FileHash -LiteralPath $packed).Hash
+            codecSha256=(Get-FileHash -LiteralPath (Join-Path $directory 'es-zlib-ng.dll')).Hash
+        }
+    }
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $directory 'release.json')
     $filename = "E_Search-$($evidence.version)-$($commit.Substring(0,7))-$($fingerprint.Substring(0,12))-win-x64.zip"
     $candidate = Join-Path $work $filename
@@ -197,8 +251,9 @@ if ($PackageSeed -or $VerifyReleaseZip) {
             # 仅发布当批种子确实引用的原书，历史版本与修复隔离区留在本机。
             foreach ($hash in $indexedSources) {
                 $file = Join-Path ($seed + '.sources') ($hash + '.mdx')
+                if ($hash -ceq $japaneseHash) { $file = $packed }
                 [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,
-                    "E_Search-win-x64/Data/dictionaries.db.sources/$hash.mdx",[IO.Compression.CompressionLevel]::NoCompression)
+                    ("E_Search-win-x64/Data/dictionaries.db.sources/" + [IO.Path]::GetFileName($file)),[IO.Compression.CompressionLevel]::NoCompression)
             }
             foreach ($hash in $mergedResources) {
                 $file = Join-Path (Split-Path $seed) "merged-resources/$hash.mdd"
@@ -5065,7 +5120,14 @@ function Test-CliAccess([string]$Directory) {
 
 function Test-ReleaseDataLocation([switch]$Indexed) {
     # 程序和两个启动目录均位于项目树外，以真实 CLI 进程验证发布版的默认位置。
-    $root = [IO.Directory]::CreateDirectory([IO.Path]::Combine([IO.Path]::GetTempPath(), 'ESearch-location-' + [guid]::NewGuid().ToString('N'))).FullName
+    # TEMP 可以被调用者重定向到仓库内；那样程序会选中真正的开发库。复制测试程序前先排除这类路径。
+    $outside = foreach ($candidate in @([IO.Path]::GetTempPath(), (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Temp'))) {
+        $dir = [IO.DirectoryInfo]::new([IO.Path]::GetFullPath($candidate))
+        while ($dir -and !(Test-Path -LiteralPath (Join-Path $dir.FullName 'E_Search.csproj'))) { $dir = $dir.Parent }
+        if (!$dir) { $candidate; break }
+    }
+    if (!$outside) { throw '无种子发布测试需要项目树外的临时目录。' }
+    $root = [IO.Directory]::CreateDirectory([IO.Path]::Combine($outside, 'ESearch-location-' + [guid]::NewGuid().ToString('N'))).FullName
     $install = [IO.Directory]::CreateDirectory((Join-Path $root 'program')).FullName
     $second = [IO.Directory]::CreateDirectory((Join-Path $root 'another-cwd')).FullName
     $source = Split-Path $app

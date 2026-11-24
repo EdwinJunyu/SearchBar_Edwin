@@ -1654,6 +1654,14 @@ internal sealed class DictionaryStore : IDisposable
         return ActiveSourceHashes(snapshot);
     }
 
+    internal string? JapaneseVolumeHash()
+    {
+        using var snapshot = db.BeginTransaction(deferred: true);
+        if (!HasMergedMdxVolumes(snapshot)) return null;
+        using var query = Command("SELECT sha256 FROM merged_mdx_volumes WHERE volume='zh-ja'", snapshot);
+        return query.ExecuteScalar() as string;
+    }
+
     private List<string> ActiveSourceHashes(SqliteTransaction snapshot)
     {
         var queries = new List<string>();
@@ -2589,7 +2597,8 @@ internal static class ManagedMdx
         try
         {
             string path = CheckedSource(SourcePath(databasePath, hash));
-            return File.Exists(path) || File.Exists(ArchivedPath(path));
+            return File.Exists(path) || File.Exists(ArchivedPath(path))
+                || File.Exists(CheckedSource(Path.ChangeExtension(path, ".mdxp")));
         }
         catch (InvalidDataException) { return false; }
     }
@@ -2633,6 +2642,15 @@ internal static class ManagedMdx
         foreach (string hash in seed.IndexedHashes())
         {
             string path = CheckedSource(SourcePath(sourceDatabase, hash));
+            if (!File.Exists(path) && !File.Exists(ArchivedPath(path)))
+            {
+                string packed = CheckedSource(Path.ChangeExtension(path, ".mdxp"));
+                if (File.Exists(packed))
+                {
+                    MaterializeSource(SourcePath(destinationDatabase, hash), packed, hash, CancellationToken.None, packedDelivery: true);
+                    continue;
+                }
+            }
             try { Preserve(destinationDatabase, path, hash); }
             catch (FileNotFoundException) when (File.Exists(ArchivedPath(path)))
             { Preserve(destinationDatabase, ArchivedPath(path), hash); }
@@ -2670,8 +2688,12 @@ internal static class ManagedMdx
     }
 
     internal static string Preserve(string databasePath, string inputPath, string hash, CancellationToken token = default)
+        => MaterializeSource(SourcePath(databasePath, hash), inputPath, hash, token, packedDelivery: false);
+
+    private static string MaterializeSource(string destinationPath, string inputPath, string hash, CancellationToken token,
+        bool packedDelivery)
     {
-        string path = CheckedSource(SourcePath(databasePath, hash));
+        string path = CheckedSource(destinationPath);
         bool MatchesExisting()
         {
             using var source = File.OpenRead(path);
@@ -2696,9 +2718,15 @@ internal static class ManagedMdx
         try
         {
             // 哈希校验和持久化均在发布前完成。并发导入相同内容时复用已经发布的副本。
-            using (var input = File.OpenRead(inputPath))
-            using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+            if (packedDelivery)
             {
+                // 分发解码器按种子索引的原书哈希核验完整输出，再走同一套原子发布和修复路径。
+                MdxReader.RestoreDelivery(inputPath, temporary, hash);
+            }
+            else
+            {
+                using var input = File.OpenRead(inputPath);
+                using var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
                 if (!TransferHash(input, output, token).Equals(hash, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException("复制过程中 MDX 内容发生变化，请重新导入。");
                 output.Flush(flushToDisk: true);
@@ -2740,8 +2768,27 @@ internal static class ManagedMdx
                 // 已打开的句柄允许改名。较迟才展开的旧快照在同一卷上原子改名之后可用同一散列读归档。
                 try { return Reader = Open(CheckedSource(Path)); }
                 catch (FileNotFoundException) when (File.Exists(ArchivedPath(Path))) { return Reader = Open(ArchivedPath(Path)); }
+                catch (FileNotFoundException) when (File.Exists(CheckedSource(System.IO.Path.ChangeExtension(Path, ".mdxp"))))
+                {
+                    // 独立数据库可以位于只读介质。只缓存它按哈希引用的原书，继续使用当前调用者的 SQLite 索引。
+                    return Reader = Open(CachedDelivery(System.IO.Path.ChangeExtension(Path, ".mdxp"), hash));
+                }
             }
         }
+    }
+
+    private static string CachedDelivery(string payload, string hash)
+    {
+        string profile = Environment.GetEnvironmentVariable("LOCALAPPDATA") ??
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string directory = CheckedPath(Path.Combine(CheckedPath(Path.Combine(profile, "E_Search")), "packed-source-cache"));
+        string path = CheckedSource(Path.Combine(directory, hash.ToUpperInvariant() + ".mdx"));
+        // 同一进程复用打开的 Reader；并发首读按散列互斥，缓存损坏时用分发件原子修复。
+        using var cacheLock = new Mutex(false, "E_Search.PackedSource." + hash.ToUpperInvariant());
+        try { cacheLock.WaitOne(); }
+        catch (AbandonedMutexException) { }
+        try { return MaterializeSource(path, payload, hash, CancellationToken.None, packedDelivery: true); }
+        finally { cacheLock.ReleaseMutex(); }
     }
 
     private static readonly LinkedList<OpenSource> sources = new();

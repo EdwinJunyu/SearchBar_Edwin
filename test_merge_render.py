@@ -1,5 +1,13 @@
 import sqlite3
 import unittest
+import base64
+import hashlib
+import json
+import os
+import random
+import shutil
+import subprocess
+import zlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import audit_merged
@@ -199,6 +207,57 @@ class CompactIndexTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 with audit_merged.CompactTermReader(root / "trial", 4) as reader:
                     reader.lookup("😀")
+
+
+@unittest.skipUnless(os.name == "nt", "Windows x64 发布程序的集成测试")
+class DeliveryTests(unittest.TestCase):
+    def test_restore_is_exact_and_rejects_partial_or_wrong_destination(self):
+        from mdict_io import write_mdict
+
+        root = Path(__file__).resolve().parent
+        host = root / ".tools/dotnet/dotnet.exe"
+        app = root / "bin/Release/net10.0/E_Search.dll"
+
+        def run(*args, success=True):
+            result = subprocess.run([str(host) if host.is_file() else shutil.which("dotnet") or "dotnet",
+                                     str(app), *map(str, args)], capture_output=True)
+            self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+
+        with TemporaryDirectory() as temp:
+            path = Path(temp)
+            mdx, archive, restored = (path / n for n in ("source.mdx", "delivery.mdxp", "restored.mdx"))
+            rng = random.Random(42)
+            rows = []
+            for i in range(300):
+                head = f"item-{i:04}"
+                definition = "".join(rng.choices("abcdefghijklmnopqrstuvwxyz", k=200))
+                metadata = json.dumps([["shinseiki", i + 1, head, definition]]).encode()
+                rows.append((head, b"<!--ESMERGE1:" + base64.b64encode(metadata) + b"--><p>"
+                             + definition.encode() + b"</p>"))
+            # 大于写入器的分块目标，保证末尾还有独立、无元数据的原样块。
+            rows.append(("zz-plain", b"unchanged non-merged page" * 3000))
+            write_mdict(mdx, rows, "test", "")
+            digest = hashlib.sha256(mdx.read_bytes()).hexdigest()
+            run("pack-ja", mdx, archive)
+            if getattr(zlib, "ZLIBNG_VERSION", "") == "2.2.4":
+                self.assertLess(archive.stat().st_size, 0.85 * mdx.stat().st_size)
+            run("restore-ja", archive, restored, digest)
+            self.assertEqual(mdx.read_bytes(), restored.read_bytes())
+            run("restore-ja", archive, mdx, digest, success=False)
+            self.assertEqual(hashlib.sha256(mdx.read_bytes()).hexdigest(), digest)
+            invalid = path / "invalid.mdx"
+            run("restore-ja", archive, invalid, "0" * 64, success=False)
+            self.assertFalse(invalid.exists())
+            bad = path / "cut.mdxp"
+            bad.write_bytes(archive.read_bytes()[:-12])
+            run("restore-ja", bad, invalid, digest, success=False)
+            self.assertFalse(invalid.exists())
+            damaged = bytearray(archive.read_bytes())
+            damaged[-1] ^= 1
+            bad.write_bytes(damaged)
+            run("restore-ja", bad, invalid, digest, success=False)
+            self.assertFalse(invalid.exists())
+            self.assertEqual(list(path.glob("*.tmp")), [])
 
 
 if __name__ == "__main__":
