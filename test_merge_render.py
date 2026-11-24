@@ -12,7 +12,70 @@ import zlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import audit_merged
+import merge_render
 from merge_render import Renderer
+
+
+class MergedDisplayTests(unittest.TestCase):
+    rules = {"sango": [["D?bel", "Dübel"]], "shinseiki": [["\ue003", "様"]],
+             "oxford": [["BUY NOW&NDASH;PAY LATER", "BUY NOW–PAY LATER"]]}
+
+    def section(self, source, body, shared=""):
+        return (f'<div class="es-source es-{source}"><a name="es-{source}-1"></a>{shared}'
+                f'<div class="es-label"><b>D?bel</b></div>{body}</div>')
+
+    def test_only_confirmed_visible_text_changes_in_public_and_helper_pages(self):
+        cleaner = merge_render.MergedDisplayCleaner(self.rules)
+        keep = ('<!-- D?bel --><style>.x{content:"D?bel"}</style><script>"D?bel"</script>'
+                '<span hidden>D?bel</span><template>D?bel</template><span title="D?bel > x"></span>')
+        raw = '<div class="es-target"><a href="entry://D?bel" id="D?bel">D?bel</a>  ?? &lt;I&gt; &amp;</div>'
+        expect = raw.replace('>D?bel</a>', '>Dübel</a>')
+        outside = self.section("oxford", "D?bel") + self.section("sango", "D?bel", '<a name="es-eijiro-2"></a>')
+        for prefix in (b'<!--ESHELP1-->', b'<!--ESMERGE1:RD9iZWw=-->'):
+            original = prefix + (self.section("sango", keep + raw) + outside).encode()
+            result = cleaner.clean(original)
+            self.assertEqual(result, prefix + (self.section("sango", keep + expect) + outside).encode())
+            self.assertEqual(cleaner.clean(result), result)
+        unmerged = self.section("sango", raw).encode()
+        self.assertEqual(cleaner.clean(unmerged), unmerged)
+
+    def test_entity_spelling_outside_repair_and_escaped_literal_markup_survive(self):
+        cleaner = merge_render.MergedDisplayCleaner(self.rules)
+        original = (self.section("oxford", "&lt;I&gt; BUY NOW&amp;NDASH;PAY LATER &AMP;")
+                    + self.section("shinseiki", "&#xE003; / &#57347; / \ue003 / &#xfffe;"))
+        expected = (self.section("oxford", "&lt;I&gt; BUY NOW–PAY LATER &AMP;")
+                    + self.section("shinseiki", "様 / 様 / 様 / &#xfffe;"))
+        self.assertEqual(cleaner.clean(b'<!--ESHELP1-->' + original.encode()),
+                         b'<!--ESHELP1-->' + expected.encode())
+
+    def test_oxford_font_requires_one_known_text_run_and_its_original_signature(self):
+        cleaner = merge_render.MergedDisplayCleaner(self.rules, kingsoft=["a5A", "aˈæ"])
+        good = '<FONT face="Kingsoft Phonetic Plain, Tahoma" color=red>5Aa</FONT>'
+        near = (good.replace("5Aa", "5Ωa") + good.replace("5Aa", "<i>5Aa</i>")
+                + good.replace("color=red", "color=green") + f"<span hidden>{good}</span>")
+        plain = self.section("sango", good)
+        result = cleaner.clean(b'<!--ESHELP1-->' + (self.section("oxford", good + near) + plain).encode())
+        self.assertEqual(result, b'<!--ESHELP1-->' + (self.section("oxford", good.replace(
+            "Kingsoft Phonetic Plain, Tahoma", "Segoe UI, sans-serif").replace("5Aa", "ˈæa") + near) + plain).encode())
+
+    def test_only_generated_native_redirect_labels_print_digit_scripts(self):
+        import html
+        def link(key, prefix=""):
+            target = hashlib.sha256(key.encode()).hexdigest()
+            return f'<a href="entry://esref-shinseiki-{target}">{prefix}{html.escape(key)}</a>'
+
+        original = link("C<sub>3</sub>植物", "参见 ")
+        nested = "<div>" + link("Dial Q<sup>2</sup>") + "</div>"
+        sample = '<div class="es-target">' + original + " &lt;sub&gt;3&lt;/sub&gt;</div>"
+        prefix = b'<!--ESHELP1-->'
+        clean = merge_render.MergedDisplayCleaner(self.rules).clean
+        expected = original.replace("&lt;sub&gt;3&lt;/sub&gt;", "₃") + nested.replace("&lt;sup&gt;2&lt;/sup&gt;", "²") + sample
+        self.assertEqual(clean(prefix + self.section("shinseiki", original + nested + sample).encode()),
+                         prefix + self.section("shinseiki", expected).encode())
+        for untouched in ("<p>" + original + "</p>", original.replace("esref-shinseiki-", "esref-oxford-"),
+                          original.replace("植物</a>", "植物X</a>")):
+            page = prefix + self.section("shinseiki", untouched).encode()
+            self.assertEqual(clean(page), page)
 
 
 class RenderTests(unittest.TestCase):
@@ -280,6 +343,44 @@ class DeliveryTests(unittest.TestCase):
             run("restore-ja", bad, invalid, digest, success=False)
             self.assertFalse(invalid.exists())
             self.assertEqual(list(path.glob("*.tmp")), [])
+
+
+class CleanMergedBooksTests(unittest.TestCase):
+    def test_clean_copy_roundtrip_and_reject_stale_manifest(self):
+        from mdict_io import read_entries, write_mdict
+        from merge_dictionaries import clean_books, file_hash, metadata, VOLUMES
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            books = root / "input"
+            books.mkdir()
+            manifest = {"format": 1, "files": {}, "sources": {}, "goldendict_compatibility": []}
+            source_bodies = {}
+            for volume in VOLUMES:
+                path = books / f"E_search-{volume}.mdx"
+                source = VOLUMES[volume][1][0]
+                body = metadata([[source, 1, "word ", "防\ue40c"]]) + (
+                    f'<div class="es-source es-{source}"><a name="es-{source}-1"></a>'
+                    f'<div class="es-label"><b>{source} #1</b></div>防\ue40c</div>').encode()
+                write_mdict(path, [("word ", body)], volume, "")
+                manifest["files"][path.name] = file_hash(path)
+                source_bodies[volume] = body
+            resource = books / "E_search-zh-ja.mdd"
+            resource.write_bytes(b"unchanged resource")
+            manifest["files"][resource.name] = file_hash(resource)
+            (books / "E_search-merge.json").write_text(json.dumps(manifest), encoding="utf-8")
+            rules = root / "rules.json"
+            rules.write_text(json.dumps({"rules": {"oxford": [["防\ue40c", "防卫"]]}, "kingsoft":["a","a"]}), encoding="utf-8")
+            output = root / "clean"
+            clean_books(books, output, rules)
+            for volume, original in source_bodies.items():
+                path = output / f"E_search-{volume}.mdx"
+                expected = original.replace("防\ue40c".encode(), "防卫".encode()) if volume == "zh-en" else original
+                self.assertEqual(list(read_entries(path)), [(1, "word ", expected)])
+            self.assertEqual((output / resource.name).read_bytes(), resource.read_bytes())
+            self.assertRaises(ValueError, clean_books, books, books, rules)
+            resource.write_bytes(b"stale")
+            self.assertRaises(ValueError, clean_books, books, root / "failed", rules)
+            self.assertFalse((root / "failed" / "E_search-merge.json").exists())
 
 
 if __name__ == "__main__":

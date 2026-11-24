@@ -263,6 +263,7 @@ if (args is [] or ["help"] or ["--help"])
         pack-volume <zh-en|zh-ja> <MDX> <MDXP>  创建中英或日语词典分发文件
         restore-volume <MDXP> <MDX> <SHA256>    还原并校验任一分发卷
         merged-resources            列出当前合并卷引用的 MDD 资源哈希
+        export-display-rules        导出双卷生成工具使用的显示规则（JSON）
         compact                     整理现有数据库，回收重导后空闲的 SQLite 页
         import-merged <双卷目录>     校验两个卷及其资源，原子导入独立库（可用 E_SEARCH_DB 指定）
         article <卷ID> <原词头>      输出合并卷公开词头或辅助页的 HTML
@@ -316,6 +317,16 @@ try
     }
     switch (args)
     {
+        case ["export-display-rules"]:
+        {
+            // 离线合卷和桌面共用同一份有序规则；导出不需要打开任何词库。
+            var rules = Source.All.ToDictionary(s => s.Id, s => EntryParser.DisplayReplacements(s.Id)
+                .Select(pair => new[] { pair.Before, pair.After }).ToArray());
+            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new {
+                rules, kingsoft = new[] { EntryParser.KingsoftAlphabet, EntryParser.KingsoftUnicode }
+            }));
+            break;
+        }
         case ["install-seed"]:
         {
             // 此显式命令与桌面首装使用同一个人目录；E_SEARCH_DB 仍供普通查询选择独立库。

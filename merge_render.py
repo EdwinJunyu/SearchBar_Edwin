@@ -157,6 +157,224 @@ def split_target(value):
     return unquote(key), unquote(fragment) if sep else ""
 
 
+_SECTION = re.compile(r'<div class="es-source es-([a-z-]+)">((?:<a name="es-[a-z-]+-\d+"></a>)+)'
+                      r'<div class="es-label"><b>[^<>]*</b></div>')
+_REFERENCE = re.compile(r'&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]+);')
+_ALIAS = re.compile(r'<a href="entry://es(?:ref|missing)-shinseiki-([0-9a-f]{64})">([^<>]*)</a>')
+_DIGITS = re.compile(r'&lt;(sub|sup)&gt;([0-9]+)&lt;/\1&gt;')
+_FONT_HINT = re.compile(b'[Kk][Ii][Nn][Gg][Ss][Oo][Ff][Tt] ')
+_PHONETIC = re.compile(r'<font face="(?P<face>Kingsoft Phonetic Plain, Tahoma)" '
+                       r'(?:color=(?:red|#fb8c42|#0000ff)|style="font-weight:normal")>'
+                       r'(?P<text>[^<>&]+)</font>', re.I | re.ASCII)
+_VOID = frozenset('area base br col embed hr img input link meta param source track wbr'.split())
+_INVISIBLE = frozenset('script style template noscript title iframe textarea xmp'.split())
+
+
+def _visible_entity(match):
+    token = match[0]
+    if token.startswith("&#"):
+        # 跳过无效数字实体，既不猜测其原义，也不让它被相邻替换的范围吞掉。
+        return html.unescape(token) or token
+    return html.entities.html5.get(token[1:], token)
+
+
+class MergedDisplayCleaner:
+    """按八书的校勘表处理合并页的可见副本；同一实例可复用于整卷。"""
+
+    def __init__(self, rules, kingsoft=None):
+        self.rules = {source: [tuple(pair) for pair in pairs] for source, pairs in rules.items() if pairs}
+        self.kingsoft = dict(zip(*kingsoft, strict=True)) if kingsoft else {}
+        if self.kingsoft:
+            self.rules.setdefault("oxford", [])
+        # 每页先在可见部分的字节上筛一次，避免为数百万普通词条解析 HTML。
+        # 数字实体可能代表任意码点，命中后才按原位置核对完整的校勘词串。
+        names = {}
+        for name, char in html.entities.html5.items():
+            if name.endswith(";") and len(char) == 1:
+                names.setdefault(char, []).append("&" + name)
+        self.hints = {}
+        probes = {b"&#", b"&lt;sub&gt;", b"&lt;sup&gt;"}
+        self.rules.setdefault("shinseiki", [])
+        for source, pairs in self.rules.items():
+            hints = {r"&#"}
+            for before, _ in pairs:
+                if not before:
+                    raise ValueError("校勘规则的原文不能为空")
+                private = next((ch for ch in before if '\ue000' <= ch <= '\uf8ff'), None)
+                if private:
+                    hints.add(re.escape(private))
+                    probes.add(private.encode()[:1])
+                    continue
+                # 非私用字按原词的开头筛选；命名实体只在字符值相同的地方作为候选。
+                parts = []
+                for ch in before[:20]:
+                    alternatives = [re.escape(ch), *map(re.escape, names.get(ch, []))]
+                    parts.append("(?:" + "|".join(alternatives) + ")" if len(alternatives) > 1 else alternatives[0])
+                hints.add("".join(parts))
+                # 没有命名实体拼法的一段字可直接用 bytes.find 跳过大多数正文；数字实体另行筛选。
+                literals = ["".join(chars) for eligible, chars in groupby(before, key=lambda ch: ch not in names) if eligible]
+                if literals:
+                    probes.add(max(literals, key=len).encode())
+                else:
+                    probes.add(before[0].encode())
+                    probes.update(name.encode() for name in names[before[0]])
+            self.hints[source] = re.compile("|".join(sorted(hints)))
+        self.probes = tuple(sorted(probes))
+
+    def clean(self, payload):
+        if not payload.startswith((b"<!--ESMERGE1:", b"<!--ESHELP1-->")):
+            return payload
+        end = payload.find(b"-->")
+        if end < 0:
+            return payload
+        body = end + 3
+        if not any(payload.find(probe, body) >= 0 for probe in self.probes) and not (
+                self.kingsoft and payload.find(b'es-source es-oxford', body) >= 0 and _FONT_HINT.search(payload, body)):
+            return payload
+        page = payload[end + 3:].decode("utf-8")
+        parser = _DisplayPage(page, self)
+        parser.feed(page)
+        parser.close()
+        edits = parser.edits
+        for start, stop, source in parser.spans:
+            text = page[start:stop]
+            if self.hints[source].search(text):
+                repaired = self.replace_text(source, text)
+                if text != repaired:
+                    edits.append((start, stop, repaired))
+        if not edits:
+            return payload
+        out, cursor = [], 0
+        for start, stop, replacement in sorted(edits):
+            if start < cursor:
+                raise ValueError("可见文字与旧音标校勘范围重叠")
+            out.extend((page[cursor:start], replacement))
+            cursor = stop
+        out.append(page[cursor:])
+        return payload[:end + 3] + "".join(out).encode("utf-8")
+
+    def replace_text(self, source, raw):
+        # 仅在一条校勘命中时改动它覆盖的原始字节。其余实体保留同样的拼法和层数。
+        visible = _REFERENCE.sub(_visible_entity, raw) if "&" in raw else raw
+        for before, after in self.rules[source]:
+            if before not in visible:
+                continue
+            if visible == raw:
+                raw = raw.replace(before, html.escape(after, quote=False))
+                visible = _REFERENCE.sub(_visible_entity, raw) if "&" in raw else raw
+                continue
+            bounds = [0]
+            position = 0
+            for entity in _REFERENCE.finditer(raw):
+                bounds.extend(range(position + 1, entity.start() + 1))
+                decoded = _visible_entity(entity)
+                if decoded == entity[0]:
+                    bounds.extend(range(entity.start() + 1, entity.end() + 1))
+                elif decoded:
+                    # 一个命名实体可能显示两个码点，不能拆开它进行替换。
+                    bounds.extend([None] * (len(decoded) - 1) + [entity.end()])
+                position = entity.end()
+            bounds.extend(range(position + 1, len(raw) + 1))
+            replacements = []
+            for match in re.finditer(re.escape(before), visible):
+                a, b = bounds[match.start()], bounds[match.end()]
+                if a is not None and b is not None:
+                    replacements.append((a, b))
+            for a, b in reversed(replacements):
+                raw = raw[:a] + html.escape(after, quote=False) + raw[b:]
+            visible = _REFERENCE.sub(_visible_entity, raw)
+        return raw
+
+
+class _DisplayPage(HTMLParser):
+    """用解析器定位允许改动的区间；原始标签、属性以及可见区间外的数据不经序列化。"""
+
+    def __init__(self, page, cleaner):
+        super().__init__(convert_charrefs=False)
+        self.page, self.cleaner = page, cleaner
+        self.lines = [0] + [m.end() for m in re.finditer("\n", page)]
+        self.stack = []
+        self.spans, self.edits = [], []
+        self.body_start, self.native_alias = -1, False
+
+    def source_index(self):
+        line, col = self.getpos()
+        return self.lines[line - 1] + col
+
+    def handle_starttag(self, tag, attrs):
+        source = self.stack[-1][1] if self.stack else None
+        values = dict(attrs)
+        classes = (values.get("class") or "").split()
+        pos = self.source_index()
+        if tag == "div" and "es-source" in classes:
+            # 仅信任渲染器产生的整段前缀。多来源共用的一段字无法按第一部词书解释。
+            section = _SECTION.match(self.page, pos) if not self.stack else None
+            source = None
+            if section and section[1] in self.cleaner.rules:
+                anchors = re.findall(r'es-([a-z-]+)-\d+"', section[2])
+                if all(origin == section[1] for origin in anchors):
+                    source = section[1]
+                    self.body_start, self.native_alias = section.end(), False
+        if tag in _INVISIBLE or "hidden" in values or "es-label" in classes or "es-client-target" in classes:
+            source = None
+        if tag == "font" and source == "oxford" and self.cleaner.kingsoft:
+            match = _PHONETIC.match(self.page, pos)
+            if match and all(ch in self.cleaner.kingsoft for ch in match["text"]):
+                # 只替换这种已校对字体的完整单文字节点。改用 Unicode 字体可避免客户端二次转写。
+                decoded = "".join(self.cleaner.kingsoft[ch] for ch in match["text"])
+                self.edits.append((*match.span("face"), "Segoe UI, sans-serif"))
+                self.edits.append((*match.span("text"), decoded))
+                source = None
+        if tag == "a" and source == "shinseiki":
+            # 生成器的首个别名直接在署名后；别名链只在随后直属的无属性 div 中展开。
+            first = pos == self.body_start
+            nested = self.native_alias and len(self.stack) == 2 and self.page.startswith("<div>", pos - 5)
+            match = _ALIAS.match(self.page, pos) if first or nested else None
+            if match and (not first or match[2].startswith("参见 ")):
+                label = match[2][3:] if first else match[2]
+                if sha256(html.unescape(label).encode()).hexdigest() == match[1]:
+                    if first:
+                        self.native_alias = True
+                    if _DIGITS.search(label):
+                        def digits(token):
+                            alphabet = "₀₁₂₃₄₅₆₇₈₉" if token[1] == "sub" else "⁰¹²³⁴⁵⁶⁷⁸⁹"
+                            return "".join(alphabet[int(ch)] for ch in token[2])
+                        fixed = _DIGITS.sub(digits, match[2])
+                        self.edits.append((*match.span(2), self.cleaner.replace_text(source, fixed)))
+                        source = None
+        if tag not in _VOID:
+            self.stack.append((tag, source))
+
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i][0] == tag:
+                del self.stack[i:]
+                return
+
+    def handle_startendtag(self, tag, attrs):
+        # HTML 的普通元素即使以 /> 收尾仍然打开；void 元素无需维护栈。
+        self.handle_starttag(tag, attrs)
+
+    def mark(self, length):
+        if self.stack and (source := self.stack[-1][1]):
+            a = self.source_index()
+            if self.spans and self.spans[-1][1:] == [a, source]:
+                self.spans[-1][1] += length
+            else:
+                self.spans.append([a, a + length, source])
+
+    def handle_data(self, data):
+        self.mark(len(data))
+
+    def handle_entityref(self, name):
+        size = len(name) + 1
+        self.mark(size + self.page.startswith(";", self.source_index() + size))
+
+    def handle_charref(self, name):
+        size = len(name) + 2
+        self.mark(size + self.page.startswith(";", self.source_index() + size))
+
+
 def source_boundary_edits(source, raw):
     """返回物理原文坐标上的最小修改。不可用图像只显示来源损坏说明，原文仍在公开页清单中。"""
     if source == "sango":

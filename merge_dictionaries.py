@@ -11,6 +11,7 @@ from itertools import groupby
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -869,9 +870,70 @@ def self_test():
     print("PASS 合并顺序、重复版本、资源归属、MDX 回读、原文篡改及构建差异检测")
 
 
+def clean_books(books, output, rules_path):
+    """从已验收的合卷生成展示修订版。输入卷只读，最后才发布新清单。"""
+    from mdict_io import read_entries, read_header, write_mdict
+    from merge_render import MergedDisplayCleaner
+
+    if output.exists():
+        raise ValueError("请指定一个尚不存在的输出目录")
+    manifest_name = "E_search-merge.json"
+    manifest = json.loads((books / manifest_name).read_text(encoding="utf-8"))
+    filenames = [f"E_search-{volume}.mdx" for volume in VOLUMES]
+    resource = "E_search-zh-ja.mdd"
+    if manifest["format"] != 1 or set(manifest["files"]) != {*filenames, resource}:
+        raise ValueError("清单必须对应 E_Search 双卷及日语资源")
+    for name, expected in manifest["files"].items():
+        if file_hash(books / name) != expected:
+            raise ValueError(f"输入清单哈希不符：{name}")
+    profile = json.loads(rules_path.read_text(encoding="utf-8-sig"))
+    cleaner = MergedDisplayCleaner(profile["rules"], profile["kingsoft"])
+    output.mkdir(parents=True)
+    shutil.copyfile(books / resource, output / resource)
+    if file_hash(output / resource) != manifest["files"][resource]:
+        raise ValueError("资源复制校验失败")
+    for name in filenames:
+        original, revised = books / name, output / name
+        header = read_header(original)
+        expected_rows = hashlib.sha256()
+        counts = Counter()
+
+        def rows():
+            for _, key, payload in read_entries(original):
+                if not payload.startswith((PREFIX, HELPER)):
+                    raise ValueError(f"缺少合卷来源标记：{key!r}")
+                cleaned = cleaner.clean(payload)
+                if cleaned != payload:
+                    # 来源清单内存有原始词头和完整原文，单独核实未被显示规则修改。
+                    boundary = payload.index(b"-->") + 3
+                    if not cleaned.startswith(payload[:boundary]):
+                        raise ValueError(f"原文元数据被改写：{key!r}")
+                    counts["changed_helpers" if payload.startswith(HELPER) else "changed_public"] += 1
+                counts["rows"] += 1
+                update_hash(expected_rows, key, cleaned)
+                yield key, cleaned
+
+        log(f"生成展示修订卷 {name}")
+        write_mdict(revised, rows(), header["Title"], header["Description"])
+        actual_rows = hashlib.sha256()
+        for _, key, payload in read_entries(revised):
+            update_hash(actual_rows, key, payload)
+        if actual_rows.digest() != expected_rows.digest() or read_header(revised) != header:
+            raise ValueError(f"逐条回读或卷头校验失败：{name}")
+        if file_hash(original) != manifest["files"][name]:
+            raise ValueError(f"生成期间输入卷发生变化：{name}")
+        manifest["files"][name] = file_hash(revised)
+        log(f"{name} {dict(counts)} SHA-256 {manifest['files'][name]}")
+    write_report(output / manifest_name, manifest)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    clean = commands.add_parser("clean-display", help="只修订现有双卷的可见内容")
+    clean.add_argument("--books", type=Path, required=True)
+    clean.add_argument("--output", type=Path, required=True)
+    clean.add_argument("--rules", type=Path, required=True, help="E_Search export-display-rules 导出的 JSON")
     make_stage = commands.add_parser("stage")
     make_stage.add_argument("--source-root", type=Path, default=DEFAULT_INPUT)
     make_stage.add_argument("--stage", type=Path, required=True)
@@ -902,7 +964,9 @@ def main():
     evidence.add_argument("--output",type=Path,required=True)
     commands.add_parser("self-test")
     args = parser.parse_args()
-    if args.command == "stage":
+    if args.command == "clean-display":
+        clean_books(args.books, args.output, args.rules)
+    elif args.command == "stage":
         stage_inputs(args.source_root, args.stage)
     elif args.command == "build":
         build(args.stage, args.output, args.resume_volume)
