@@ -845,6 +845,32 @@ function Test-MergedAudioPlayback([string]$Database,[string]$UiDir,[switch]$Brok
         Wait-Audio { $w.FindName('MergedWebHost').Content.CoreWebView2 } '创建词条 WebView2'
         $browser=$w.FindName('MergedWebHost').Content.CoreWebView2
         $browser.IsMuted=$true
+        Wait-Audio { $w.FindName('MergedDetail').IsHitTestVisible } '本页排版已显示'
+        $shown = Read-AudioDom @'
+(() => {
+    const link = document.querySelector('.es-shogakukan-zhja a');
+    return [link.innerText, link.getAttribute('href'), link.getAttribute('name'),
+        link.querySelector('b').innerText, document.querySelector('.es-sanseido').innerText,
+        document.querySelector('.es-sango > span').innerText];
+})()
+'@
+        Assert-Equal $shown[0] '参见 C³I' '小学馆中日富文本按来源还原实体解码后的上标'
+        Assert-Equal $shown[1] "#C$([char]0xe117)I" '富文本可见文字修正保留原链接'
+        Assert-Equal $shown[2] "C$([char]0xe117)I" '原书页内锚点仍使用原字符'
+        Assert-Equal $shown[3] 'C³I' '保留原书加粗标签'
+        Assert-Equal $shown[4] "C$([char]0xe117)I" '另一来源相同私用字符保持原义'
+        Assert-Equal $shown[5] '?ngstr?m' '多词书共用的正文保留双方原文'
+        $phonetic = Read-AudioDom @'
+(() => {
+    const sample = document.querySelector('#phonetic');
+    return [sample.innerText, getComputedStyle(sample).fontFamily,
+        document.querySelector('#mixed-phonetic').innerText, document.querySelector('#nested-phonetic').innerText,
+        document.querySelector('#ordinary').innerText, document.querySelector('#other-font').innerText];
+})()
+'@
+        Assert-Equal $phonetic[0] 'ˈæpl' '牛津 apple 使用 Unicode 音标'
+        Assert-Equal ($phonetic[1] -like '*Kingsoft*') $false 'Unicode 音标由普通系统字体绘制'
+        Assert-Equal ($phonetic[2..5] -join '|') '5Apl中|5Apl|5Apl|5Apl' '含未知字、混排标签、普通正文和其他来源不猜读音'
         Wait-Audio { (Read-AudioDom "document.getElementById('native-audio')?.readyState >= 1") } '原生 audio 解码 WAV 元数据'
         Assert-Equal (Read-AudioDom "document.getElementById('native-audio').duration") 1 'MDD 实际 WAV 播放时长一秒'
         $native=Read-AudioDom "document.getElementById('native-audio').currentSrc"
@@ -905,6 +931,9 @@ function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, 
         $appTarget = 'esappref-shinseiki-' + ('a' * 64)
         $appLink = '<a href="entry://' + $appTarget + '">E_Search 补充跳转</a>'
         $sampleAudio = '<p>主书及补充</p><audio id="native-audio" controls preload="metadata" src="es/shinseiki/voices/sample%20voice.wav"></audio><a id="sound-link" href="sound://es/shinseiki/voices/sample%20voice.wav?voice=1#t=0.125">发音</a><a id="missing-sound" href="sound://es/shinseiki/missing.wav">缺失</a><a id="external-link" href="https://media.invalid/missing.wav">外部</a><a id="file-link" href="file:///C:/unavailable-test.wav">文件</a>'
+        $sampleAudio += '<div class="es-source es-shogakukan-zhja"><a name="C&#xE117;I" href="#C&#xE117;I">参见 <b>C&#xE117;I</b></a></div><div class="es-source es-sanseido">C&#xE117;I</div>'
+        $sampleAudio += '<div class="es-source es-sango"><a name="es-sango-1"></a><a name="es-shinseiki-1"></a><div class="es-label"><b>两个来源共用</b></div><span>?ngstr?m</span></div>'
+        $sampleAudio += '<div class="es-source es-oxford"><font id="phonetic" face=" Kingsoft Phonetic Plain, Tahoma ">5Apl</font><font id="mixed-phonetic" face="Kingsoft Phonetic Plain, Tahoma">5Apl中</font><font id="nested-phonetic" face="Kingsoft Phonetic Plain, Tahoma">5<b>Apl</b></font><span id="ordinary">5Apl</span></div><div class="es-source es-hanying"><font id="other-font" face="Kingsoft Phonetic Plain, Tahoma">5Apl</font></div>'
         $japanesePages = [ordered]@{test=(Article $jaRows $sampleAudio); alias=(Article (,@('shogakukan',2,'alias','@@@LINK=test')) $appLink)}
         $japanesePages[$appTarget] = '<!--ESHELP1--><p>新世纪的实体补救候选</p>'
         Write-Mdx $ja $japanesePages
@@ -1820,7 +1849,7 @@ function Test-ImportIdentity([string]$Directory, [Reflection.Assembly]$Assembly)
     $first = [IO.Path]::Combine([IO.Directory]::CreateDirectory((Join-Path $Directory 'source-a')).FullName, $filename)
     $second = [IO.Path]::Combine([IO.Directory]::CreateDirectory((Join-Path $Directory 'source-b')).FullName, $filename)
     Write-Mdx $first ([ordered]@{'たべる'='たべる<br>【食べる】<br>吃'})
-    Write-Mdx $second ([ordered]@{'よむ'='よむ<br>【読む】<br>读'})
+    Write-Mdx $second ([ordered]@{'よむ'='よむ<br>【読む】<br>读'; 'ああ'="ああ<br>嗯`u{E7C8}g"})
     $type = $Assembly.GetType('DictionaryStore', $true)
     $database = [IO.Path]::Combine($Directory,'identity.db')
     # 从已有三列元数据表起步，覆盖已发布数据库的就地升级。
@@ -1845,6 +1874,7 @@ function Test-ImportIdentity([string]$Directory, [Reflection.Assembly]$Assembly)
         Assert-Equal $db.ListDictionaries().Count 2 '默认导入保留两份来源'
         Assert-Equal $db.Search('食べる', $a.Id, [Threading.CancellationToken]::None).Count 1 '原有来源仍可检索'
         Assert-Equal $db.Search('読む', $b.Id, [Threading.CancellationToken]::None).Count 1 '同名新来源保留专用解析'
+        Assert-Equal ($db.Search('ああ',$b.Id,[Threading.CancellationToken]::None)[0].Display.Contains('ǹg')) $true '同名 MDX 分配 GUID 后仍按原辞书显示外字'
         Write-Mdx $second ([ordered]@{'よむ'='よむ<br>【読む】<br>阅读'})
         $updated = $import.Invoke($db, @($second, 'ja', $null, $null))
         Assert-Equal $updated.Id $b.Id '再次导入相同来源只更新自己的词典'
@@ -2954,9 +2984,12 @@ function Test-SanseidoSummary([string]$Scratch, [Reflection.Assembly]$Assembly) 
             'お帰り' = '<font face="Arial"><b>おかえり</b></body2>■一■　(名)<br>帰ることの尊敬語。<br>■二■　(感)</font>'
             '似' = '<font face="Arial"><font color="#FF0000">【似】</font><br>(動詞「似る」の連用形から)<br>そのものに似ていることを表す。</font>'
             '形容' = '<font face="Arial"><font color="#FF0000">【形容】</font><br><br>(名)description；<br>another meaning</font>'
+            accelerator = '<font face="Arial"><b>アクセレレーター</b></body2><a href="entry://アクセル<font color="#008000">(1)</font>">アクセル<font color="#008000">(1)</font></a></font>'
+            aneurin = '<font face="Arial"><b>アノイリン</b></body2><a href="entry://ビタミン　B<sub>1</sub>">ビタミン　B<sub>1</sub></a></font>'
+            'そつ－なく' = '<font face="Arial">(連語)<br>ぬかりなく。要領よく。<br><a href="entry://そつ<font color="#008000">(1)</font>">そつ<font color="#008000">(1)</font></a></font>'
         }
         $expected = @('a.(車が)道路走行に適した.', '乗馬用の洋式の鞍。', '機能を備えたさま。', 'imbalance', '原文の一行目',
-            '帰ることの尊敬語。', 'そのものに似ていることを表す。', '(名)description')
+            '帰ることの尊敬語。', 'そのものに似ていることを表す。', '(名)description', 'アクセル(1)', 'ビタミン　B1', 'ぬかりなく。')
         Write-Mdx $mdx $words
         Invoke-Search @('import','sanseido',$mdx) | Out-Null
         $connection = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$env:E_SEARCH_DB")
@@ -2977,7 +3010,33 @@ function Test-SanseidoSummary([string]$Scratch, [Reflection.Assembly]$Assembly) 
                 Assert-Equal ($reader.CurrentBody($hit.Entry)) $words[$key] "三省堂详情原文 $key"
             }
         } finally { $reader.Dispose() }
-        Write-Output 'PASS 三省堂音标、声调、词性行与已有只读索引的释义'
+        if ($window = $Assembly.GetType('ESearch.SearchWindow')) {
+            $static=[Reflection.BindingFlags]'Static,NonPublic'
+            $plain=$window.GetMethod('FormatDetail',$static).Invoke($null,@($words.accelerator,$null,'sanseido'))
+            Assert-Equal ($plain.Text -split '\r?\n')[-1].EndsWith('アクセル(1)') $true '三省堂详情保留可见的义项号'
+            Assert-Equal ($plain.Text.Contains('">')) $false '三省堂详情不显示损坏属性的边界'
+            $key='esmissing-sanseido-'+('a'*64)
+            $bad='<a href="entry://'+$key+'"#008000">(1)</font>">アクセル<font color="#008000">(1)</font></a>'
+            $good='<a href="/page/lookup/'+$key+'">アクセル<font color="#008000">(1)</font></a>'
+            $other=$bad.Replace('entry://','/page/lookup/')
+            $html='<div class="es-source es-sanseido">'+$bad+'</div><div class="es-source es-oxford">'+$bad+'</div>'
+            $got=$window.GetMethod('RewriteMergedLinks',$static).Invoke($null,@($html,'/page'))
+            Assert-Equal $got ('<div class="es-source es-sanseido">'+$good+'</div><div class="es-source es-oxford">'+$other+'</div>') '仅在三省堂来源修复链接文字并保留实际目标'
+            $mismatch=('<div class="es-source es-sanseido">'+$bad+'</div>').Replace('アクセル<font color="#008000">(1)','アクセル<font color="#008000">(2)')
+            Assert-Equal ($window.GetMethod('RewriteMergedLinks',$static).Invoke($null,@($mismatch,'/page'))) ($mismatch.Replace('entry://','/page/lookup/')) '前后的义项号不同，不推断或移除残片'
+        }
+        # 按需词库的旧戳也可能把词性而非正文存进摘要，且无多余的引号可供检测。
+        Invoke-Search @('import-indexed','sanseido',$mdx) | Out-Null
+        $oldIndex = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$env:E_SEARCH_DB")
+        try {
+            $oldIndex.Open()
+            $cmd = $oldIndex.CreateCommand()
+            $cmd.CommandText = "UPDATE entries SET gloss='(連語)' WHERE head='そつ－なく'; UPDATE dictionary_metadata SET summary_stamp='ja-preview/1:'||revision WHERE id='sanseido'"
+            [void]$cmd.ExecuteNonQuery()
+        } finally { $oldIndex.Dispose() }
+        $oldPreview = Invoke-Search @('query','そつ－なく','sanseido')
+        Assert-Equal (($oldPreview -join '').Contains('ぬかりなく。')) $true '按需索引旧戳下的词性摘要也能刷新'
+        Write-Output 'PASS 三省堂音标、声调、词性、重复链接标记与已有只读索引的释义'
     } finally { $env:E_SEARCH_DB = $previous }
 }
 
@@ -3590,6 +3649,59 @@ function Test-HanyingReferences([string]$Scratch,[Reflection.Assembly]$Assembly)
     } finally {$env:E_SEARCH_DB=$previous}
 }
 
+function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
+    $flags = [Reflection.BindingFlags]'Static,NonPublic'
+    $format = [Lookup].GetMethod('Format',$flags)
+    $detail = $Assembly.GetType('ESearch.SearchWindow').GetMethod('FormatDetail',$flags)
+    # 样例来自实际词头和正文；同时覆盖同码异书、正常标点和原始索引身份。
+    foreach ($row in @(
+        @('shinseiki',"表現`u{E003}式",'表現様式'),
+        @('shinseiki',"Andr`u{E7B0}・vas`u{E7B0}ctomie",'André・vasectomie'),
+        @('shinseiki',"Jo`u{E567}o・Lule`u{E567}・Nairañjan`u{E567}",'João・Luleå・Nairañjanā'),
+        @('shinseiki',"Z`u{E564}topek・par`u{E564}digmatic relation",'Zátopek・paradigmatic relation'),
+        @('shinseiki',"Ju`u{E7AF}rez・Sudhan`u{E7AF}","Juárez・Sudhan`u{E7AF}"),
+        @('shinseiki',"未知語`u{E567}・未確認`u{E564}・未確認`u{E7AF}","未知語`u{E567}・未確認`u{E564}・未確認`u{E7AF}"),
+        @('shinseiki','市 ? 郡 ? 町 ? 村名','市 ∙ 郡 ∙ 町 ∙ 村名'),
+        @('shogakukan-zhja',"C`u{E117}I系统",'C³I系统'),
+        @('shogakukan-zhja',"`u{E11F}本,册",'『量』本,册'),
+        @('shogakukan-zhja',"欠qia`u{E7C8}合理",'欠qiàn合理'),
+        @('shogakukan-zhja',"碰壁pe`u{E7C8}gbì",'碰壁pèngbì'),
+        @('shogakukan-zhja',"嗯 `u{E7C8}gに同じ",'嗯 ǹgに同じ'),
+        @('sango','【瑞典 ?ngstr?m】','【瑞典 ångström】'),
+        @('oxford',"具有防`u{E40C}性质",'具有防卫性质'),
+        @('hanying',"1达因/厘米`u{2072}",'1达因/厘米²'),
+        @('hanying',"micromicrom （10⁻ⁱ`u{2072}米）",'micromicrom （10⁻¹²米）'),
+        @('hanying','xⁱ','xⁱ'),
+        @('shogakukan-zhja',"`u{E184}（鰤）shī",'𫚕（鰤）shī'),
+        @('eijiro',("death?" + ('　' * 72) + ' あなたのお父様'),'death? あなたのお父様'),
+        @('eijiro','value　　and　　unit','value　　and　　unit'),
+        @('other',"C`u{E117}I  ?　〓","C`u{E117}I  ?　〓"),
+        @('shinseiki','(?—1598)　⇒?','(?—1598)　⇒?')
+    )) {
+        $entry = [LookupEntry]::new($row[0],1,'zh',1,$row[1],$null,$row[1])
+        Assert-Equal ($format.Invoke($null,@($entry,'headword'))) $row[2] "词书摘要 $($row[0])"
+        Assert-Equal ($detail.Invoke($null,@("<b>$($row[1])</b>",$null,$row[0]))).Text $row[2] "词书详情 $($row[0])"
+        Assert-Equal $entry.Headword $row[1] '显示后原词头仍可用作查词键'
+    }
+    $html = '<h1>あら<!-- --></h1><div>东洋鲈鱼。&lt;!--例--&gt;</div>'
+    Assert-Equal ($detail.Invoke($null,@($html,$null,'shinseiki'))).Text ("あら" + [Environment]::NewLine + '东洋鲈鱼。<!--例-->') '新世纪隐藏模板注释，保留实体编码的示例'
+    $ipa = '<FONT face="Kingsoft Phonetic Plain, Tahoma" color=red>5Apl</FONT>'
+    Assert-Equal ($detail.Invoke($null,@("5Apl / $ipa /",$null,'oxford'))).Text '5Apl / ˈæpl /' '仅在牛津音标标签内转写'
+    Assert-Equal ($detail.Invoke($null,@($ipa,$null,'other'))).Text '5Apl' '其它来源保留同一拼写'
+    Assert-Equal ($detail.Invoke($null,@($ipa.Replace('5Apl','C++'),$null,'oxford'))).Text 'C++' '未识别的字体片段整体保留'
+    $label = 'Adam<FONT style="font-weight:normal">''</FONT>s apple'
+    $rawLink = '<a href="entry://' + $label + '">' + $label + '</a>'
+    Assert-Equal ($detail.Invoke($null,@($rawLink,$null,'oxford'))).Text "Adam's apple" '牛津误嵌进原 href 的撇号标记只显示一次'
+    $hashed = 'esmissing-oxford-cbc379a6a271353b888d0c37b264542e925bf595480ce7a1c31ef9fa83080cd7'
+    $brokenLink = '<a href="entry://' + $hashed + '"font-weight:normal">''</FONT>s apple">' + $label + '</a>'
+    $section = '<div class="es-source es-oxford">'
+    $rewrite = $Assembly.GetType('ESearch.SearchWindow').GetMethod('RewriteMergedLinks',$flags)
+    $path = '/page-1'
+    Assert-Equal ($rewrite.Invoke($null,@(($section + $brokenLink + '</div>'),$path))) ($section + '<a href="/page-1/lookup/' + $hashed + '">' + $label + '</a></div>') '旧合并页保留原跳转目标和可见撇号格式'
+    $mismatched = $section + $brokenLink.Replace('>Adam','>Eve') + '</div>'
+    Assert-Equal ($rewrite.Invoke($null,@($mismatched,$path))) ($mismatched.Replace('entry://','/page-1/lookup/')) '标签与原卷内目标哈希不符时不猜原链接'
+}
+
 function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly) {
     $previous=$env:E_SEARCH_DB
     $env:E_SEARCH_DB=Join-Path $Scratch 'phrase-anchor.db'
@@ -3623,8 +3735,8 @@ function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly
             Assert-Equal ($senseRange.Item1 -gt $raw.IndexOf('definition')) $true '重复译文锚点指向真实小节'
             # 将同一父正文经过窗口使用的文本转换，核对去标签、实体解码及换行后的高亮位置。
             $format=$Assembly.GetType('ESearch.SearchWindow').GetMethod('FormatDetail',[Reflection.BindingFlags]'Static,NonPublic')
-            $view=$format.Invoke($null,@($raw,$anchor))
-            Assert-Equal $view.Text ($format.Invoke($null,@($raw,$null))).Text '高亮不会删减父词条内容'
+            $view=$format.Invoke($null,@($raw,$anchor,'oxford'))
+            Assert-Equal $view.Text ($format.Invoke($null,@($raw,$null,'oxford'))).Text '高亮不会删减父词条内容'
             $titleRange=$view.Anchor.Title.GetOffsetAndLength($view.Text.Length)
             $senseRange=$view.Anchor.Sense.GetOffsetAndLength($view.Text.Length)
             Assert-Equal $view.Text.Substring($titleRange.Item1,$titleRange.Item2).Trim() 'run out (of sth)' '窗口标题高亮跨越嵌套标签'
@@ -3652,7 +3764,7 @@ function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly
                 $hit=$coat[$i]
                 Assert-Equal $hit.Term 'TOOK  my coat off' '还原后的义项保留原输入片段'
                 $raw=$reader.CurrentBody($hit.Entry)
-                $view=$format.Invoke($null,@($raw,$property.GetValue($hit.Entry)))
+                $view=$format.Invoke($null,@($raw,$property.GetValue($hit.Entry),'oxford'))
                 $titleRange=$view.Anchor.Title.GetOffsetAndLength($view.Text.Length)
                 $senseRange=$view.Anchor.Sense.GetOffsetAndLength($view.Text.Length)
                 Assert-Equal $view.Text.Substring($titleRange.Item1,$titleRange.Item2).Trim() $expectedTitles[$i] '选择不同义项时标题高亮随之切换'
@@ -6345,6 +6457,7 @@ if ($BackendTestDirectory -or $IndexedMdxTestDirectory) {
     Test-ReadingPreference $BackendTestDirectory $assembly
     Test-EnglishReferencePreview $BackendTestDirectory $assembly
     Test-SentencePhrases $BackendTestDirectory
+    Test-DictionaryDisplayText $assembly
     Test-PhraseDetailAnchor $BackendTestDirectory $assembly
     Test-HanyingReferences $BackendTestDirectory $assembly
     Test-LatinPunctuation $BackendTestDirectory

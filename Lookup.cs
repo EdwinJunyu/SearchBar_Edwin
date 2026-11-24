@@ -183,6 +183,9 @@ internal sealed class ReverseEncoder
 public sealed record LookupEntry(string DictionaryId, long EntryId, string Language, int Priority,
     string Headword, string? Reading, string Gloss)
 {
+    internal string DisplaySourceId { get; init; } = DictionaryId;
+    internal string DisplayHeadword => EntryParser.DisplayText(DisplaySourceId, Headword);
+    internal string DisplayGloss => EntryParser.DisplayText(DisplaySourceId, Gloss);
     public string? DictionaryName { get; init; }
     public string? DictionaryRevision { get; init; }
     internal string? ReverseSourceHash { get; init; }
@@ -354,8 +357,8 @@ public static partial class Lookup
             string gloss = Format(target, "headword");
             if (gloss.Length == 0 || Normalize(gloss) == Normalize(target.Headword) || ReferenceOf(target) != null) continue;
             var preview = hit.Entry.Reference?.Form is string form
-                ? $"{hit.Entry.Headword}（{target.Headword} 的{form}）· {gloss}"
-                : $"{hit.Entry.Headword} → {target.Headword} · {gloss}";
+                ? $"{hit.Entry.DisplayHeadword}（{target.DisplayHeadword} 的{form}）· {gloss}"
+                : $"{hit.Entry.DisplayHeadword} → {target.DisplayHeadword} · {gloss}";
             ranked[i] = hit with { Display = preview, HasReferencePreview = true };
         }
         return ranked;
@@ -448,7 +451,8 @@ public static partial class Lookup
                     if (entry.Language != phrase.Language) continue;
                     if (!phrase.WeakPotential && phrase.Language == "ja") resolvedJapanese.Add(phrase.Offset);
                     var head = phrase.Canonical ?? entry.Headword;
-                    var label = phrase.Surface == head ? phrase.Surface : $"{phrase.Surface} → {head}";
+                    var displayHead = EntryParser.DisplayText(entry.DisplaySourceId, head);
+                    var label = phrase.Surface == head ? displayHead : $"{phrase.Surface} → {displayHead}";
                     var hit = new LookupHit(entry, "phrase", phrase.Surface, $"{label} · {Format(entry, "headword")}") { SourceOffset = phrase.Offset };
                     // 同一位置同一标题只显示一次；句内另一处可分表达即使指向相同义项，也保留它自己的原文。
                     var identity = (entry.DictionaryId, entry.EntryId, entry.Anchor == null ? entry.Headword : head, entry.Anchor, Position(phrase));
@@ -699,7 +703,7 @@ public static partial class Lookup
             .Skip(1).Take(2).Select(hit =>
                 hit.Method != "headword" || hit.HasReferencePreview
                     ? hit.Display
-                    : $"{hit.Entry.Headword} · {hit.Display}").ToArray();
+                    : $"{hit.Entry.DisplayHeadword} · {hit.Display}").ToArray();
     }
 
     private static bool IsJapanese(LookupEntry entry) =>
@@ -713,7 +717,7 @@ public static partial class Lookup
 
     internal static string Format(LookupEntry entry, string method)
     {
-        string gloss = entry.Gloss.Trim();
+        string gloss = entry.DisplayGloss.Trim();
         int newline = gloss.AsSpan().IndexOfAny('\r', '\n');
         if (newline >= 0) gloss = gloss[..newline].TrimEnd();
         if (gloss.Length > 72)
@@ -722,9 +726,10 @@ public static partial class Lookup
             if (starts.Length > 72) gloss = gloss[..starts[71]] + "…";
         }
         if (!IsJapanese(entry))
-            return method == "deinflection" ? $"{entry.Headword} · {gloss}" : gloss;
-        var label = method == "headword" ? entry.Reading :
-            string.IsNullOrEmpty(entry.Reading) ? entry.Headword : $"{entry.Headword}（{entry.Reading}）";
+            return method == "deinflection" ? $"{entry.DisplayHeadword} · {gloss}" : gloss;
+        var reading = entry.Reading == null ? null : EntryParser.DisplayText(entry.DisplaySourceId, entry.Reading);
+        var label = method == "headword" ? reading :
+            string.IsNullOrEmpty(reading) ? entry.DisplayHeadword : $"{entry.DisplayHeadword}（{reading}）";
         return string.IsNullOrEmpty(label) ? gloss : $"{label} · {gloss}";
     }
 

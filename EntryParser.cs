@@ -10,6 +10,121 @@ internal static partial class EntryParser
 {
     private static readonly StringComparison IgnoreCase = StringComparison.OrdinalIgnoreCase;
 
+    // 牛津旧音标字体用 ASCII 表示重音、长音与 IPA 字形。仅列本书实际核对过的字符。
+    // 前半部分原样显示；后半部分按同一位置转为 Unicode。桌面纯文本和 WebView 共用此表。
+    private const string PhoneticPlain = "abdefhijklmnoprstuvwxz()- ";
+    internal const string KingsoftAlphabet = PhoneticPlain + "57:ABCEFNQTVW^";
+    internal const string KingsoftUnicode  = PhoneticPlain + "ˈˌːæɑɔəʃŋʌðʒθɡ";
+
+    [GeneratedRegex("""<font face="Kingsoft Phonetic Plain, Tahoma" (?:color=(?:red|#fb8c42|#0000ff)|style="font-weight:normal")>([^<>]+)</font>""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex OxfordPhoneticFont();
+
+    internal static string DecodeOxfordFont(string html) => OxfordPhoneticFont().Replace(html, match =>
+    {
+        var text = match.Groups[1].Value;
+        // 整个片段都符合旧音标表才转写，遇到未知符号或内嵌标签时保留原文。
+        if (text.AsSpan().IndexOfAnyExcept(KingsoftAlphabet) >= 0) return match.Value;
+        return string.Create(text.Length, text, (buffer, value) =>
+        {
+            for (int i = 0; i < value.Length; i++)
+                buffer[i] = KingsoftUnicode[KingsoftAlphabet.IndexOf(value[i])];
+        });
+    });
+
+    // 外字只在显示时按辞书解释。原始词头、正文、链接及用于高亮的物理坐标继续使用原编码。
+    // 同一私用码在不同词典可能代表完全不同的字，未列出的字符按原样显示。
+    private static readonly Dictionary<string, (string Before, string After)[]> DisplayRules = new(StringComparer.Ordinal)
+    {
+        // 现代汉英的单位表把上标 1/2/3 连续编码为 U+2071..2073。
+        // U+2071 本身是合法的上标 i，只在原书可核对的指数及氕的符号里恢复数字。
+        ["hanying"] = [("10ⁱ⁰⁰","10¹⁰⁰"), ("10⁻ⁱ\u2072","10⁻¹²"), ("10ⁱ\u2072","10¹²"),
+                       ("10⁻ⁱ\u2073","10⁻¹³"), ("10⁻ⁱ⁸","10⁻¹⁸"), ("10⁻ⁱ⁵","10⁻¹⁵"), ("(ⁱH)","(¹H)"),
+                       ("\u2072","²"), ("\u2073","³")],
+        // 仅这一组英日例句之间有 72 个全角填充空格；其它缩进和分隔符具有排版意义。
+        ["eijiro"] = [("death?" + new string('　',72) + " あなたのお父様","death? あなたのお父様")],
+        ["oxford"] = [("防\uE40C","防卫"), ("守\uE40C队员","守卫队员")],
+        ["sango"] = [("?ngstr?m","ångström"), ("se\uE570or","señor")],
+        ["shogakukan"] = [("\uE116","²"), ("\uE46E","→"), ("\uE7C8g","ǹg")],
+        // 小学馆中日的「外字（繁字）读音」与 Unihan 17 的双向唯一简繁对及读音对照。
+        // 只收录已知繁字、缺简字的方向；括注外字可能是同音异体，不能反向推断。
+        ["shogakukan-zhja"] = [
+            ("C\uE117I","C³I"), ("\uE11F","『量』"),
+            // #39909 和 #41519 把第四声写在韵尾；其余实例在 #16961，是独立成音节的 ǹ。
+            ("欠qia\uE7C8","欠qiàn"), ("碰壁pe\uE7C8gbì","碰壁pèngbì"), ("\uE7C8","ǹ"),
+            ("\uE184","𫚕"), ("\uE185","𮖁"), ("\uE18C","䁖"), ("\uE1A5","褝"),
+            ("\uE1A7","䥽"), ("\uE1AA","䇲"), ("\uE1B7","𢙐"), ("\uE1C2","䓖"),
+            ("\uE1DD","𡒄"), ("\uE1DE","㖞"), ("\uE1E0","𱇣"), ("\uE1E2","𪞝"),
+            ("\uE1EE","㭎"), ("\uE200","㖊"), ("\uE206","𫉁"), ("\uE20D","𫖔"),
+            ("\uE217","𮩛"), ("\uE218","𫗩"), ("\uE221","𥮾"), ("\uE222","䅟"),
+            ("\uE227","𬬮"), ("\uE228","𮧴"), ("\uE237","𫼝"), ("\uE238","𥬠"),
+            ("\uE23E","𬸅"), ("\uE242","𰃷"), ("\uE247","𪻐"), ("\uE248","𫓩"),
+            ("\uE24C","𫄤"), ("\uE24E","𰾒"), ("\uE253","䃅"), ("\uE257","𬟽"),
+            ("\uE258","𬍛"), ("\uE25B","𫶇"), ("\uE262","𮙋"), ("\uE267","𫰂"),
+            ("\uE276","𬮿"), ("\uE27A","㧏"), ("\uE289","䯄"), ("\uE28A","𮉨"),
+            ("\uE293","𬇹"), ("\uE29B","𭘓"), ("\uE29F","𤩽"), ("\uE2A4","𫗠"),
+            ("\uE2BA","𬣡"), ("\uE2BC","螀"), ("\uE2C4","𢀖"), ("\uE2CC","𫏋"),
+            ("\uE2D9","𫸩"), ("\uE2DD","㧟"), ("\uE2E3","𪨧"), ("\uE2EE","𫄥"),
+            ("\uE2F2","𫚈"), ("\uE2F3","𮔊"), ("\uE2F4","𮉧"), ("\uE2F5","𬧀"),
+            ("\uE2F6","䒿"), ("\uE2F9","𫢒"), ("\uE2FC","㑩"), ("\uE2FE","𪾦"),
+            ("\uE2FF","𮉡"), ("\uE306","𮣶"), ("\uE307","𫭢"), ("\uE309","𫌨"),
+            ("\uE30D","𫞩"), ("\uE322","𫍢"), ("\uE328","𥬞"), ("\uE32A","𮫂"),
+            ("\uE32B","𬪩"), ("\uE333","𰾎"), ("\uE34C","𬓫"), ("\uE35B","𢫬"),
+            ("\uE35D","𬈧"), ("\uE35F","𫮃"), ("\uE376","㳠"), ("\uE384","𬇘"),
+            ("\uE390","𬇕"), ("\uE391","𣲗"), ("\uE394","𬀩"), ("\uE395","𮧵"),
+            ("\uE3A1","𬯅"), ("\uE3A6","𤞤"), ("\uE3AF","𢽾"), ("\uE3BC","𬍤"),
+            ("\uE3BD","𬩽"), ("\uE3C1","𪩘"), ("\uE3C2","𪡋"), ("\uE3C3","𫛩"),
+            ("\uE3CA","𫖮"), ("\uE3CD","𱊄"), ("\uE3D1","𮙊"), ("\uE3D3","䓨"),
+            ("\uE3D7","𭤰"), ("\uE3DA","𬸚"), ("\uE3DF","𱌬"), ("\uE3E6","𫗞"),
+            ("\uE3E7","𬍙"), ("\uE3F3","𰧉"), ("\uE3FA","𬣞"), ("\uE3FD","䏝"),
+            ("\uE402","骔"), ("\uE418","𫣊"), ("\uE41A","㤽"), ("\uE41F","𫮅"),
+            ("\uE422","𪭢"), ("\uE429","𬉼")
+        ],
+        ["shinseiki"] = [
+            // 秋田等三个原表头保有 U+2219；生卒年、例句中的普通问号不参与替换。
+            ("市 ? 郡 ? 町 ? 村名","市 ∙ 郡 ∙ 町 ∙ 村名"),
+            // 法语 vasectomie 的元音无重音，须在本书常见的 é 字形前处理这个完整拼写。
+            ("vas\uE7B0ctomie","vasectomie"),
+            ("\uE003","様"), ("\uE578","ç"), ("\uE7B0","é"), ("\uE548","ł"), ("\uE568","ë"),
+            ("\uE56A","î"), ("\uE571","š"), ("\uE575","ž"), ("\uE56B","ï"), ("\uE560","å"),
+            ("\uE55D","œ"), ("\uE55E","ß"), ("\uE55Asop","Æsop"),
+            // 同为 E567，葡语 João、瑞典地名 Luleå 和梵语河名 Nairañjanā 各用不同元音。
+            ("Jo\uE567o","João"), ("Guimar\uE567es","Guimarães"), ("Gale\uE567o","Galeão"),
+            ("S\uE567o","São"), ("p\uE567o","pão"), ("sab\uE567o","sabão"), ("gib\uE567o","gibão"),
+            ("bai\uE567o","baião"), ("bot\uE567o","botão"), ("Uni\uE567o","União"),
+            ("Libertaç\uE567o","Libertação"), ("Lule\uE567","Luleå"), ("Nairañjan\uE567","Nairañjanā"),
+            // E564 亦见英语 paradigmatic；E7AF 在梵文中不能作为西班牙语重音处理。
+            ("par\uE564digmatic relation","paradigmatic relation"), ("Z\uE564topek","Zátopek"),
+            ("Němcov\uE564","Němcová"), ("Itz\uE564","Itzá"), ("Su\uE564rez","Suárez"),
+            ("M\uE564rquez","Márquez"), ("Guant\uE564namo","Guantánamo"), ("Gust\uE564v","Gustáv"),
+            ("Hus\uE564k","Husák"), ("Mari\uE564tegui","Mariátegui"), ("Juli\uE564n","Julián"),
+            ("Kod\uE564ly","Kodály"), ("Zolt\uE564n","Zoltán"), ("Luk\uE564cs","Lukács"),
+            ("L\uE564szló","László"), ("Moln\uE564r","Molnár"), ("Nicol\uE564s","Nicolás"),
+            ("S\uE564ndor","Sándor"), ("Incl\uE564n","Inclán"), ("Gonz\uE564lez","González"),
+            ("Ib\uE564ñez","Ibáñez"), ("s\uE564bado","sábado"), ("cs\uE564rd\uE564s","csárdás"),
+            ("ser\uE564","será"), ("m\uE564gico","mágico"), ("Gal\uE564pagos","Galápagos"),
+            ("Par\uE564","Pará"), ("Yucat\uE564n","Yucatán"), ("Ju\uE7AFrez","Juárez"),
+            ("J\uE7AFnos","János"), ("Konr\uE7AFd","Konrád"), ("Par\uE7AF","Pará"),
+            ("cha-cha-ch\uE7AF","cha-cha-chá"), ("moz\uE7AFrabe","mozárabe"), ("Prodan\uE7AF","Prodaná"),
+            ("Volc\uE7AFn","Volcán")
+        ]
+    };
+
+    internal static (string Before, string After)[] DisplayReplacements(string sourceId) =>
+        DisplayRules.TryGetValue(sourceId, out var rules) ? rules : [];
+
+    internal static string DisplayText(string sourceId, string value)
+    {
+        // 普通文本占绝大多数；只在出现该书已核对的标记时遍历规则。
+        if (!value.AsSpan().ContainsAnyInRange('\uE000','\uF8FF')
+            && !(sourceId == "hanying" && value.AsSpan().ContainsAny('ⁱ','\u2072','\u2073'))
+            && !(sourceId == "sango" && value.Contains("?ngstr?m", StringComparison.Ordinal))
+            && !(sourceId == "shinseiki" && value.Contains("市 ? 郡", StringComparison.Ordinal))
+            && !(sourceId == "eijiro" && value.Contains('　'))) return value;
+        foreach (var (before, after) in DisplayReplacements(sourceId))
+            value = value.Replace(before, after, StringComparison.Ordinal);
+        return value;
+    }
+
     public static ParsedEntry Parse(string sourceId, string key, string raw, string? language = null)
     {
         key = key.Trim();
@@ -540,7 +655,8 @@ internal static partial class EntryParser
 
     private static string? SanseidoSense(string body)
     {
-        var prefix = body[..Math.Min(body.Length, 2048)];
+        var original = body[..Math.Min(body.Length, 2048)];
+        var prefix = SanseidoLinkText(original);
         static string? ReadSense(string text)
         {
             var lines = Lines(text, 1536);
@@ -567,8 +683,34 @@ internal static partial class EntryParser
             var lineBreak = prefix.IndexOf("<br>", IgnoreCase);
             if (lineBreak >= 0) return ReadSense(prefix[(lineBreak + 4)..]);
         }
+        if (prefix.Length != original.Length)
+        {
+            // 部分参见条没有 </body2>，正文紧跟外文标题或「(連語)」。先读真实释义，
+            // 即使后面的交叉引用带绿色 (1)，也不把它当作词条自己的首义。
+            const string foreignEnd = "〗</font><br>";
+            int foreign = prefix.IndexOf(foreignEnd, StringComparison.Ordinal);
+            if (foreign is >= 0 and < 380) return ReadSense(prefix[(foreign + foreignEnd.Length)..]);
+            const string phrase = "<font face=\"Arial\">(連語)<br>";
+            if (prefix.StartsWith(phrase, StringComparison.Ordinal)) return ReadSense(prefix[phrase.Length..]);
+            if (original.StartsWith("<font face=\"Arial\"><a href=\"entry://", StringComparison.Ordinal)) return ReadSense(prefix);
+            int oldFirst = original.IndexOf(firstSense, StringComparison.Ordinal);
+            if (oldFirst is >= 0 and < 768)
+                foreach (Match link in SanseidoCopiedLink().Matches(original))
+                    if (oldFirst >= link.Index && oldFirst < link.Index + link.Length)
+                        return Plain(link.Groups["label"].Value);
+        }
         return null;
     }
+
+    // 三省堂会把同一段带标签的文字完整复制进 href；普通去标签会把最后的 "> 当成正文，
+    // 或把属性中的绿色 (1) 当成首义。仅在属性与可见文字逐字相同时取后者，保留原有标点。
+    internal static string SanseidoLinkText(string html) =>
+        html.Contains("<a href=\"entry://", StringComparison.Ordinal)
+            ? SanseidoCopiedLink().Replace(html, match => Tags().Replace(match.Groups["label"].Value, ""))
+            : html;
+
+    [GeneratedRegex("""<a href="entry://(?<label>(?=[^"<>]*<)(?:[^"<>]|<font color="#008000">[^"<>]*</font>|<i>[^"<>]*</i>|<sub>[^"<>]*</sub>)+)">\k<label></a>""")]
+    private static partial Regex SanseidoCopiedLink();
 
     private static ParsedEntry Shinseiki(string key, string body)
     {

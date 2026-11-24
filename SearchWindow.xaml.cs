@@ -1816,11 +1816,64 @@ public partial class SearchWindow : Window
         }
     }
 
+    // 只在第一次展开合并页时序列化静态码表。
+    private static readonly Lazy<string> MergedDisplayRulesJson = new(() => JsonSerializer.Serialize(
+        Source.All.Select(source => new { source.Id, Pairs = EntryParser.DisplayReplacements(source.Id) })
+            .Where(source => source.Id == "oxford" || source.Pairs.Length > 0).ToDictionary(source => source.Id,
+                source => source.Pairs.Select(pair => new[] { pair.Before, pair.After }))));
+
     private async Task WaitForMergedFrame(CoreWebView2 browser, string path, long request)
     {
-        // Source 在渲染器换页前就会更新。必须在浏览器内同时验证本页路径、正文与首次内容绘制。
-        string expected = JsonSerializer.Serialize(path);
-        string probe = $"location.pathname==={expected} && !!document.body?.hasChildNodes() && performance.getEntriesByName('first-contentful-paint').length>0";
+        // 浏览器完成 HTML 解析后才有所有来源分区；只在当前页已绘制、即将交给用户时处理一次。
+        string probe = $$"""
+            (() => {
+                if (location.pathname !== {{JsonSerializer.Serialize(path)}} || document.readyState === 'loading' ||
+                    !document.body?.hasChildNodes() || !performance.getEntriesByName('first-contentful-paint').length) return false;
+                const alphabet = {{JsonSerializer.Serialize(EntryParser.KingsoftAlphabet)}};
+                const unicode = {{JsonSerializer.Serialize(EntryParser.KingsoftUnicode)}};
+                for (const [source, pairs] of Object.entries({{MergedDisplayRulesJson.Value}})) {
+                    const sections = document.querySelectorAll('.es-source.es-' + source);
+                    if (!sections.length) continue;
+                    // 优先用私用字，其余取规则首字符；普通正文只需一次快速扫描。
+                    const hints = pairs.map(([before]) => (before.match(/[\uE000-\uF8FF]/)?.[0] ?? before[0]).charCodeAt(0));
+                    const candidates = new RegExp('[' + [...new Set(hints)].map(n => '\\u' + n.toString(16).padStart(4, '0')).join('') + ']');
+                    for (const section of sections) {
+                        // 合并器为共享的纯文本在标签前连续列出各来源锚点；不能以第一个来源解释整段。
+                        let shared = false;
+                        for (let a = section.firstElementChild; a?.matches('a[name]'); a = a.nextElementSibling) {
+                            const origin = /^es-(.+)-\d+$/.exec(a.name);
+                            if (origin && origin[1] !== source) { shared = true; break; }
+                        }
+                        if (shared) continue;
+                        if (source === 'oxford') {
+                            // 老字体用英文字母代画音标。整段均在已核对的码表内时才解码，混排和未知段保留。
+                            for (const font of section.querySelectorAll('font[face]')) {
+                                if (font.face.trim().toLowerCase() !== 'kingsoft phonetic plain, tahoma' ||
+                                    font.closest('.es-source') !== section || font.closest('[hidden],.es-label') ||
+                                    font.childNodes.length !== 1 || font.firstChild.nodeType !== Node.TEXT_NODE) continue;
+                                const node = font.firstChild;
+                                const letters = Array.from(node.data, ch => unicode[alphabet.indexOf(ch)]);
+                                if (letters.includes(undefined)) continue;
+                                node.data = letters.join('');
+                                font.style.fontFamily = '"Segoe UI", sans-serif';
+                            }
+                        }
+                        const walker = document.createTreeWalker(section, NodeFilter.SHOW_TEXT);
+                        for (let node; (node = walker.nextNode());) {
+                            let text = node.data;
+                            if (!candidates.test(text)) continue;
+                            for (const [before, after] of pairs) text = text.replaceAll(before, () => after);
+                            if (node.data === text) continue;
+                            // 只改所属词书的正文文字节点；保留标签、链接目标、锚点、样式和合并器生成的来源标签。
+                            const owner = node.parentElement;
+                            if (owner.closest('.es-source') === section && !owner.closest('style,script,template,noscript,[hidden],.es-label'))
+                                node.data = text;
+                        }
+                    }
+                }
+                return true;
+            })()
+            """;
         var elapsed = Stopwatch.StartNew();
         while (request == detailRevision && DetailsPanel.IsVisible)
         {
@@ -1843,12 +1896,50 @@ public partial class SearchWindow : Window
 
     private static string RewriteMergedLinks(string html, string documentPath)
     {
+        // 旧合并页已保存实际链接目标；恢复损坏的开标签，使浏览器只创建一个链接。
+        // 只有来源和绿色标签残片都能与可见标签对上，才能确认多出来的文字属于原 href。
+        if (html.Contains("\"#008000\">", StringComparison.Ordinal) || html.Contains("\"font-weight:", StringComparison.Ordinal) && html.Contains("entry://esmissing-oxford-", StringComparison.Ordinal))
+        {
+            const string boundary = "<div class=\"es-source ";
+            var sections = html.Split(boundary, StringSplitOptions.None);
+            for (int i = 1; i < sections.Length; i++)
+                if (sections[i].StartsWith("es-sanseido\">", StringComparison.Ordinal))
+                    sections[i] = SanseidoMergedLink().Replace(sections[i], m =>
+                        m.Groups["label"].Value.EndsWith("<font color=\"#008000\">" + m.Groups["tail"].Value, StringComparison.Ordinal)
+                            ? m.Groups["link"].Value + ">" + m.Groups["label"].Value + "</a>" : m.Value);
+                else if (sections[i].StartsWith("es-oxford\">", StringComparison.Ordinal))
+                    sections[i] = OxfordMergedLink().Replace(sections[i], m =>
+                    {
+                        // 合并器已将截断的 href 前缀替换为 SHA-256。可见标签必须同时匹配摘要和属性尾部。
+                        string label = m.Groups["label"].Value;
+                        int quote = label.IndexOf("\"font-weight:", StringComparison.Ordinal);
+                        if (!label.AsSpan(quote + 1).SequenceEqual(m.Groups["tail"].ValueSpan)) return m.Value;
+                        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(label[..quote]));
+                        return Convert.ToHexStringLower(hash) == m.Groups["hash"].Value
+                            ? m.Groups["link"].Value + ">" + label + "</a>" : m.Value;
+                    });
+            html = string.Join(boundary, sections);
+        }
         // 三类跨词条链接共享当前文档的版本前缀，包括按 E_Search 原书索引补充的落点。
         string body = Regex.Replace(html, @"(?i)(\bhref\s*=\s*[""'])entry://(?=es(?:ref|appref|missing)-)",
             "$1" + documentPath + "/lookup/");
         body = Regex.Replace(body, @"(?i)(\bhref\s*=\s*[""'])sound://(?:/)?(?=es/)", "$1" + documentPath + "/sound/");
         return Regex.Replace(body, @"(?i)(\bhref\s*=\s*[""'])entry://#", "$1#");
     }
+
+    [GeneratedRegex("""(?<link><a href="entry://es(?:missing|ref)-sanseido-[a-f0-9]{64}")#008000">(?<tail>[^"<>]*</font>(?:[^"<>]|<font color="#008000">[^"<>]*</font>)*)">(?<label>(?:[^"<>]|<font color="#008000">[^"<>]*</font>)+)</a>""")]
+    private static partial Regex SanseidoMergedLink();
+
+    // 原书只在这两种字体标记上把排版后的可见词头完整复制进 href。
+    private const string OxfordLinkFont = """(?:<FONT style="font-weight:normal">'</FONT>|<font style="font-weight:lighter">∙</font>)""";
+    private const string OxfordLinkRest = """(?:[^"<>\r\n]|""" + OxfordLinkFont + ")*";
+    private const string OxfordLinkLabel = """[^"<>\r\n]+""" + OxfordLinkFont + OxfordLinkRest;
+
+    [GeneratedRegex("""<a href="entry://(?<label>""" + OxfordLinkLabel + """)">\k<label></a>""")]
+    private static partial Regex OxfordCopiedLink();
+
+    [GeneratedRegex("""(?<link><a href="entry://esmissing-oxford-(?<hash>[a-f0-9]{64})")(?<tail>(?:font-weight:normal">'</FONT>|font-weight:lighter">∙</font>)""" + OxfordLinkRest + """)">(?<label>""" + OxfordLinkLabel + """)</a>""")]
+    private static partial Regex OxfordMergedLink();
 
     private const string SelectedPhraseId = "es-selected-phrase";
 
@@ -1882,13 +1973,26 @@ public partial class SearchWindow : Window
         return article with { Html = marked.ToString() };
     }
 
-    private static DetailBody FormatDetail(string raw, EntryAnchor? anchor)
+    private static DetailBody FormatDetail(string raw, EntryAnchor? anchor, string sourceId)
     {
         // 坐标分界均在完整标签之间，先分段解码再映射。实体、嵌套标签和重复文字都不靠文本搜索定位。
-        static string Decode(string html)
+        string Decode(string html)
         {
+            if (sourceId == "sanseido") html = EntryParser.SanseidoLinkText(html);
+            // 新世纪以空 HTML 注释隔开标题等字段。先去掉模板标记，实体转义的字面示例仍会保留。
+            if (sourceId == "shinseiki")
+            {
+                html = html.Replace("<!-- -->", "", StringComparison.Ordinal);
+                html = Regex.Replace(html, @"</h[1-6]\s*>", "\n", RegexOptions.IgnoreCase);
+            }
+            if (sourceId == "oxford")
+            {
+                if (html.Contains("<a href=\"entry://", StringComparison.Ordinal))
+                    html = OxfordCopiedLink().Replace(html, "${label}");
+                html = EntryParser.DecodeOxfordFont(html);
+            }
             var lines = Regex.Replace(html, @"<(?:br\b[^>]*|/p\s*|/div\s*|/li\s*|/tr\s*)>", "\n", RegexOptions.IgnoreCase);
-            return WebUtility.HtmlDecode(Regex.Replace(lines, @"</?[a-zA-Z][^>]*>", ""));
+            return EntryParser.DisplayText(sourceId, WebUtility.HtmlDecode(Regex.Replace(lines, @"</?[a-zA-Z][^>]*>", "")));
         }
         if (anchor == null)
         {
@@ -1982,7 +2086,7 @@ public partial class SearchWindow : Window
                 var raw = store.CurrentBody(chosen.Hit.Entry);
                 MarkDetail(request, "source");
                 if (raw == null) return (Found: false, Merged: (MergedArticle?)null, Preferred: (string?)null, LayoutError: (string?)null);
-                var body = FormatDetail(raw, chosen.Hit.Entry.Anchor);
+                var body = FormatDetail(raw, chosen.Hit.Entry.Anchor, chosen.Hit.Entry.DisplaySourceId);
                 MarkDetail(request, "formatted");
                 Dispatcher.InvokeAsync(() =>
                 {
@@ -2088,7 +2192,7 @@ public partial class SearchWindow : Window
     private sealed record Candidate(LookupHit Hit, int? Occurrence)
     {
         public string Label => (Occurrence is int n ? $"第 {n} 处 · {Hit.Term} → " : "") +
-            $"{Hit.Entry.Headword} · {Hit.Entry.DictionaryName ?? Hit.Entry.DictionaryId} · {Hit.Entry.Gloss}";
+            $"{Hit.Entry.DisplayHeadword} · {Hit.Entry.DictionaryName ?? Hit.Entry.DictionaryId} · {Hit.Entry.DisplayGloss}";
         // WPF 候选项的自动化名称也使用面向用户的标签，读屏时可直接辨认来源。
         public override string ToString() => Label;
     }

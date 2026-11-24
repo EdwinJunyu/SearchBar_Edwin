@@ -39,6 +39,7 @@ internal sealed class DictionaryStore : IDisposable
     // 摘要标记同时绑定提取格式和导入批次。
     private const string OxfordSummaryFormat = "oxford/1:";
     private const string JapaneseSummaryFormat = "ja-preview/1:";
+    private const string SanseidoSummaryFormat = "sanseido/2:";
 
     public DictionaryStore(string path, bool readOnly = false) : this(path, readOnly, pooling: true) { }
 
@@ -225,8 +226,6 @@ internal sealed class DictionaryStore : IDisposable
         input.Position = 0;
         // 在写事务内确定身份及优先级，避免两次并发导入同一路径时创建两个词库。
         using var tx = db.BeginTransaction();
-        static Source? SourceForFilename(string name) => Source.All.FirstOrDefault(s =>
-            name.Equals(Path.GetFileName(s.RelativePath), StringComparison.OrdinalIgnoreCase));
         var known = cliSource ?? SourceForFilename(filename);
         var dictionaries = ReadCatalog(tx);
         using var fromPath = Command("""
@@ -330,7 +329,8 @@ internal sealed class DictionaryStore : IDisposable
         metadata.Parameters.AddWithValue("$stamp", parserId switch
         {
             "oxford" => OxfordSummaryFormat + revision,
-            "sanseido" or "shogakukan" when indexed => JapaneseSummaryFormat + revision,
+            "sanseido" when indexed => SanseidoSummaryFormat + revision,
+            "shogakukan" when indexed => JapaneseSummaryFormat + revision,
             _ => (object)DBNull.Value
         });
         metadata.ExecuteNonQuery();
@@ -394,6 +394,9 @@ internal sealed class DictionaryStore : IDisposable
         tx.Commit();
         return new DictionaryInfo(id, filename, language, priority, count, hash, existing?.Enabled ?? true);
     }
+
+    private static Source? SourceForFilename(string name) => Source.All.FirstOrDefault(s =>
+        name.Equals(Path.GetFileName(s.RelativePath), StringComparison.OrdinalIgnoreCase));
 
     private static ParsedEntry ParseMdxEntry(string parserId, string head, string body, string language, bool indexed)
     {
@@ -744,7 +747,8 @@ internal sealed class DictionaryStore : IDisposable
         install.Parameters.AddWithValue("$stamp", source.Id switch
         {
             "oxford" => OxfordSummaryFormat + revision,
-            "sanseido" or "shogakukan" => JapaneseSummaryFormat + revision,
+            "sanseido" => SanseidoSummaryFormat + revision,
+            "shogakukan" => JapaneseSummaryFormat + revision,
             _ => (object)DBNull.Value
         });
         install.ExecuteNonQuery();
@@ -1201,8 +1205,9 @@ internal sealed class DictionaryStore : IDisposable
         // 非假名直接从 terms_lookup 出发，无需为了读音查询词典和正文。
         bool kana = Lookup.IsKana(key);
         string currentSummary = schema.IsCurrent ? "COALESCE(m.summary_stamp = ($summaryFormat || m.revision),0)" : "0";
-        string needsJapanesePrefix = schema.IsCurrent && (schema.HasMdxRecords || schema.HasMergedRanges)
-            ? $"AND ({schema.RangeColumn("record_start")} IS NULL OR NOT COALESCE(m.summary_stamp=('{JapaneseSummaryFormat}' || m.revision),0))" : "";
+        // 三省堂旧戳既可能保留属性残片，也可能只保留词性或词头。按来源版本刷新实际命中项。
+        string JapanesePrefix(string format) => schema.IsCurrent && (schema.HasMdxRecords || schema.HasMergedRanges)
+            ? $"AND ({schema.RangeColumn("record_start")} IS NULL OR NOT COALESCE(m.summary_stamp=('{format}' || m.revision),0))" : "";
         string physicalKeys = !reading && Lookup.HasLatinJoiner(key)
             ? $"IN (SELECT $key UNION ALL {LegacyLatinTerms("$key")})" : "=$key";
         string seed = kana ? $"""
@@ -1225,15 +1230,16 @@ internal sealed class DictionaryStore : IDisposable
                     AND (({(schema.HasRevision ? "m.revision IS NULL AND" : "")}
                         (e.reading IS NULL OR replace(replace(e.gloss,'・',''),'－','')=e.reading))
                         OR substr(e.gloss,-1)='〕' OR e.gloss GLOB '〈*〉' OR e.gloss GLOB '《*》')
-                    {needsJapanesePrefix} THEN substr(e.raw,1,4096) END,
+                    {JapanesePrefix(JapaneseSummaryFormat)} THEN substr(e.raw,1,4096) END,
                 CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
                     CASE WHEN d.id='oxford' OR d.filename=$oxfordName THEN 'oxford' END)='oxford'
                     AND {(phrasalSenses ? "1" : $"NOT ({currentSummary})")} THEN e.raw END,
                 CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
                     CASE WHEN d.id='sanseido' OR d.filename=$sanseidoName THEN 'sanseido' END)='sanseido'
-                    {needsJapanesePrefix} THEN substr(e.raw,1,2048) END
+                    {JapanesePrefix(SanseidoSummaryFormat)} THEN substr(e.raw,1,2048) END
                 ,CASE WHEN {hanyingParser} AND (instr(e.head,' ')>0 OR instr(e.head,'　')>0 OR instr(e.head,char(123))>0)
-                    THEN e.raw END, f.legacyChinese, {currentSummary}, d.sha256, {schema.RecordRange}
+                    THEN e.raw END, f.legacyChinese, {currentSummary}, d.sha256, {schema.RecordRange},
+                CASE WHEN d.filename LIKE '%.mdx' THEN {(schema.HasRevision ? "m.parser_id" : "NULL")} ELSE '' END
             FROM (SELECT dict,ordinal,aliasReading,0 AS legacyChinese FROM found
                 {(legacyChinese ? legacyCandidates : "")}) f
             -- 先取得少量命中，再按词典和序号读取正文，避免优化器反过来扫描全部 entries。
@@ -1264,7 +1270,11 @@ internal sealed class DictionaryStore : IDisposable
             // 旧索引可能把读音存成首义。只检查本次命中且符合旧版回退特征的正文前缀。
             var entry = new LookupEntry(r.GetString(0), r.GetInt64(1), r.GetString(2), r.GetInt32(3),
                 r.GetString(4), r.IsDBNull(5) ? null : r.GetString(5), r.GetString(6))
-                { DictionaryName = r.GetString(7), DictionaryRevision = r.GetString(8), HasIndexedMergedPage = !r.IsDBNull(18) };
+                {
+                    DictionaryName = r.GetString(7), DictionaryRevision = r.GetString(8), HasIndexedMergedPage = !r.IsDBNull(18),
+                    // 同一本书在不同目录导入可有独立 GUID；显示跟随已识别的原书版式。
+                    DisplaySourceId = r.IsDBNull(19) ? SourceForFilename(r.GetString(7))?.Id ?? r.GetString(0) : r.GetString(19)
+                };
             bool indexed = !r.IsDBNull(16);
             bool triedBody = false;
             string? managedBody = null;
@@ -1365,7 +1375,7 @@ internal sealed class DictionaryStore : IDisposable
                 if (entry == null) continue;
                 if (choices.Count == 0) best = cost;
                 else if (word.Length == 3 && cost == best) return []; // 短词首位并列，保留用户输入。
-                choices.Add(new(entry, "spelling", key, $"{entry.Headword} · {Lookup.Format(entry, "headword")}"));
+                choices.Add(new(entry, "spelling", key, $"{entry.DisplayHeadword} · {Lookup.Format(entry, "headword")}"));
                 if (choices.Count == 3) break;
             }
             return deadline?.ElapsedMilliseconds >= SpellingBudgetMilliseconds ? [] : choices;
@@ -1884,6 +1894,7 @@ internal sealed class DictionaryStore : IDisposable
                     var entry = new LookupEntry(book.Id,item.Ordinal,book.Language,book.Priority,item.Head,null,item.Gloss)
                     {
                         DictionaryName=book.Name, DictionaryRevision=book.Revision, HasIndexedMergedPage=item.Merged,
+                        DisplaySourceId=book.Language == "ja" ? "shinseiki" : "oxford",
                         ReverseSourceHash=book.Hash,
                         Anchor=new EntryAnchor(item.Span.Start..item.Span.Start,item.Span)
                     };
@@ -1896,10 +1907,10 @@ internal sealed class DictionaryStore : IDisposable
                         string? reading = EntryParser.Parse("shinseiki",item.Head,body,"ja").Reading;
                         entry = entry with { Headword = EntryParser.ShinseikiReverseHeadword(body,item.Head), Reading = reading };
                     }
-                    string label = entry.Headword;
-                    if (entry.Reading is { Length: > 0 } kana && Lookup.NormalizeReading(kana) != Lookup.NormalizeReading(label))
-                        label += $"（{kana}）";
-                    ranked.Add((score,new LookupHit(entry,"reverse",entry.Headword,$"{label} · {item.Gloss}")
+                    string label = entry.DisplayHeadword;
+                    if (entry.Reading is { Length: > 0 } kana && Lookup.NormalizeReading(kana) != Lookup.NormalizeReading(entry.Headword))
+                        label += $"（{EntryParser.DisplayText(entry.DisplaySourceId,kana)}）";
+                    ranked.Add((score,new LookupHit(entry,"reverse",entry.Headword,$"{label} · {entry.DisplayGloss}")
                         { UsedSemanticIndex = hasVectors }));
                 }
             }
