@@ -167,6 +167,12 @@
                         <TextBlock x:Name="EntryText" AutomationProperties.AutomationId="EntryText"
                                    TextWrapping="Wrap" FontSize="15" LineHeight="24" Padding="0,0,6,0"/>
                     </ScrollViewer>
+                    <StackPanel x:Name="MergedDetail" Visibility="Collapsed">
+                        <Button x:Name="MergedBack" Content="返回上一个词条" HorizontalAlignment="Left"
+                                Click="MergedBackClick" Visibility="Collapsed" Margin="0,4"/>
+                        <ContentControl x:Name="MergedWebHost" Height="215" Margin="0,6,0,0"
+                                        HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch"/>
+                    </StackPanel>
                 </StackPanel>
             </Border>
             <TextBlock x:Name="StatusText" AutomationProperties.AutomationId="StatusText"

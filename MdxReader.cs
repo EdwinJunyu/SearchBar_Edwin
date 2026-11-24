@@ -1,3 +1,4 @@
+#nullable enable
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
@@ -26,6 +27,21 @@ public static class MdxReader
         using var reader = OpenIndexed(path);
         foreach (Entry e in reader.Entries)
             yield return (e.Ordinal, e.Headword, reader.ReadImportBody(e.Start, e.End));
+    }
+
+    public static IEnumerable<(int Ordinal, string Headword, string Body)> ReadExact(string path)
+    {
+        using var reader = OpenIndexed(path);
+        foreach (var entry in reader.Entries)
+            yield return (entry.Ordinal, entry.Headword, reader.ReadImportExact(entry.Start, entry.End));
+    }
+
+    public static IEnumerable<(int Ordinal, string Key, ReadOnlyMemory<byte> Data)> ReadResources(string path)
+    {
+        using var file = File.OpenRead(path);
+        using var reader = ReadDirectory(file, Guid.NewGuid().ToString("N"), includeKeys: true, resource: true);
+        foreach (var entry in reader.Entries)
+            yield return (entry.Ordinal, entry.Headword, reader.ReadRange(entry.Start, entry.End, importing: true));
     }
 
     public static IndexedReader OpenIndexed(string path) => Open(path, null);
@@ -133,21 +149,22 @@ public static class MdxReader
         }
     }
 
-    private static IndexedReader ReadDirectory(FileStream file, string identity, bool includeKeys)
+    private static IndexedReader ReadDirectory(FileStream file, string identity, bool includeKeys, bool resource = false)
     {
         byte[] header = ReadBytes(file, Number(file, 4));
         uint headerSum = BinaryPrimitives.ReadUInt32LittleEndian(ReadBytes(file, 4));
         Require(Adler(header) == headerSum, "MDX 文件头校验失败。");
         var xml = XElement.Parse(Encoding.Unicode.GetString(header).TrimEnd('\0'));
+        Require(xml.Name.LocalName == (resource ? "Library_Data" : "Dictionary"), "MDX/MDD 文件类型不符。");
         string version = xml.Attribute("GeneratedByEngineVersion")?.Value ?? "";
         int width = version switch { "1.2" => 4, "2.0" => 8, _ => throw new InvalidDataException($"未支持的 MDX 版本 {version}。") };
         string encryption = xml.Attribute("Encrypted")?.Value ?? "0";
         Require(encryption is "No" or "0" || (width == 8 && encryption == "2"), "未支持的 MDX 加密模式。");
-        string charset = (xml.Attribute("Encoding")?.Value ?? "").ToUpperInvariant();
+        string charset = resource ? "UTF-16" : (xml.Attribute("Encoding")?.Value ?? "").ToUpperInvariant();
         Encoding encoding = charset switch
         {
-            "UTF-16" or "UTF-16LE" => Encoding.Unicode,
-            "UTF-8" => Encoding.UTF8,
+            "UTF-16" or "UTF-16LE" => new UnicodeEncoding(false, false, true),
+            "UTF-8" => new UTF8Encoding(false, true),
             _ => throw new InvalidDataException($"未支持的 MDX 编码 {charset}。")
         };
         byte[] descriptor = ReadBytes(file, width == 8 ? 40 : 16);
@@ -204,7 +221,7 @@ public static class MdxReader
 
     private static void ReadKeys(Stream file, int width, Encoding encoding, int blockCount, int count, byte[] keyIndex, List<Entry> keys)
     {
-        int unit = encoding == Encoding.Unicode ? 2 : 1;
+        int unit = encoding.CodePage == 1200 ? 2 : 1;
         using var index = new MemoryStream(keyIndex);
         for (int i = 0; i < blockCount; i++)
         {
@@ -288,14 +305,20 @@ public static class MdxReader
         private byte[] importBlock = [];
 
         // 一次导入只由一个枚举器顺读。同块可承载许多词条，即使它超过在线缓存预算，也只解压一次。
-        internal string ReadImportBody(long start, long end) => ReadRange(start, end, importing: true);
-        public string ReadBody(long start, long end) => ReadRange(start, end, importing: false);
+        internal string ReadImportBody(long start, long end) => encoding.GetString(ReadRange(start, end, true).Span).TrimEnd('\0');
+        internal string ReadImportExact(long start, long end) => ReadExactBody(start, end, importing: true);
+        internal string ReadExactBody(long start, long end, bool importing)
+        {
+            string body = encoding.GetString(ReadRange(start, end, importing).Span);
+            return body.EndsWith('\0') ? body[..^1] : body;
+        }
+        public string ReadBody(long start, long end) => encoding.GetString(ReadRange(start, end, false).Span).TrimEnd('\0');
 
-        private string ReadRange(long start, long end, bool importing)
+        internal ReadOnlyMemory<byte> ReadRange(long start, long end, bool importing)
         {
             ObjectDisposedException.ThrowIf(handle.IsClosed, this);
             Require(start >= 0 && start <= end && end <= total && end - start <= SizeLimit, "词条正文偏移或大小无效。");
-            if (start == end) return "";
+            if (start == end) return ReadOnlyMemory<byte>.Empty;
             // 取第一个块末端大于 start 的物理块。半开区间和零长度块均适用。
             int low = 0, high = blocks.Length;
             while (low < high)
@@ -313,13 +336,13 @@ public static class MdxReader
                 int skip = (int)(cursor - b.RawStart);
                 int take = (int)Math.Min(b.Plain - skip, end - cursor);
                 byte[] bytes = importing ? ImportBlock(low) : GetBlock(this, identity, low);
-                if (take == length) return encoding.GetString(bytes, skip, length).TrimEnd('\0');
+                if (take == length) return bytes.AsMemory(skip, length);
                 // UTF-8 多字节或 UTF-16 码元可能被块分开，完整拼回原始字节再解码。
                 combined ??= new byte[length];
                 Buffer.BlockCopy(bytes, skip, combined, (int)(cursor - start), take);
                 cursor += take;
             }
-            return encoding.GetString(combined!).TrimEnd('\0');
+            return combined!;
         }
 
         private byte[] ImportBlock(int number)
@@ -335,7 +358,7 @@ public static class MdxReader
             finally { DecodeSlots.Release(); }
         }
 
-        public byte[] ExportVerifiedDirectory(string sourceSha256)
+        public byte[] ExportVerifiedDirectory(string sourceSha256, CancellationToken token = default)
         {
             ObjectDisposedException.ThrowIf(handle.IsClosed, this);
             Require(blockHashes == null, "生成持久目录需要从原 MDX 解析块表。");
@@ -365,6 +388,7 @@ public static class MdxReader
             {
                 while (remaining > 0)
                 {
+                    token.ThrowIfCancellationRequested();
                     int take = (int)Math.Min(remaining, buffer.Length);
                     Span<byte> bytes = buffer.AsSpan(0, take);
                     ReadAt(offset, bytes);

@@ -13,7 +13,7 @@ if (args is ["--everything-worker", var parent] && int.TryParse(parent, out int 
     return ESearch.EverythingSearch.RunWorker(parentId);
 
 // WinExe 默认从托盘浮窗进入；独立的 net10.0 入口继续承载原命令行操作。
-if (args.Length == 0 || args[0] == "gui")
+if (args.Length == 0 || args[0] is "gui" or "gui-merged")
 {
     int result = 0;
     var ui = new Thread(() =>
@@ -21,9 +21,16 @@ if (args.Length == 0 || args[0] == "gui")
         try
         {
             string? id = args.Length > 1 ? args[1] : null;
-            if (args.Length > 2)
-                throw new ArgumentException("用法：gui [词典ID]");
-            RunDesktop(id);
+            if (args.Length != 0 && args[0] == "gui-merged")
+            {
+                string? group = args.Length > 2 ? args[2] : null;
+                if (id == null || !Path.IsPathFullyQualified(id) || !File.Exists(id) || args.Length > 3 ||
+                    group is not (null or "zh-en" or "zh-ja"))
+                    throw new ArgumentException("用法：gui-merged <已导入的独立数据库绝对路径> [zh-en|zh-ja]");
+                RunDesktop(group, Path.GetFullPath(id));
+            }
+            else if (args.Length <= 2) RunDesktop(id);
+            else throw new ArgumentException("用法：gui [词典ID]");
         }
         catch (Exception ex)
         {
@@ -37,11 +44,17 @@ if (args.Length == 0 || args[0] == "gui")
     return result;
 }
 
-static void RunDesktop(string? id)
+static void RunDesktop(string? id, string? mergedDatabase = null)
 {
     using var identity = WindowsIdentity.GetCurrent();
     using var process = System.Diagnostics.Process.GetCurrentProcess();
     string pipeName = $"E_Search.Desktop.{identity.User!.Value}.{process.SessionId}";
+    if (mergedDatabase != null)
+    {
+        // 同一独立库的再次打开转到其已有窗口；当前个人库继续在原实例中运行。
+        string hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(mergedDatabase.ToUpperInvariant())));
+        pipeName += ".Merged." + hash[..32];
+    }
     if (Environment.GetEnvironmentVariable("E_SEARCH_TEST_INSTANCE") is { Length: > 0 } scope)
     {
         // 同一轮验收的首次和后续启动共享独立的互斥量及管道，个人实例沿用原名。
@@ -61,10 +74,10 @@ static void RunDesktop(string? id)
     try
     {
         SQLitePCL.raw.SetProvider(new SQLitePCL.SQLite3Provider_winsqlite3());
-        string databasePath = FindDatabase();
+        string databasePath = mergedDatabase ?? FindDatabase();
         string? ResolveDictionary(string? requested)
         {
-            if (requested == null) return null;
+            if (requested is null or "zh-en" or "zh-ja") return requested;
             var source = Source.All.FirstOrDefault(s => s.Id == requested);
             if (source != null && (!source.Optional || !File.Exists(databasePath))) return requested;
             using var catalog = new DictionaryStore(databasePath, readOnly: File.Exists(databasePath));
@@ -163,7 +176,7 @@ static async Task ReceiveLaunchesAsync(string pipeName, Action<string?> activate
 
 #endif
 
-static string FindDatabase(bool readOnly = false)
+static string FindDatabase(bool readOnly = false, bool resolveOnly = false)
 {
     var configured = Environment.GetEnvironmentVariable("E_SEARCH_DB");
     if (!string.IsNullOrWhiteSpace(configured)) return Path.GetFullPath(configured);
@@ -180,7 +193,7 @@ static string FindDatabase(bool readOnly = false)
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
     string directory = Path.Combine(profile, "E_Search");
     string database = Path.Combine(directory, "dictionaries.db");
-    if (!hasSeed || File.Exists(database)) return database;
+    if (resolveOnly || !hasSeed || File.Exists(database)) return database;
     // 尚无个人副本时，查询可直接读取随包词库；首次写入才需要复制。
     if (readOnly) return seed;
     Directory.CreateDirectory(directory);
@@ -226,9 +239,12 @@ if (args is [] or ["help"] or ["--help"])
         import-indexed --language <ja|en|zh> <MDX路径>  按需读取自选词典
                                     搬迁或备份时请同时保留数据库及其同名 .sources 目录
         indexed-sources             列出当前数据库引用的 MDX 内容哈希
+        merged-resources            列出当前合并卷引用的 MDD 资源哈希
         compact                     整理现有数据库，回收重导后空闲的 SQLite 页
+        import-merged <双卷目录>     校验两个卷及其资源，原子导入独立库（可用 E_SEARCH_DB 指定）
+        article <卷ID> <原词头>      输出合并卷公开词头或辅助页的 HTML
         list                        查看词典标识、语言、条数、哈希与文件名
-        query <输入> [词典ID]        查询全部词库或限定一本
+        query <输入> [词典ID或卷ID]  查询全部词库、单一来源或 zh-en / zh-ja 卷
         entry <词典ID> <序号>        查看读音依据与 MDX 原始正文
         verify                      核对四本基础词典和已启用的扩展词典样本
         --version                   查看版本、构建标识和支持的词典（JSON）
@@ -252,6 +268,7 @@ try
         ?? throw new ArgumentException($"未知词典 {id}");
     string LookupId(DictionaryStore store, string id)
     {
+        if (id is "zh-en" or "zh-ja") return id;
         if (Source.All.FirstOrDefault(s => s.Id == id) is { } source) return store.InstalledId(source);
         if (store.ListDictionaries().Any(d => d.Id == id)) return id;
         throw new ArgumentException($"未知词典 {id}");
@@ -265,8 +282,28 @@ try
         }
         else store.Import(source, path);
     }
+    static string MergedDatabase()
+    {
+        string? explicitDb = Environment.GetEnvironmentVariable("E_SEARCH_DB");
+        return string.IsNullOrWhiteSpace(explicitDb) ? DictionaryStore.MergedDatabasePath(FindDatabase(resolveOnly: true)) : Path.GetFullPath(explicitDb);
+    }
     switch (args)
     {
+        case ["import-merged",var package]:
+        {
+            string path = MergedDatabase();
+            using var store = new DictionaryStore(path);
+            store.ImportMerged(package, (group, pages) => Console.Error.WriteLine($"{group} 已读词页 {pages:N0}"));
+            Console.WriteLine(path);
+            break;
+        }
+        case ["article",var group,var head]:
+        {
+            using var store = new DictionaryStore(MergedDatabase(), readOnly: true);
+            var article = store.MergedArticleByKey(group, head) ?? throw new InvalidOperationException("找不到卷内词条");
+            Console.WriteLine(article.Html);
+            break;
+        }
         case ["import" or "import-indexed",var root]:
         {
             using var store = new DictionaryStore(FindDatabase());
@@ -312,6 +349,10 @@ try
             using (var store = OpenReader())
                 foreach (var hash in store.IndexedHashes()) Console.WriteLine(hash);
             break;
+        case ["merged-resources"]:
+            using (var store = OpenReader())
+                foreach (var hash in store.MergedResourceHashes()) Console.WriteLine(hash);
+            break;
         case ["compact"]:
             if (!File.Exists(FindDatabase(readOnly: true))) throw new FileNotFoundException("没有可整理的词库。");
             using (var store = new DictionaryStore(FindDatabase())) store.Compact();
@@ -321,7 +362,9 @@ try
             break;
         case ["query",_] or ["query",_,_]:
         {
-            using var store = OpenReader();
+            // 未指定 E_SEARCH_DB 时，按卷查询与 import-merged、article 使用同一份独立库。
+            using var store = args.Length == 3 && args[2] is "zh-en" or "zh-ja"
+                ? new DictionaryStore(MergedDatabase(), readOnly: true) : OpenReader();
             var only=args.Length==3 ? LookupId(store,args[2]) : null;
             foreach(var hit in store.Search(args[1],only))
                 Console.WriteLine($"{hit.Entry.DictionaryId}:{hit.Entry.EntryId}\t{hit.Method}\t{hit.Term}\t{hit.Display}");
@@ -383,6 +426,7 @@ catch (Exception error)
 
 internal sealed record Source(string Id,string Language,int Priority,string RelativePath,bool Optional = false)
 {
+    public string MergeGroup => Id is "oxford" or "hanying" ? "zh-en" : "zh-ja";
     // 同级命中优先使用双语词典；三省堂还混有日语和英语释义。
     public static readonly Source[] All = [
         new("shogakukan","ja",1,"中日/[5《小学馆V2日汉辞典》.mdx"),

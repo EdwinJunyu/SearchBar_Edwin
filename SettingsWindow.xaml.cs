@@ -17,6 +17,7 @@ public partial class SettingsWindow : Window
     private string? preparedPath;
     private int previewVersion;
     private bool busy, ready, closed;
+    private CancellationTokenSource? currentOperation;
     internal bool HasPendingWrite { get; private set; }
     private const string NoReading = "不导入读音";
 
@@ -32,14 +33,14 @@ public partial class SettingsWindow : Window
         Width = Math.Min(Width, SystemParameters.WorkArea.Width);
         Height = Math.Min(Height, SystemParameters.WorkArea.Height);
         Loaded += Initialize;
-        Closed += (_, _) => { closed = true; ++previewVersion; };
+        Closed += (_, _) => { closed = true; ++previewVersion; currentOperation?.Cancel(); };
     }
 
     private sealed record CatalogRow(DictionaryInfo Book, int Position)
     {
         public string Filename => Book.Filename;
         public string State => Book.Enabled ? "已启用" : "已停用";
-        public string Summary => $"{LanguageName(Book.Language)} · {Book.Records:N0} 条";
+        public string Summary => $"{LanguageName(Book.Language)} · {Book.Records:N0} 条" + (Book.MissingSource ? " · 原档缺失" : "");
     }
 
     private sealed record Target(string Name, DictionaryInfo? Book);
@@ -108,6 +109,84 @@ public partial class SettingsWindow : Window
         MoveDownButton.IsEnabled = !busy && row != null && DictionaryList.SelectedIndex < DictionaryList.Items.Count - 1;
         ToggleEnabledButton.IsEnabled = !busy && row != null;
         ToggleEnabledButton.Content = row?.Book.Enabled == false ? "启用词典" : "停用词典";
+        RestoreSourceButton.Visibility = row?.Book.IndexedSource == true ? Visibility.Visible : Visibility.Collapsed;
+        RestoreSourceButton.IsEnabled = !busy;
+    }
+
+    private Action<string,long,long> TrackProgress(CancellationTokenSource operation, TextBlock status)
+    {
+        currentOperation = operation;
+        HasPendingWrite = true;
+        Busy(true);
+        bool importing = status == ImportStatus;
+        var cancel = importing ? CancelImportButton : CancelRestoreButton;
+        cancel.IsEnabled = true;
+        cancel.Visibility = Visibility.Visible;
+        ImportProgress.Visibility = importing ? Visibility.Visible : Visibility.Collapsed;
+        IProgress<(string Stage,long Done,long Total)> ui = new Progress<(string Stage,long Done,long Total)>(p => {
+            // 已排队的旧进度可能晚于导入结果回到 Dispatcher，不覆盖最终结果或新任务。
+            if (closed || currentOperation != operation || operation.IsCancellationRequested) return;
+            string message = p.Stage switch {
+                "hash" => "正在核对原档 SHA-256",
+                "source" => "正在保存并校验原档",
+                "publish" => "正在发布已验证的词典",
+                "entries" => $"正在建立索引 · {p.Done:N0} 条",
+                _ => $"正在导入 {p.Stage} · {p.Done:N0} 个词页"
+            };
+            bool measurable = p.Total > 0;
+            if (measurable) message += $" · {(double)p.Done/p.Total:P0}";
+            if (importing)
+            {
+                ImportProgress.IsIndeterminate = !measurable;
+                ImportProgress.Value = measurable ? Math.Clamp((double)p.Done/p.Total, 0, 1) : 0;
+            }
+            Message(status, message);
+        });
+        return (stage,done,total) => ui.Report((stage,done,total));
+    }
+
+    private void CancelOperation(object sender, RoutedEventArgs e)
+    {
+        if (currentOperation == null) return;
+        currentOperation.Cancel();
+        CancelImportButton.IsEnabled = CancelRestoreButton.IsEnabled = false;
+        Message(sender == CancelRestoreButton ? CatalogStatus : ImportStatus, "正在取消，等待当前操作退出…");
+    }
+
+    private void EndOperation()
+    {
+        currentOperation = null;
+        HasPendingWrite = false;
+        if (closed) return;
+        ImportProgress.Visibility = CancelImportButton.Visibility = CancelRestoreButton.Visibility = Visibility.Collapsed;
+        Busy(false);
+    }
+
+    private async void RestoreSource(object sender, RoutedEventArgs e)
+    {
+        if (busy || DictionaryList.SelectedItem is not CatalogRow { Book.IndexedSource: true } row) return;
+        var picker = new OpenFileDialog { CheckFileExists = true, Filter = "MDX 词典|*.mdx", Title = "选择与当前版本 SHA-256 匹配的原档" };
+        if (picker.ShowDialog(this) != true) return;
+        await RestoreFromPath(row, picker.FileName);
+    }
+
+    private async Task RestoreFromPath(CatalogRow row, string path)
+    {
+        using var operation = new CancellationTokenSource();
+        var report = TrackProgress(operation, CatalogStatus);
+        try
+        {
+            var books = await Task.Run(() => {
+                using var store = new DictionaryStore(databasePath);
+                store.RestoreIndexedSource(row.Book.Id, path, report, operation.Token);
+                return store.ListDictionaries();
+            });
+            onCatalogChanged();
+            if (!closed) { BindCatalog(books,row.Book.Id); Message(CatalogStatus, "原档已按 SHA-256 核对并恢复。"); }
+        }
+        catch (OperationCanceledException) { if (!closed) Message(CatalogStatus, "已取消恢复。"); }
+        catch (Exception ex) { if (!closed) Message(CatalogStatus, $"恢复失败。{ex.Message}", true); }
+        finally { EndOperation(); }
     }
 
     private void MoveUp(object sender, RoutedEventArgs e) => Move(-1);
@@ -169,6 +248,8 @@ public partial class SettingsWindow : Window
         sample = [];
         if (ImportButton == null) return;
         ImportButton.IsEnabled = false;
+        ImportButton.Content = "导入词库";
+        ImportTarget.IsEnabled = ImportLanguage.IsEnabled = true;
         TablePanel.Visibility = Visibility.Collapsed;
         PreviewGrid.ItemsSource = null;
         Message(ImportStatus, "");
@@ -212,8 +293,12 @@ public partial class SettingsWindow : Window
                 if (known != null) SelectLanguage(known.Language);
             }
             preparedPath = path;
+            bool merged = DictionaryStore.IsMergedVolume(path);
+            ImportTarget.IsEnabled = ImportLanguage.IsEnabled = !merged;
+            ImportButton.Content = merged ? "打开独立双卷词库" : "导入词库";
             ImportButton.IsEnabled = true;
-            Message(ImportStatus, rows.Count > 0 ? "请核对样例行和列映射，再导入词库。" : "已选择 MDX 文件，可以导入。");
+            Message(ImportStatus, merged ? "将校验同目录两卷，在独立词库中打开八本来源。" :
+                rows.Count > 0 ? "请核对样例行和列映射，再导入词库。" : "已选择 MDX 文件，可以导入。");
         }
         catch (Exception ex)
         {
@@ -302,15 +387,35 @@ public partial class SettingsWindow : Window
             mapping = new TableMapping(head, gloss, read, HasHeader.IsChecked == true) { PreviewRows = sample };
         }
 
-        Busy(true);
-        HasPendingWrite = true;
-        Message(ImportStatus, "正在导入词条并建立索引…");
+        using var operation = new CancellationTokenSource();
+        var report = TrackProgress(operation, ImportStatus);
+        Message(ImportStatus, "正在读取词典…");
         try
         {
+            if (DictionaryStore.IsMergedVolume(path))
+            {
+                string merged = DictionaryStore.MergedDatabasePath(databasePath);
+                await Task.Run(() =>
+                {
+                    using var store = new DictionaryStore(merged);
+                    store.ImportMergedWithProgress(Path.GetDirectoryName(path)!, report, operation.Token);
+                });
+                if (closed) return;
+                // 开发构建可由 dotnet E_Search.dll 承载，发布构建则直接由 apphost 启动。
+                var launch = new System.Diagnostics.ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false };
+                if (Path.GetFileNameWithoutExtension(launch.FileName).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+                    launch.ArgumentList.Add(typeof(SettingsWindow).Assembly.Location);
+                launch.ArgumentList.Add("gui-merged");
+                launch.ArgumentList.Add(merged);
+                launch.ArgumentList.Add(Path.GetFileName(path).Equals("E_search-zh-en.mdx", StringComparison.OrdinalIgnoreCase) ? "zh-en" : "zh-ja");
+                using var process = System.Diagnostics.Process.Start(launch);
+                Message(ImportStatus, "已打开独立双卷词库。");
+                return;
+            }
             var (book, books) = await Task.Run(() =>
             {
                 using var store = new DictionaryStore(databasePath);
-                var imported = store.ImportDictionary(path, language, mapping, target);
+                var imported = store.ImportDictionaryWithProgress(path, language, mapping, target, report, operation.Token);
                 return (imported, store.ListDictionaries());
             });
             onCatalogChanged();
@@ -320,12 +425,13 @@ public partial class SettingsWindow : Window
                 Message(ImportStatus, $"已导入 {book.Filename}，共 {book.Records:N0} 条。");
             }
         }
+        catch (OperationCanceledException) { if (!closed) Message(ImportStatus, "已取消导入，原词库仍可使用。"); }
         catch (Exception ex)
         {
             // 失败时仍停留在当前词表和映射，可直接改列后重试。
             if (!closed) Message(ImportStatus, $"导入失败。{ex.Message}", true);
         }
-        finally { HasPendingWrite = false; Busy(false); }
+        finally { EndOperation(); }
     }
 
     private void CaptureKey(object sender, KeyEventArgs e)

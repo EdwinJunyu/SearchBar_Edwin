@@ -8,6 +8,9 @@
     <DefaultItemExcludes>$(DefaultItemExcludes);.tools/**;.data/**</DefaultItemExcludes>
   </PropertyGroup>
   <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0-windows'">
+    <!-- 透明 WPF 浮窗的 WebView2 合成控件需要 Windows 10 1809 WinRT 投影。 -->
+    <TargetPlatformIdentifier>Windows</TargetPlatformIdentifier>
+    <TargetPlatformVersion>10.0.17763.0</TargetPlatformVersion>
     <OutputType>WinExe</OutputType>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
@@ -16,6 +19,10 @@
     <AppHostRelativeDotNet Condition="'$(SelfContained)' != 'true'">../../../../.tools/dotnet</AppHostRelativeDotNet>
   </PropertyGroup>
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0-windows'">
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3537.50" GeneratePathProperty="true" />
+    <Content Include="$(PkgMicrosoft_Web_WebView2)/LICENSE.txt;$(PkgMicrosoft_Web_WebView2)/NOTICE.txt"
+             Condition="'$(PkgMicrosoft_Web_WebView2)' != ''" Link="licenses/WebView2-%(Filename)%(Extension)"
+             CopyToPublishDirectory="PreserveNewest" />
     <Using Remove="System.Windows.Forms;System.Drawing" />
     <Using Include="System.IO" />
     <Content Include=".tools/everything/dll/Everything32.dll;.tools/everything/dll/Everything64.dll;.tools/everything/dll/EverythingARM64.dll"
@@ -31,11 +38,22 @@
           Condition="'$(DictionarySeed)' != '' and '$(TargetFramework)' == 'net10.0-windows'">
     <PropertyGroup>
       <_SeedPath>$([System.IO.Path]::GetFullPath('$(DictionarySeed)', '$(MSBuildProjectDirectory)'))</_SeedPath>
+      <_SeedDirectory>$([System.IO.Path]::GetDirectoryName('$(_SeedPath)'))</_SeedDirectory>
     </PropertyGroup>
     <Exec Command="&quot;$(NetCoreRoot)dotnet.exe&quot; &quot;$(TargetPath)&quot; indexed-sources"
           EnvironmentVariables="E_SEARCH_DB=$(_SeedPath)" ConsoleToMSBuild="true" StandardOutputImportance="Low">
       <Output TaskParameter="ConsoleOutput" ItemName="_SeedHashes"/>
     </Exec>
+    <Exec Command="&quot;$(NetCoreRoot)dotnet.exe&quot; &quot;$(TargetPath)&quot; merged-resources"
+          EnvironmentVariables="E_SEARCH_DB=$(_SeedPath)" ConsoleToMSBuild="true" StandardOutputImportance="Low">
+      <Output TaskParameter="ConsoleOutput" ItemName="_ResourceHashes"/>
+    </Exec>
+    <GetFileHash Files="@(_ResourceHashes->'$(_SeedDirectory)/merged-resources/%(Identity).mdd')" Algorithm="SHA256"
+                 Condition="'@(_ResourceHashes)' != ''">
+      <Output TaskParameter="Items" ItemName="_MergedSeedFiles"/>
+    </GetFileHash>
+    <Error Condition="'%(_MergedSeedFiles.Filename)' != '%(_MergedSeedFiles.FileHash)'"
+           Text="种子引用的 MDD 内容哈希不匹配：%(_MergedSeedFiles.Identity)"/>
     <GetFileHash Files="@(_SeedHashes->'$(_SeedPath).sources/%(Identity).mdx')" Algorithm="SHA256"
                  Condition="'@(_SeedHashes)' != ''">
       <Output TaskParameter="Items" ItemName="_IndexedSeedFiles"/>
@@ -44,6 +62,8 @@
            Text="种子引用的 MDX 内容哈希不匹配：%(_IndexedSeedFiles.Identity)"/>
     <ItemGroup>
       <ResolvedFileToPublish Include="@(_IndexedSeedFiles)" RelativePath="Data/dictionaries.db.sources/%(Filename)%(Extension)"
+                             CopyToPublishDirectory="PreserveNewest"/>
+      <ResolvedFileToPublish Include="@(_MergedSeedFiles)" RelativePath="Data/merged-resources/%(Filename)%(Extension)"
                              CopyToPublishDirectory="PreserveNewest"/>
     </ItemGroup>
   </Target>

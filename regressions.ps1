@@ -3,7 +3,10 @@ param([string] $RealDatabase, [switch] $Desktop, [switch] $FileDesktop, [string]
       [switch] $SettingsDesktop, [string] $MdxSample, [string] $GuiExecutable, [switch] $OutOfOrder, [switch] $RestartEngine,
       [ValidateSet('Files','Keyboard','ColdEdit','Tray')][string[]] $AcceptanceDesktop,
       [string] $BackendTestDirectory, [switch] $PrepareDesktop, [switch] $WindowDesktop, [switch] $FileActionsDesktop, [string] $FileFixtureRoot,
-      [string] $PackageSeed, [string] $VerifyReleaseZip, [string] $IndexedMdxTestDirectory, [string] $CompareIndexedDatabase)
+      [string] $PackageSeed, [string] $VerifyReleaseZip, [string] $IndexedMdxTestDirectory, [string] $CompareIndexedDatabase,
+      [string] $MergedTestDirectory, [switch] $MergedAudio, [string] $WpfRenderDirectory, [switch] $WpfRenderHost,
+      [ValidateSet('Warm','Cold','Image')] [string] $WpfRenderMode = 'Warm', [int] $WpfColdTrials = 20,
+      [string] $MergeSampleInventory, [string] $MergeAuditDirectory, [string] $MergedDatabase, [switch]$MergeAuditHost)
 $ErrorActionPreference = 'Stop'
 # 失败重导本身也是验收项，命令退出码由 Invoke-Search 明确检查。
 $PSNativeCommandUseErrorActionPreference = $false
@@ -34,17 +37,19 @@ function Get-ReleaseFingerprint($Hashes) {
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
 }
 
-function Get-IndexedSeedHashes([string]$Directory, [string]$Database) {
+function Get-IndexedSeedHashes([string]$Directory, [string]$Database, [switch]$Resources) {
     $previousDb = $env:E_SEARCH_DB
     try {
         $env:E_SEARCH_DB = $Database
         # WinExe 需显式接入管道，PowerShell 才会等待程序并收集标准输出。
-        $hashes = @(& (Join-Path $Directory 'E_Search.exe') indexed-sources | ForEach-Object { $_ })
-        if ($LASTEXITCODE -ne 0) { throw '无法读取种子所引用的 MDX 清单' }
+        $command = if ($Resources) { 'merged-resources' } else { 'indexed-sources' }
+        $hashes = @(& (Join-Path $Directory 'E_Search.exe') $command | ForEach-Object { $_ })
+        if ($LASTEXITCODE -ne 0) { throw "无法读取种子清单 $command" }
         foreach ($hash in $hashes) {
             if ($hash -cnotmatch '^[0-9A-F]{64}$') { throw "种子的 MDX 哈希无效：$hash" }
-            $source = Join-Path ($Database + '.sources') ($hash + '.mdx')
-            if ((Get-FileHash -LiteralPath $source).Hash -cne $hash) { throw "托管 MDX 内容校验失败：$hash" }
+            $source = if ($Resources) { Join-Path (Split-Path $Database) "merged-resources/$hash.mdd" }
+                else { Join-Path ($Database + '.sources') ($hash + '.mdx') }
+            if ((Get-FileHash -LiteralPath $source).Hash -cne $hash) { throw "辞书文件内容校验失败：$source" }
             $hash
         }
     } finally { $env:E_SEARCH_DB = $previousDb }
@@ -103,6 +108,10 @@ function Test-ReleaseZip([string]$Archive, [string]$Cache) {
             throw 'ZIP 的 MDX 与种子引用清单不一致'
         }
         $observed = Get-ReleaseEvidence $directory $seed
+        if ($manifest.ContainsKey('mergedResources') -and
+            ((@(Get-IndexedSeedHashes $directory $seed -Resources) -join ',') -cne ($manifest.mergedResources -join ','))) {
+            throw 'ZIP 内 MDD 与双卷种子不符'
+        }
         foreach ($field in $observed.Keys) {
             if ((ConvertTo-Json -Compress -InputObject $observed[$field]) -cne
                 (ConvertTo-Json -Compress -InputObject $manifest.verified[$field])) { throw "ZIP 内程序的 $field 与发布记录不一致" }
@@ -157,11 +166,12 @@ if ($PackageSeed -or $VerifyReleaseZip) {
         (Get-ReleaseFingerprint (Get-ReleaseSources)) -cne $fingerprint) { throw '构建时源码发生变化，请用当前工作区重新发布。' }
     $evidence = Get-ReleaseEvidence $directory $seed
     $indexedSources = @(Get-IndexedSeedHashes $directory $seed)
+    $mergedResources = @(Get-IndexedSeedHashes $directory $seed -Resources)
     if ($evidence.build -cne "$($evidence.version)+$tag") { throw '编译标识与本次源码不一致' }
     $manifest = [ordered]@{ baseCommit=$commit; sourceSha256=$fingerprint; sourceFiles=$hashes
         binaries=(Get-ReleaseBinaries $directory)
         seedSha256=(Get-FileHash -LiteralPath $seed).Hash
-        indexedSources=$indexedSources; verified=$evidence }
+        indexedSources=$indexedSources; mergedResources=$mergedResources; verified=$evidence }
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $directory 'release.json')
     $filename = "E_Search-$($evidence.version)-$($commit.Substring(0,7))-$($fingerprint.Substring(0,12))-win-x64.zip"
     $candidate = Join-Path $work $filename
@@ -188,6 +198,11 @@ if ($PackageSeed -or $VerifyReleaseZip) {
                 $file = Join-Path ($seed + '.sources') ($hash + '.mdx')
                 [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,
                     "E_Search-win-x64/Data/dictionaries.db.sources/$hash.mdx",[IO.Compression.CompressionLevel]::NoCompression)
+            }
+            foreach ($hash in $mergedResources) {
+                $file = Join-Path (Split-Path $seed) "merged-resources/$hash.mdd"
+                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,
+                    "E_Search-win-x64/Data/merged-resources/$hash.mdd",[IO.Compression.CompressionLevel]::NoCompression)
             }
         } finally { $zip.Dispose() }
     } finally { $source.Dispose() }
@@ -229,21 +244,21 @@ function Checksum([byte[]]$Bytes) {
 function Block([byte[]]$Bytes) {
     return ,([byte[]]((BigEndian 0) + (BigEndian (Checksum $Bytes)) + $Bytes))
 }
-function Write-Mdx([string]$Path, [Collections.IDictionary]$Entries) {
+function Write-Mdx([string]$Path, [Collections.IDictionary]$Entries, [switch]$Resource) {
     $blocks = [Collections.Generic.List[byte[]]]::new()
     $offsets = [Collections.Generic.List[int]]::new()
     $offset = 0
     foreach ($pair in $Entries.GetEnumerator()) {
-        $body = [Text.Encoding]::UTF8.GetBytes($pair.Value)
+        $body = if ($Resource) { ,([byte[]]$pair.Value) } else { ,([Text.Encoding]::UTF8.GetBytes($pair.Value)) }
         $offsets.Add($offset)
         $blocks.Add($body)
         $offset += $body.Length
     }
-    Write-MdxLayout $Path @($Entries.Keys) ($offsets.ToArray()) ($blocks.ToArray())
+    Write-MdxLayout $Path @($Entries.Keys) ($offsets.ToArray()) ($blocks.ToArray()) -Utf16:$Resource -Resource:$Resource
 }
 
 # 词头区间与压缩块边界独立；测试可以指定共享偏移及跨块的 UTF-8 字符。
-function Write-MdxLayout([string]$Path, [string[]]$Names, [int[]]$Offsets, [byte[][]]$Blocks, [switch]$Utf16) {
+function Write-MdxLayout([string]$Path, [string[]]$Names, [int[]]$Offsets, [byte[][]]$Blocks, [switch]$Utf16, [switch]$Resource) {
     $charset = if ($Utf16) { 'UTF-16' } else { 'UTF-8' }
     $encoding = [Text.Encoding]::GetEncoding($charset)
     $terminator = $encoding.GetBytes([string][char]0)
@@ -259,6 +274,7 @@ function Write-MdxLayout([string]$Path, [string[]]$Names, [int[]]$Offsets, [byte
         $records += $packed
     }
     $header = [Text.Encoding]::Unicode.GetBytes('<Dictionary GeneratedByEngineVersion="1.2" Encoding="{0}"/>' -f $charset)
+    if ($Resource) { $header = [Text.Encoding]::Unicode.GetBytes('<Library_Data GeneratedByEngineVersion="1.2" Encoding="UTF-16"/>') }
     $packedKeys = Block $keys
     $first = $encoding.GetBytes($Names[0])
     $last = $encoding.GetBytes($Names[-1])
@@ -569,8 +585,620 @@ function Test-IndexedMdx([string]$Directory, [Reflection.Assembly]$Assembly) {
         Test-IndexedLiveRepair $scratch $Assembly
         Test-IndexedReimportMode $scratch $Assembly
         Test-IndexedCompaction $scratch
+        Test-RestoreOpenSource $scratch $Assembly
+        Test-ImportRecovery $scratch $Assembly
+        Test-ImportInterruptions $scratch $Assembly
+        Test-ImportRecoverySettings $scratch $Assembly
+        Test-RetiredMdxSources $scratch $Assembly
+        Test-MdxArchiveJunctions $scratch $Assembly
     } finally { $env:E_SEARCH_DB = $originalDb }
     Write-Output 'PASS 索引导入、按块详情、换版及旧库兼容'
+}
+
+function Test-MergedAudioPlayback([string]$Database,[string]$UiDir) {
+    Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
+    foreach($name in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','Microsoft.Web.WebView2.Core','E_Search'){
+        $null=[Reflection.Assembly]::LoadFrom((Join-Path $UiDir "$name.dll"))
+    }
+    [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+    $arch=[Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
+    $loader=if(Test-Path -LiteralPath (Join-Path $UiDir 'WebView2Loader.dll')){$UiDir}else{Join-Path $UiDir "runtimes/win-$arch/native"}
+    [Microsoft.Web.WebView2.Core.CoreWebView2Environment]::SetLoaderDllFolderPath($loader)
+    $previousContext=[Threading.SynchronizationContext]::Current
+    $previousProfile=$env:WEBVIEW2_USER_DATA_FOLDER
+    $env:WEBVIEW2_USER_DATA_FOLDER=Join-Path ([IO.Path]::GetDirectoryName($Database)) 'audio-webview'
+    $w=[ESearch.SearchWindow]::new($Database,'zh-ja')
+    $dispatcher=$w.Dispatcher
+    try {
+        [Threading.SynchronizationContext]::SetSynchronizationContext([Windows.Threading.DispatcherSynchronizationContext]::new($dispatcher))
+        function Pump-Audio {
+            $frame=[Windows.Threading.DispatcherFrame]::new()
+            $null=$dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background,[Action]{$frame.Continue=$false})
+            [Windows.Threading.Dispatcher]::PushFrame($frame)
+            Start-Sleep -Milliseconds 5
+        }
+        function Wait-Audio([scriptblock]$Check,[string]$Scenario) {
+            $timer=[Diagnostics.Stopwatch]::StartNew()
+            while(!(& $Check)){
+                if($timer.Elapsed.TotalSeconds -gt 20){throw "音频验收超时：$Scenario。$($w.FindName('StatusText').Text)"}
+                Pump-Audio
+            }
+        }
+        function Read-AudioDom([string]$Script) {
+            $task=$browser.ExecuteScriptAsync($Script)
+            Wait-Audio {$task.IsCompleted} '读取音频状态'
+            ConvertFrom-Json -InputObject $task.GetAwaiter().GetResult() -NoEnumerate
+        }
+        $w.ShowActivated=$false
+        $w.ShowInTaskbar=$false
+        $w.Show()
+        $w.FindName('QueryBox').Text='test'
+        Wait-Audio { $w.FindName('CandidatePicker').Items.Count -gt 0 } '显示测试词条'
+        $w.FindName('DetailsButton').RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+        Wait-Audio { $w.FindName('MergedWebHost').Content.CoreWebView2 } '创建词条 WebView2'
+        $browser=$w.FindName('MergedWebHost').Content.CoreWebView2
+        $browser.IsMuted=$true
+        Wait-Audio { (Read-AudioDom "document.getElementById('native-audio')?.readyState >= 1") } '原生 audio 解码 WAV 元数据'
+        Assert-Equal (Read-AudioDom "document.getElementById('native-audio').duration") 1 'MDD 实际 WAV 播放时长一秒'
+        $native=Read-AudioDom "document.getElementById('native-audio').currentSrc"
+        Assert-Equal $native 'https://dictionary.invalid/es/shinseiki/voices/sample%20voice.wav' '原生音频来自当前 MDD 的虚拟来源'
+        $link=Read-AudioDom "document.getElementById('sound-link').href"
+        Assert-Equal ($link.StartsWith('https://dictionary.invalid/')) $true 'sound 点击绑定在当前词典虚拟来源'
+        function Click-AudioLink([string]$Id) {
+            $point=Read-AudioDom "(()=>{const a=document.getElementById('$Id');a.scrollIntoView();const r=a.getBoundingClientRect();return [r.x+r.width/2,r.y+r.height/2]})()"
+            foreach($type in 'mousePressed','mouseReleased'){
+                $argsJson=ConvertTo-Json -Compress -InputObject @{type=$type;x=$point[0];y=$point[1];button='left';clickCount=1}
+                $task=$browser.CallDevToolsProtocolMethodAsync('Input.dispatchMouseEvent',$argsJson)
+                Wait-Audio {$task.IsCompleted} '向 WebView2 发送用户点击'
+                $null=$task.GetAwaiter().GetResult()
+            }
+        }
+        Click-AudioLink 'sound-link'
+        Wait-Audio { (Read-AudioDom "Array.from(document.querySelectorAll('audio')).some(a=>a.id!=='native-audio' && a.readyState>=1 && a.duration===1)") } 'sound 点击后音频元数据'
+        Assert-Equal (Read-AudioDom "new URL(Array.from(document.querySelectorAll('audio')).find(a=>a.id!=='native-audio').currentSrc).pathname") ([uri]$native).AbsolutePath 'sound:// 与原生控件解码同一包内资源'
+        Wait-Audio { (Read-AudioDom "Array.from(document.querySelectorAll('audio')).some(a=>a.id!=='native-audio' && (a.currentTime>0 || a.ended))") } 'sound 点击后真实播放时间前进'
+        $page=Read-AudioDom 'location.href'
+        foreach($id in 'missing-sound','external-link','file-link'){
+            Click-AudioLink $id
+            Pump-Audio
+            Assert-Equal (Read-AudioDom 'location.href') $page '未提供的包内音频、外部与文件链接不得离开本页'
+            Assert-Equal (Read-AudioDom "new URL(document.querySelector('audio[data-esearch-sound]').currentSrc).pathname") ([uri]$native).AbsolutePath '拒绝的链接不能改变播放器来源'
+        }
+        Assert-Equal (Read-AudioDom "document.querySelector('audio[data-esearch-sound]').getAttribute('src').endsWith('?voice=1#t=0.125')") $true '保留词书的查询和媒体时间片段'
+        $null=Read-AudioDom "(()=>{let a=document.querySelector('audio[data-esearch-sound]');a.loop=true;a.play();return true})()"
+        Wait-Audio { (Read-AudioDom "!document.querySelector('audio[data-esearch-sound]').paused") } '收起前确实正在循环播放'
+        $w.FindName('DetailsButton').RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+        Wait-Audio { (Read-AudioDom "!document.querySelector('audio[data-esearch-sound]') && Array.from(document.querySelectorAll('audio')).every(a=>a.paused)") } '收起详情会暂停媒体并释放链接播放器'
+        Write-Output 'PASS 真实 WebView2 原生 audio 与 sound:// 点击均解码 1.000 秒 WAV；保留媒体片段，播放时钟前进，收起后停止，外部与文件链接被阻止'
+    } finally {
+        $w.GetType().GetField('exiting',[Reflection.BindingFlags]'Instance,NonPublic').SetValue($w,$true)
+        $w.Close()
+        [Threading.SynchronizationContext]::SetSynchronizationContext($previousContext)
+        $env:WEBVIEW2_USER_DATA_FOLDER=$previousProfile
+    }
+}
+
+function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, [switch]$Audio) {
+    $dir = [IO.Directory]::CreateDirectory((Join-Path $Directory ([guid]::NewGuid().ToString('N')))).FullName
+    $previous = $env:E_SEARCH_DB
+    try {
+        $env:E_SEARCH_DB = Join-Path $dir 'isolated.db'
+        $en = Join-Path $dir 'E_search-zh-en.mdx'
+        $ja = Join-Path $dir 'E_search-zh-ja.mdx'
+        $mdd = Join-Path $dir 'E_search-zh-ja.mdd'
+        $sources = [ordered]@{oxford=1; hanying=1; shogakukan=2; sanseido=1; shinseiki=1; sango=1; eijiro=1; 'shogakukan-zhja'=1}
+        function Article($rows, [string]$html) {
+            $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $rows -Compress -Depth 4))
+            "<!--ESMERGE1:$([Convert]::ToBase64String($bytes))-->$html"
+        }
+        $enRows = @(@('oxford',1,'sample','中文'), @('hanying',1,'sample','英文'))
+        Write-Mdx $en ([ordered]@{sample=(Article $enRows '<p>两份原文</p>'); 'helper'='<!--ESHELP1--><p>指定来源</p>'})
+        $jaRows = @(@('shogakukan',1,'test','たべる<br>【食べる】<br>吃'), @('sanseido',1,'test','食べる'), @('shinseiki',1,'test','食べる'),
+            @('sango',1,'test','食べる'), @('eijiro',1,'test','<br>日语释义'), @('shogakukan-zhja',1,'test','<br>訳'))
+        $appTarget = 'esappref-shinseiki-' + ('a' * 64)
+        $appLink = '<a href="entry://' + $appTarget + '">E_Search 补充跳转</a>'
+        $sampleAudio = '<p>主书及补充</p><audio id="native-audio" controls preload="metadata" src="es/shinseiki/voices/sample%20voice.wav"></audio><a id="sound-link" href="sound://es/shinseiki/voices/sample%20voice.wav?voice=1#t=0.125">发音</a><a id="missing-sound" href="sound://es/shinseiki/missing.wav">缺失</a><a id="external-link" href="https://media.invalid/missing.wav">外部</a><a id="file-link" href="file:///C:/unavailable-test.wav">文件</a>'
+        $japanesePages = [ordered]@{test=(Article $jaRows $sampleAudio); alias=(Article (,@('shogakukan',2,'alias','@@@LINK=test')) $appLink)}
+        $japanesePages[$appTarget] = '<!--ESHELP1--><p>新世纪的实体补救候选</p>'
+        Write-Mdx $ja $japanesePages
+        $manifest = [ordered]@{format=1; files=[ordered]@{'E_search-zh-en.mdx'=(Get-FileHash -LiteralPath $en).Hash; 'E_search-zh-ja.mdx'=(Get-FileHash -LiteralPath $ja).Hash}; sources=$sources}
+        $manifestFile = Join-Path $dir 'E_search-merge.json'
+        $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestFile -Encoding utf8
+        Invoke-Search @('import-merged',$dir) 1 | Out-Null
+        # 8 kHz、8 位单声道静音 PCM，一秒；浏览器从归档解码，测试无须音响设备。
+        $pcm=[byte[]]::new(8000)
+        [Array]::Fill[byte]($pcm,128)
+        $wave=[IO.MemoryStream]::new()
+        $writer=[IO.BinaryWriter]::new($wave)
+        try {
+            $writer.Write([Text.Encoding]::ASCII.GetBytes('RIFF')); $writer.Write([int](36+$pcm.Length))
+            $writer.Write([Text.Encoding]::ASCII.GetBytes('WAVEfmt ')); $writer.Write([int]16)
+            $writer.Write([int16]1); $writer.Write([int16]1); $writer.Write([int]8000); $writer.Write([int]8000)
+            $writer.Write([int16]1); $writer.Write([int16]8); $writer.Write([Text.Encoding]::ASCII.GetBytes('data'))
+            $writer.Write([int]$pcm.Length); $writer.Write($pcm)
+            $audioBytes=$wave.ToArray()
+        } finally {$writer.Dispose()}
+        Write-Mdx $mdd ([ordered]@{'\es\shinseiki\sample.bin'=[byte[]](0,255,17); '\es\shinseiki\voices\sample voice.wav'=$audioBytes}) -Resource
+        $manifest.files['E_search-zh-ja.mdd'] = (Get-FileHash -LiteralPath $mdd).Hash
+        $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestFile -Encoding utf8
+        Invoke-Search @('import-merged',$dir) | Out-Null
+        if ($Audio) { Test-MergedAudioPlayback $env:E_SEARCH_DB (Join-Path $PSScriptRoot 'bin/Release/net10.0-windows') }
+        $volumes = @(Get-ChildItem -LiteralPath ($env:E_SEARCH_DB + '.sources') -Filter '*.mdx' -File)
+        Assert-Equal $volumes.Count 2 '双卷完整正文按需从两份托管 MDX 打开'
+        Assert-Equal (@(Invoke-Search @('merged-resources')) -join '|') (Get-FileHash -LiteralPath $mdd).Hash '发布只收录活动卷引用的 MDD'
+        # 同版重导须修复托管资源；源包仍保持完整，用它模拟用户重新指定已验证副本。
+        $managedArchive = Join-Path $dir ("merged-resources/" + $manifest.files['E_search-zh-ja.mdd'] + ".mdd")
+        [IO.File]::WriteAllBytes($managedArchive,[byte[]](17,23,31))
+        Invoke-Search @('import-merged',$dir) | Out-Null
+        Assert-Equal (Get-FileHash -LiteralPath $managedArchive).Hash $manifest.files['E_search-zh-ja.mdd'] '同版重导修复受损 MDD'
+        Assert-Equal @(Get-ChildItem -LiteralPath (Join-Path $dir 'merged-resources/staging') -Filter '*.damaged').Count 1 '被替换的 MDD 可供复查'
+        Assert-Equal (@(Invoke-Search @('entry','hanying','1'))[-1] -ceq '英文') $true '按来源序号还原同页第二条独立正文'
+        Assert-Equal @(Invoke-Search @('list')).Count 8 '双卷导入还原八个检索域'
+        Assert-Equal @(Invoke-Search @('query','sample','zh-en')).Count 2 '中英卷内保留两个来源命中'
+        Assert-Equal @(Invoke-Search @('query','sample','zh-ja')).Count 0 '日语卷不混入中英卷命中'
+        Assert-Equal @(Invoke-Search @('query','helper','zh-en')).Count 0 '来源专用辅助页不作为公开搜索结果'
+        $hit = @(Invoke-Search @('query','alias','shogakukan')) -join ' '
+        Assert-Equal ($hit -like '*shogakukan:1*') $true '重定向留在原书内'
+        Assert-Equal (@(Invoke-Search @('query','taberu','shogakukan')) -join ' ' -like '*食べる*') $true '保留日语来源的罗马字读音'
+        Assert-Equal (@(Invoke-Search @('article','zh-en','sample')) -join ' ') '<p>两份原文</p>' '公开页正文移除内嵌清单'
+        Assert-Equal (@(Invoke-Search @('article','zh-en','helper')) -join ' ') '<p>指定来源</p>' '辅助页可按卷内精确键打开'
+        if ($Assembly) {
+            # 使用实际详情窗的 URL 改写入口，再用改写后的卷内键读取合成原生实体补救页。
+            $rewrite = $Assembly.GetType('ESearch.SearchWindow',$true).GetMethod('RewriteMergedLinks',[Reflection.BindingFlags]'Static,NonPublic')
+            Assert-Equal ($null -ne $rewrite) $true '详情窗包含同源补充跳转绑定'
+            $sourceHtml = @(Invoke-Search @('article','zh-ja','alias')) -join ' '
+            $navigation = $rewrite.Invoke($null,@($sourceHtml,'/page-2'))
+            $url = [regex]::Match($navigation,'href="([^"]+)"').Groups[1].Value
+            Assert-Equal $url ("/page-2/lookup/" + $appTarget) 'E_Search 实体补救链接改写为该文档的内部路径'
+            $target = [Uri]::UnescapeDataString($url.Substring('/page-2/lookup/'.Length))
+            Assert-Equal (@(Invoke-Search @('article','zh-ja',$target)) -join ' ') '<p>新世纪的实体补救候选</p>' '从真实路由目标取回所属卷的补充富文本'
+            # 复制数据库和内容寻址的 MDD，验证旧绝对路径及新相对路径都只定位到搬家后的同级缓存。
+            $moved = [IO.Directory]::CreateDirectory((Join-Path $dir 'relocated')).FullName
+            $cache = [IO.Directory]::CreateDirectory((Join-Path $moved 'merged-resources')).FullName
+            $name = $manifest.files['E_search-zh-ja.mdd'].ToUpperInvariant()+'.mdd'
+            $originalArchive = Join-Path (Join-Path $dir 'merged-resources') $name
+            $movedArchive = Join-Path $cache $name
+            [IO.File]::Copy($originalArchive,$movedArchive)
+            $movedDb = Join-Path $moved 'isolated.db'
+            [IO.File]::Copy($env:E_SEARCH_DB,$movedDb)
+            Copy-Item -LiteralPath ($env:E_SEARCH_DB + '.sources') -Destination ($movedDb + '.sources') -Recurse
+            $store = $Assembly.GetType('DictionaryStore',$true).GetConstructor([type[]]@([string],[bool])).Invoke([object[]]@([string]$movedDb,$false))
+            try {
+                $connection = $store.GetType().GetField('db',[Reflection.BindingFlags]'Instance,NonPublic').GetValue($store)
+                $budget = [MdxReader]::CacheBudgetBytes
+                try {
+                    [MdxReader]::CacheBudgetBytes = 0
+                    $before = [MdxReader]::CacheStats.DecodedBlocks
+                    Assert-Equal $store.Search('test','sanseido').Count 1 '三省堂用已存首义显示列表'
+                    Assert-Equal ([MdxReader]::CacheStats.DecodedBlocks) $before '三省堂列表无须解压合并页'
+                } finally { [MdxReader]::CacheBudgetBytes = $budget }
+                $check = $connection.CreateCommand()
+                $check.CommandText = 'SELECT (SELECT sum(length(raw)) FROM entries) + (SELECT sum(length(html)) FROM merged_articles)'
+                Assert-Equal $check.ExecuteScalar() 0 '双卷索引不再存储来源正文和合并页 HTML 副本'
+                $check.CommandText = "SELECT resource FROM merged_volumes WHERE volume='zh-ja'"
+                Assert-Equal ([IO.Path]::IsPathFullyQualified([string]$check.ExecuteScalar())) $false '新索引保存相对资源路径'
+                Assert-Equal $store.MergedArticleByKey('zh-ja','test').ResourceArchive $movedArchive '双卷移动后使用同级 MDD'
+                $check.CommandText = 'UPDATE merged_volumes SET resource=$path WHERE volume=''zh-ja'''
+                [void]$check.Parameters.AddWithValue('$path',$originalArchive)
+                [void]$check.ExecuteNonQuery()
+                Assert-Equal $store.MergedArticleByKey('zh-ja','test').ResourceArchive $movedArchive '历史绝对路径也回到当前缓存'
+                $check.Parameters['$path'].Value = "../merged-resources/$name"
+                [void]$check.ExecuteNonQuery()
+                $rejected = $false
+                try { $null = $store.MergedArticleByKey('zh-ja','test') } catch { $rejected = $true }
+                Assert-Equal $rejected $true '越界相对路径不能打开'
+                $check.Dispose()
+            } finally { $store.Dispose() }
+        }
+        $saved = Join-Path $dir 'valid-resource.saved'
+        [IO.File]::Move($mdd,$saved)
+        Invoke-Search @('import-merged',$dir) 1 | Out-Null
+        [IO.File]::WriteAllBytes($mdd,[byte[]](1,2))
+        Invoke-Search @('import-merged',$dir) 1 | Out-Null
+        $validHash = $manifest.files['E_search-zh-ja.mdd']
+        $manifest.files['E_search-zh-ja.mdd'] = (Get-FileHash -LiteralPath $mdd).Hash
+        $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestFile -Encoding utf8
+        Invoke-Search @('import-merged',$dir) 1 | Out-Null
+        $manifest.files['E_search-zh-ja.mdd'] = $validHash
+        [IO.File]::Move($mdd,(Join-Path $dir 'damaged-resource.bin'))
+        [IO.File]::Move($saved,$mdd)
+        $manifest.sources.shogakukan = 3
+        $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestFile -Encoding utf8
+        Invoke-Search @('import-merged',$dir) 1 | Out-Null
+        Assert-Equal (@(Invoke-Search @('article','zh-en','sample')) -join ' ') '<p>两份原文</p>' '缺卷、资源校验或来源对账失败后旧快照可查'
+    } finally { $env:E_SEARCH_DB = $previous }
+    Write-Output 'PASS 双卷来源、原书检索、富文本与失败回滚'
+}
+if ($MergedTestDirectory) { Test-MergedPackage $MergedTestDirectory -Audio:$MergedAudio; return }
+
+if ($MergeSampleInventory) {
+    # 从八份原 MDX 直接确定样本。以 UTF-8 原词头分组，独立于合并产物，避免缺失的词条在取样时也消失。
+    $sampleProgram = @'
+import hashlib, itertools, json, random, sqlite3, sys
+from collections import defaultdict
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from mdict_io import read_entries
+inventory = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+destination = Path(sys.argv[3])
+destination.mkdir(parents=True, exist_ok=True)
+primary = {"zh-en":"oxford", "zh-ja":"shogakukan"}
+seed = 20261123
+population, samples, generators = defaultdict(int), defaultdict(list), {}
+edges = []
+def consider(kind, limit, group, key, members, source=None):
+    bucket = kind + "/" + (source or group)
+    population[bucket] += 1
+    index = population[bucket] - 1
+    if index >= limit:
+        if bucket not in generators: generators[bucket] = random.Random(f"{seed}:{bucket}")
+        index = generators[bucket].randrange(index + 1)
+        if index >= limit: return
+    row = dict(kind=kind, group=group, key=key, scope=source, origins=members)
+    if index == len(samples[bucket]): samples[bucket].append(row)
+    else: samples[bucket][index] = row
+with sqlite3.connect("") as scratch:
+    scratch.execute("CREATE TABLE physical(g,head,s,n,kind)")
+    for source, spec in inventory["sources"].items():
+        group = "zh-en" if source in ("oxford","hanying") else "zh-ja"
+        path = Path(inventory["input_root"]) / spec["filename"]
+        with path.open("rb") as inp:
+            assert hashlib.file_digest(inp,"sha256").hexdigest().lower() == spec["sha256"].lower(), source
+        sizes = [0, "", 0]
+        def physical():
+            for ord_, key, body in read_entries(path):
+                if ord_ in (1,spec["records"]):
+                    edges.append(dict(kind="first" if ord_==1 else "last",group=group,key=key,scope=source,origins=[[source,ord_]]))
+                if len(body) > sizes[0]: sizes[:] = [len(body),key,ord_]
+                text = body.strip(b"\x00 \r\n\t")
+                kind = 0 if not text else 1 if text[:8].upper()==b"@@@LINK=" else 2
+                yield group,key,source,ord_,kind
+        scratch.executemany("INSERT INTO physical VALUES(?,?,?,?,?)", physical())
+        assert sizes[2]
+        edges.append(dict(kind="longest",group=group,key=sizes[1],scope=source,origins=[[source,sizes[2]]],bytes=sizes[0]))
+    # 一次外部排序，依来源及原序号枚举精确词头；每一类独立作固定种子蓄水池取样。
+    rows = scratch.execute("SELECT g,head,s,n,kind FROM physical ORDER BY g,head,s,n")
+    for (group,key), bucket in itertools.groupby(rows, key=lambda row:row[:2]):
+        by_source = defaultdict(list)
+        for _,_,source,ord_,kind in bucket: by_source[source].append((ord_,kind))
+        origins = [[s,n] for s,values in by_source.items() for n,_ in values]
+        for s,values in by_source.items():
+            ordinary = next((n for n,k in values if k==2),None)
+            if ordinary is not None: consider("ordinary",100,group,key,[[s,ordinary]],s)
+            if any(k==0 for _,k in values): consider("empty",3,group,key,[[s,n] for n,k in values if k==0],s)
+            if len(values)>1: consider("duplicate",3,group,key,[[s,n] for n,_ in values],s)
+        if len(by_source)>1: consider("overlap",20,group,key,origins)
+        if primary[group] not in by_source: consider("supplement",20,group,key,origins)
+        if any(k==1 for values in by_source.values() for _,k in values): consider("alias",20,group,key,origins)
+for g in primary:
+    for k in ("overlap","supplement","alias"): population.setdefault(k+"/"+g,0)
+out = dict(seed=seed,population=population,samples=[*itertools.chain.from_iterable(samples.values()),*edges],
+           original_hashes={s:v["sha256"] for s,v in inventory["sources"].items()})
+(destination/"d09-samples.json").write_text(json.dumps(out,ensure_ascii=False,indent=1),encoding="utf-8")
+print(len(out["samples"]), "source cases;",dict(population))
+'@
+    & python -c $sampleProgram $PSScriptRoot $MergeSampleInventory $MergeAuditDirectory
+    if ($LASTEXITCODE) { throw '真实原书样本生成失败' }
+    return
+}
+
+if ($MergeAuditDirectory) {
+    if (!$MergeAuditHost) {
+        # 工程的 .NET 10 宿主加载相同程序集，循环直接走界面调用的 Search 方法，计时排除启动 CLI 的时间。
+        $psDll = Join-Path $PSHOME 'pwsh.dll'
+        $config = Join-Path $PSScriptRoot 'bin/Release/net10.0/E_Search.runtimeconfig.json'
+        & $dotnet exec --runtimeconfig $config --depsfile (Join-Path (Split-Path $psDll) 'pwsh.deps.json') $psDll -NoProfile -NonInteractive -File $PSCommandPath -MergeAuditHost -MergeAuditDirectory $MergeAuditDirectory -RealDatabase $RealDatabase -MergedDatabase $MergedDatabase
+        if ($LASTEXITCODE) { throw '真实词书查询对照未通过' }
+        return
+    }
+    foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search') {
+        $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot "bin/Release/net10.0/$lib.dll"))
+    }
+    [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+    $ctor = $assembly.GetType('DictionaryStore',$true).GetConstructor([type[]]@([string],[bool]))
+    $baseline = $ctor.Invoke(@([string]$RealDatabase,$true))
+    $candidate = $ctor.Invoke(@([string]$MergedDatabase,$true))
+    $inventory = Get-Content -Raw -Encoding utf8 -LiteralPath (Join-Path $MergeAuditDirectory 'd09-samples.json') | ConvertFrom-Json -AsHashtable
+    $observations = [Collections.Generic.List[object]]::new()
+    function Fingerprint($hits, $case) {
+        $insideScope = $true
+        $data = @(foreach ($h in $hits) {
+            $en = $h.Entry.DictionaryId -in 'oxford','hanying'
+            if (($case.scope -and $case.scope -cne $h.Entry.DictionaryId) -or (($case.group -eq 'zh-en') -ne $en)) { $insideScope = $false }
+            ,@($h.Entry.DictionaryId,$h.Entry.EntryId,$h.Term,$h.Method,$h.Display,$h.Entry.Headword,$h.Entry.Reading,$h.Entry.Gloss)
+        })
+        $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $data -Depth 4 -Compress))
+        [ordered]@{count=$data.Count; inside_scope=$insideScope; sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)); ids=@($data | ForEach-Object { "$($_[0]):$($_[1])" })}
+    }
+    try {
+        foreach ($book in $baseline.ListDictionaries()) { Assert-Equal $book.Sha256.ToLowerInvariant() $inventory.original_hashes[$book.Id] "基准输入 $($book.Id)" }
+        $token = [Threading.CancellationToken]::None
+        $cases = @($inventory.samples)
+        foreach ($group in 'zh-en','zh-ja') {
+            $archiveReport = Join-Path $MergeAuditDirectory "d11-archive-$group.json"
+            if (Test-Path -LiteralPath $archiveReport) {
+                $longest = (Get-Content -Encoding utf8 -Raw -LiteralPath $archiveReport | ConvertFrom-Json).categories.public.longest_html
+                $cases += [ordered]@{kind='longest-public-html';group=$group;scope=$null;key=$longest[0];origins=@();html_bytes=$longest[1]}
+            }
+        }
+        foreach ($case in $cases) {
+            $scope = if ($case.scope) { [string]$case.scope } else { [string]$case.group }
+            $base = Fingerprint ($baseline.Search($case.key,$scope,$token)) $case
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            $hits = $candidate.Search($case.key,$scope,$token)
+            $first = $watch.Elapsed.TotalMilliseconds
+            $watch.Restart()
+            $again = $candidate.Search($case.key,$scope,$token)
+            $repeat = $watch.Elapsed.TotalMilliseconds
+            $current = Fingerprint $hits $case
+            $second = Fingerprint $again $case
+            $sameBody = $true
+            foreach ($origin in $case.origins) {
+                $expectedBody = $baseline.Detail($origin[0],$origin[1]).Item2
+                $actualBody = $candidate.Detail($origin[0],$origin[1]).Item2
+                if ($expectedBody -cne $actualBody) { $sameBody = $false }
+            }
+            $article = $candidate.MergedArticleByKey($case.group,$case.key)
+            if ($observations.Count -eq 0 -and $null -ne $article) {
+                Assert-Equal ($null -eq $candidate.MergedArticleByKey($case.group,$case.key,"obsolete-revision")) $true '旧版本文章链接不跨卷版本跳转'
+                Assert-Equal $candidate.MergedArticleByKey($case.group,$case.key,$article.Revision).Html $article.Html '当前版本文章链接可用'
+            }
+            $ok = $sameBody -and $null -ne $article -and $base.inside_scope -and $current.inside_scope -and
+                $current.sha256 -eq $base.sha256 -and $second.sha256 -eq $base.sha256
+            if ($case.html_bytes -and $null -ne $article) { $ok = $ok -and [Text.Encoding]::UTF8.GetByteCount($article.Html) -eq $case.html_bytes }
+            $observations.Add([ordered]@{group=$case.group;key=$case.key;kind=$case.kind;scope=$case.scope;origins=$case.origins;ok=$ok
+                same_raw=$sameBody;article_available=($null -ne $article);baseline=$base;actual=$current;first_ms=$first;repeat_ms=$repeat})
+        }
+    } finally { $baseline.Dispose(); $candidate.Dispose() }
+    $mismatches=@($observations | Where-Object { !$_.ok })
+    $latency = [ordered]@{}
+    foreach ($group in 'zh-en','zh-ja') {
+        $items = @($observations | Where-Object group -eq $group)
+        if (!$items.Count) { continue }
+        $latency[$group] = [ordered]@{samples=$items.Count}
+        foreach ($field in 'first_ms','repeat_ms') {
+            $sorted = @($items | ForEach-Object { $_[$field] } | Sort-Object)
+            $latency[$group][$field] = [ordered]@{median=$sorted[[Math]::Ceiling($sorted.Count*.5)-1]; p95=$sorted[[Math]::Ceiling($sorted.Count*.95)-1]; max=$sorted[-1]}
+        }
+    }
+    $report = [ordered]@{seed=$inventory.seed;population=$inventory.population;total=$observations.Count;differences=$mismatches.Count
+        latency_note="同一进程及读连接对各样本第一次查询、紧接着的重复查询；计时仅含 Search，未清空操作系统文件缓存。";latency=$latency;observations=$observations}
+    $report | ConvertTo-Json -Depth 9 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $MergeAuditDirectory 'd09-reader-comparison.json')
+    if ($mismatches.Count) { throw "$($mismatches.Count) 个真实查询存在差异，见 d09-reader-comparison.json" }
+    Write-Output "PASS $($observations.Count) 个原书与双卷真实查询、重复命中及原文核对"
+    return
+}
+
+function Test-ImportInterruptions([string]$Directory,[Reflection.Assembly]$Assembly) {
+    $previousDb=$env:E_SEARCH_DB
+    try {
+        $env:E_SEARCH_DB=Join-Path $Directory 'interrupt.db'
+        $source=Join-Path $Directory 'interrupted.mdx'
+        Write-Mdx $source ([ordered]@{stable='中断前版本'})
+        Invoke-Search @('import-indexed','oxford',$source) | Out-Null
+        Write-Mdx $source ([ordered]@{candidate='完整的新版本'; other='另一条'})
+        # 只暂停携带独立数据库路径的本轮子进程；SQLite 提交前后分别验证旧版本和完整新版。
+        $childCode=@'
+$ErrorActionPreference='Stop'
+foreach($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search'){
+    $assembly=[Reflection.Assembly]::LoadFrom((Join-Path $env:E_RECOVERY_LIB ($lib+'.dll')))
+}
+[SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+$store=$assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool])).Invoke(@([string]$env:E_SEARCH_DB,$false))
+function Pause-Test { [Console]::WriteLine('CHECKPOINT'); [Console]::Out.Flush(); [Threading.Thread]::Sleep(-1) }
+$callback=[Action[string,long,long]]{param($stage,$done,$total)
+    if($stage -eq $env:E_RECOVERY_STAGE -and ($stage -ne 'entries' -or $done -gt 0)){ Pause-Test }
+}
+try {
+    $null=$store.ImportDictionaryWithProgress($env:E_RECOVERY_INPUT,'en',$null,'oxford',$callback,[Threading.CancellationToken]::None)
+    if($env:E_RECOVERY_STAGE -eq 'committed'){Pause-Test}
+} finally {$store.Dispose()}
+'@
+        foreach($stage in 'hash','entries','source','publish','committed'){
+            $start=[Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
+            $start.UseShellExecute=$false
+            $start.CreateNoWindow=$true
+            $start.RedirectStandardOutput=$start.RedirectStandardError=$true
+            $start.Environment['E_RECOVERY_INPUT']=$source
+            $start.Environment['E_RECOVERY_LIB']=[IO.Path]::GetDirectoryName($Assembly.Location)
+            $start.Environment['E_RECOVERY_STAGE']=$stage
+            foreach($arg in '-NoProfile','-NonInteractive','-EncodedCommand',[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childCode))){
+                $start.ArgumentList.Add($arg)
+            }
+            $child=[Diagnostics.Process]::Start($start)
+            try {
+                $signal=$child.StandardOutput.ReadLineAsync()
+                if(!$signal.Wait([TimeSpan]::FromSeconds(25))){throw "$stage 子进程未到达预期断点"}
+                if($signal.Result -cne 'CHECKPOINT'){throw "$stage 子进程提前退出：$($child.StandardError.ReadToEnd())"}
+                $expected=if($stage -eq 'committed'){'完整的新版本'}else{'中断前版本'}
+                Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1]) $expected "$stage 写入者暂停时独立进程可读完整版本"
+            } finally {
+                if(!$child.HasExited){$child.Kill(); $child.WaitForExit()}
+                $child.Dispose()
+            }
+            Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1]) $expected "$stage 子进程中止后重启查询"
+        }
+        Assert-Equal (@(Invoke-Search @('entry','oxford','2'))[-1]) '另一条' '提交后中断仍有完整第二条记录'
+    } finally {$env:E_SEARCH_DB=$previousDb}
+}
+
+function Test-ImportRecoverySettings([string]$Directory,[Reflection.Assembly]$Assembly) {
+    Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
+    $root=[IO.Directory]::CreateDirectory((Join-Path $Directory ('settings-recovery-'+[guid]::NewGuid().ToString('N')))).FullName
+    $previousDb=$env:E_SEARCH_DB
+    $oldContext=[Threading.SynchronizationContext]::Current
+    $window=$null
+    try {
+        $env:E_SEARCH_DB=Join-Path $root 'ui.db'
+        $book=Join-Path $root 'ui.mdx'
+        Write-Mdx $book ([ordered]@{stable='原始释义'})
+        Invoke-Search @('import-indexed','oxford',$book) | Out-Null
+        $hash=(Get-FileHash -LiteralPath $book).Hash
+        $managed=Join-Path ($env:E_SEARCH_DB+'.sources') ($hash+'.mdx')
+        [IO.File]::Move($managed,(Join-Path $root 'missing.mdx'))
+        $csv=Join-Path $root 'large.csv'
+        $file=[IO.StreamWriter]::new($csv,$false,[Text.UTF8Encoding]::new($false))
+        try { $file.WriteLine('word,gloss'); for($i=0;$i -lt 40000;$i++){ $file.WriteLine("word$i,阶段取消样本$i") } }
+        finally { $file.Dispose() }
+        $flags=[Reflection.BindingFlags]'Instance,NonPublic'
+        $type=$Assembly.GetType('ESearch.SettingsWindow',$true)
+        $callbacks=@([string]$env:E_SEARCH_DB,[Func[uint32,uint32,Threading.Tasks.Task[string]]]{param($m,$k) [Threading.Tasks.Task]::FromResult([string]'')},[Action]{},[string]'')
+        $window=$type.GetConstructors($flags)[0].Invoke($callbacks)
+        $dispatcher=$window.Dispatcher
+        [Threading.SynchronizationContext]::SetSynchronizationContext([Windows.Threading.DispatcherSynchronizationContext]::new($dispatcher))
+        function Wait-Control([scriptblock]$Until,[string]$Scenario) {
+            $clock=[Diagnostics.Stopwatch]::StartNew()
+            while(!(& $Until)){
+                if($clock.Elapsed.TotalSeconds -gt 20){throw "设置页控件未达到预期：$Scenario"}
+                $frame=[Windows.Threading.DispatcherFrame]::new()
+                $null=$dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background,[Action]{$frame.Continue=$false})
+                [Windows.Threading.Dispatcher]::PushFrame($frame)
+                Start-Sleep -Milliseconds 5
+            }
+        }
+        function Press-Control([string]$Name){
+            $button=$window.FindName($Name)
+            Assert-Equal $button.IsEnabled $true "按钮可操作 $Name"
+            $button.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+        }
+        $window.ShowActivated=$false
+        $window.ShowInTaskbar=$false
+        $window.Opacity=0
+        $window.Show()
+        $list=$window.FindName('DictionaryList')
+        $catalogStatus=$window.FindName('CatalogStatus')
+        Wait-Control { $null -ne $list.SelectedItem -and $window.FindName('RestoreSourceButton').IsEnabled } '列出缺档词库'
+        Assert-Equal ($list.SelectedItem.Summary -like '*原档缺失*') $true '设置列表显示缺档'
+        Assert-Equal $window.FindName('RestoreSourceButton').Visibility 'Visible' '设置页提供重新定位原档'
+        # 注入相当于系统文件选择器返回的路径；之后走真实窗口的恢复和列表刷新。
+        $restore=$type.GetMethod('RestoreFromPath',$flags)
+        $task=$restore.Invoke($window,@($list.SelectedItem,[string]$csv))
+        Wait-Control { $task.IsCompleted } '拒绝不匹配文件'
+        Assert-Equal ($catalogStatus.Text -like '*SHA-256*不匹配*') $true '错误原档反馈具体哈希不匹配'
+        $task=$restore.Invoke($window,@($list.SelectedItem,[string]$book))
+        Wait-Control { $task.IsCompleted } '匹配原档恢复完成'
+        Assert-Equal ($list.SelectedItem.Summary -like '*原档缺失*') $false '正确原档恢复后刷新缺源状态'
+        Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1]) '原始释义' '桌面恢复后新进程可读'
+
+        $window.FindName('ImportTab').IsSelected=$true
+        $window.FindName('ImportPath').Text=$csv
+        Press-Control 'PreviewButton'
+        Wait-Control { $window.FindName('ImportButton').IsEnabled } '预览完成'
+        Press-Control 'ImportButton'
+        $status=$window.FindName('ImportStatus')
+        Wait-Control { $status.Text -like '正在建立索引*' } '真实导入进度'
+        Assert-Equal $window.FindName('ImportProgress').Visibility 'Visible' '写索引时进度条可见'
+        Press-Control 'CancelImportButton'
+        Wait-Control { $status.Text -like '已取消导入*' } '取消落实'
+        Assert-Equal $window.FindName('CancelImportButton').Visibility 'Collapsed' '操作结束后隐藏取消按钮'
+        Assert-Equal @(Invoke-Search @('list')).Count 1 '桌面取消没有发布新词典'
+    } finally {
+        if($window){$window.Close()}
+        [Threading.SynchronizationContext]::SetSynchronizationContext($oldContext)
+        $env:E_SEARCH_DB=$previousDb
+    }
+}
+
+function Test-RestoreOpenSource([string]$Directory,[Reflection.Assembly]$Assembly) {
+    $oldDb=$env:E_SEARCH_DB
+    try {
+        $root=[IO.Directory]::CreateDirectory((Join-Path $Directory ('restore-open-'+[guid]::NewGuid().ToString('N')))).FullName
+        $file=Join-Path $root 'restore-open.mdx'
+        Write-Mdx $file ([ordered]@{alpha='AAAA'; bravo='BBBB'})
+        $hash=(Get-FileHash -LiteralPath $file).Hash
+        foreach($alreadyRestored in $false,$true) {
+            $env:E_SEARCH_DB=Join-Path $root "open-$alreadyRestored.db"
+            Invoke-Search @('import-indexed','oxford',$file) | Out-Null
+            $managed=Join-Path ($env:E_SEARCH_DB+'.sources') ($hash+'.mdx')
+            Write-Mdx $managed ([ordered]@{alpha='AAAA'; bravo='XXXX'})
+            $store=$Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool])).Invoke(@([string]$env:E_SEARCH_DB,$false))
+            try {
+                Assert-Equal ($store.Detail('oxford',1).Item2) 'AAAA' '先缓存指向旧物理文件的会话'
+                [IO.File]::Move($managed,(Join-Path $root "displaced-$alreadyRestored.mdx"))
+                if($alreadyRestored){[IO.File]::Copy($file,$managed)}
+                $store.RestoreIndexedSource('oxford',$file,$null,[Threading.CancellationToken]::None)
+                Assert-Equal ($store.Detail('oxford',2).Item2) 'BBBB' '恢复后同一进程首次展开使用正确的新句柄'
+            } finally { $store.Dispose() }
+        }
+    } finally { $env:E_SEARCH_DB=$oldDb }
+}
+
+function Test-ImportRecovery([string]$Directory,[Reflection.Assembly]$Assembly) {
+    $previousDb=$env:E_SEARCH_DB
+    $root=[IO.Directory]::CreateDirectory((Join-Path $Directory ('import-recovery-'+[guid]::NewGuid().ToString('N')))).FullName
+    $env:E_SEARCH_DB=Join-Path $root 'catalog.db'
+    $type=$Assembly.GetType('DictionaryStore')
+    $file=Join-Path $root 'origin.mdx'
+    $token=[Threading.CancellationToken]::None
+    try {
+        Write-Mdx $file ([ordered]@{stable='旧正文'})
+        Invoke-Search @('import-indexed','oxford',$file) | Out-Null
+        $oldHash=(Get-FileHash -LiteralPath $file).Hash
+        $oldPath=Join-Path ($env:E_SEARCH_DB+'.sources') ($oldHash+'.mdx')
+        $relocated=Join-Path $root 'relocated.mdx'
+        [IO.File]::Move($oldPath,$relocated)
+        $store=$type.GetConstructor([type[]]@([string],[bool])).Invoke(@([string]$env:E_SEARCH_DB,$false))
+        try {
+            $rows=[ordered]@{}
+            for($i=0;$i -lt 600;$i++){ $rows[('entry'+$i+'w'*40)]='候选正文'+$i }
+            Write-Mdx $file $rows
+            $wrong=$false
+            try { $store.RestoreIndexedSource('oxford',$file,$null,$token) } catch { $wrong=$true }
+            Assert-Equal $wrong $true '拒绝同名或其他哈希的恢复文件'
+            Assert-Equal ([IO.File]::Exists($oldPath)) $false '错误原档不能覆盖托管位置'
+            $store.RestoreIndexedSource('oxford',$relocated,$null,$token)
+            Assert-Equal (Get-FileHash -LiteralPath $oldPath).Hash $oldHash '恢复文件准确匹配索引中已登记哈希'
+
+            $cancel=[Threading.CancellationTokenSource]::new()
+            try {
+                $stages=[Collections.Generic.List[string]]::new()
+                $report=[Action[string,long,long]]{param($stage,$done,$total)
+                    $stages.Add($stage)
+                    if($stage -eq 'entries' -and $done -gt 0){$cancel.Cancel()}
+                }
+                $failed=$false
+                try { $null=$store.ImportDictionaryWithProgress($file,'en',$null,'oxford',$report,$cancel.Token) }
+                catch { $failed=$_.Exception.GetBaseException() -is [OperationCanceledException] }
+                Assert-Equal $failed $true '引擎响应词条处理中取消'
+                Assert-Equal ($stages.Contains('hash') -and $stages.Contains('entries')) $true '回调报告校验和索引处理阶段'
+            } finally { $cancel.Dispose() }
+            Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1]) '旧正文' '取消后新进程能读上版'
+
+            # 限制这一个临时 SQLite 连接最大页数，真实触发 SQLITE_FULL，不占满系统磁盘。
+            $db=$type.GetField('db',[Reflection.BindingFlags]'Instance,NonPublic').GetValue($store)
+            $cmd=$db.CreateCommand()
+            try {
+                $cmd.CommandText='PRAGMA page_count'; $pages=$cmd.ExecuteScalar()
+                $cmd.CommandText='PRAGMA max_page_count='+$pages; $null=$cmd.ExecuteScalar()
+                $diskFull=$false
+                try { $null=$store.ImportDictionaryWithProgress($file,'en',$null,'oxford',$null,$token) }
+                catch { $errorValue=$_.Exception.GetBaseException(); $diskFull=$errorValue.SqliteErrorCode -eq 13 }
+                Assert-Equal $diskFull $true '真实 SQLite 写满错误'
+            } finally { $cmd.CommandText='PRAGMA max_page_count=1073741823'; $null=$cmd.ExecuteScalar(); $cmd.Dispose() }
+            Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1]) '旧正文' 'SQLite 满后旧索引仍可读'
+
+            # 只对测试候选设置拒绝读取的 NTFS ACL，保留原 ACL 并在 finally 恢复。
+            $originalAcl=Get-Acl -LiteralPath $file
+            $identity=[Security.Principal.WindowsIdentity]::GetCurrent().User
+            $deny=[Security.AccessControl.FileSystemAccessRule]::new($identity,[Security.AccessControl.FileSystemRights]::ReadData,[Security.AccessControl.AccessControlType]::Deny)
+            try {
+                $denySource=[Action[string,long,long]]{param($stage,$done,$total)
+                    if($stage -eq 'source'){
+                        $acl=Get-Acl -LiteralPath $file
+                        $acl.AddAccessRule($deny)
+                        Set-Acl -LiteralPath $file -AclObject $acl
+                    }
+                }
+                $denied=$false
+                try {$null=$store.ImportDictionaryWithProgress($file,'en',$null,'oxford',$denySource,$token)}
+                catch {$denied=$_.Exception.GetBaseException() -is [UnauthorizedAccessException]}
+                Assert-Equal $denied $true '校验后真实撤销候选原档读权限，发布失败'
+            } finally { Set-Acl -LiteralPath $file -AclObject $originalAcl }
+            Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1]) '旧正文' '权限撤销后原版可查'
+            Assert-Equal @(Invoke-Search @('query','entry0','oxford')).Count 0 '权限撤销不能发布半成品'
+
+        } finally { $store.Dispose() }
+    } finally { $env:E_SEARCH_DB=$previousDb }
 }
 
 function Test-Calculation([Reflection.Assembly]$Assembly) {
@@ -2248,6 +2876,7 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
             $window.Topmost = $false
             $window.Opacity = 0
             $window.Show()
+            Assert-Equal ($null -eq $window.FindName('MergedWebHost').Content) $true '普通旧库窗口不创建双卷浏览器'
             [Threading.SynchronizationContext]::SetSynchronizationContext([Windows.Threading.DispatcherSynchronizationContext]::new($window.Dispatcher))
             foreach ($inputWord in 'receive','recieve') {
                 $query.Text = $inputWord
@@ -3547,6 +4176,209 @@ function Test-QuickLookPipe([Reflection.Assembly]$Assembly) {
     Write-Output 'PASS QuickLook UTF-8 预览协议和离线超时'
 }
 
+function Test-MdxArchiveJunctions([string]$Scratch, [Reflection.Assembly]$Assembly) {
+    # 所有 Junction 均指向夹具内的同一个空目录；逐层验证拒绝重定向且原文件仍在原位。
+    $area = [IO.Directory]::CreateDirectory((Join-Path $Scratch ('junctions-' + [guid]::NewGuid().ToString('N')))).FullName
+    $target = [IO.Directory]::CreateDirectory((Join-Path $area 'test-target')).FullName
+    $database = Join-Path $area 'root.db'
+    try { $null = New-Item -ItemType Junction -Path ($database+'.sources') -Target $target -ErrorAction Stop }
+    catch [UnauthorizedAccessException] { Write-Output 'SKIP 当前用户不能建立 NTFS Junction。'; return }
+    function Assert-Guard([scriptblock]$action,[string]$caseName) {
+        try { & $action | Out-Null } catch {
+            if ($_.Exception.GetBaseException() -is [IO.InvalidDataException]) { return }
+            throw
+        }
+        throw "应拒绝重定向的托管路径：$caseName"
+    }
+    $store = $Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool])).Invoke(@([string]$database,$false))
+    try { Assert-Guard { $store.ArchiveExpiredSources() } '托管根目录' } finally { $store.Dispose() }
+    $managed = $Assembly.GetType('ManagedMdx')
+    $archive = $managed.GetMethod('TryArchive',[Reflection.BindingFlags]'Static,NonPublic')
+    $inputBook = Join-Path $area 'source.mdx'
+    Write-Mdx $inputBook ([ordered]@{ test='fixture' })
+    $hash = (Get-FileHash -LiteralPath $inputBook).Hash
+    foreach ($part in 'archive','duplicates','candidate','retired') {
+        $db = Join-Path $area ($part+'.db')
+        $root = [IO.Directory]::CreateDirectory($db+'.sources').FullName
+        $candidate = Join-Path $root ($hash+'.mdx')
+        if ($part -eq 'candidate') {
+            $null = New-Item -ItemType Junction -Path $candidate -Target $target -ErrorAction Stop
+        } else {
+            [IO.File]::WriteAllText($candidate,'保留的测试字节')
+            $redirected = Join-Path $root $part
+            if ($part -eq 'duplicates') {
+                $archiveDir = [IO.Directory]::CreateDirectory((Join-Path $root 'archive')).FullName
+                [IO.File]::Copy($candidate,(Join-Path $archiveDir ($hash+'.mdx')))
+                $redirected = Join-Path $archiveDir 'duplicates'
+            }
+            $null = New-Item -ItemType Junction -Path $redirected -Target $target -ErrorAction Stop
+        }
+        if ($part -eq 'retired') {
+            $preserve = $managed.GetMethod('Preserve',[Reflection.BindingFlags]'Static,NonPublic')
+            Assert-Guard { $preserve.Invoke($null,@([string]$db,[string]$inputBook,[string]$hash,[Threading.CancellationToken]::None)) } $part
+        } else { Assert-Guard { $archive.Invoke($null,@([string]$candidate)) } $part }
+        if ($part -ne 'candidate') { Assert-Equal ([IO.File]::ReadAllText($candidate)) '保留的测试字节' '拒绝后原文件未改动' }
+    }
+    Assert-Equal ([IO.Directory]::GetFileSystemEntries($target).Length) 0 '所有归档、恢复路径均未写入重定向目标'
+    Write-Output 'PASS NTFS Junction 托管根、源、归档、重复及修复目录边界'
+}
+
+function Test-RetiredMdxSources([string]$Scratch, [Reflection.Assembly]$Assembly) {
+    $directory = [IO.Directory]::CreateDirectory((Join-Path $Scratch ('source-retirement-' + [guid]::NewGuid().ToString('N')))).FullName
+    $previousDb = $env:E_SEARCH_DB
+    $catalog = $null; $oldConnection = $null; $snapshot = $null; $held = $null
+    try {
+        $env:E_SEARCH_DB = Join-Path $directory 'test.db'
+        $first = Join-Path $directory 'a.mdx'
+        $second = Join-Path $directory 'b.mdx'
+        Write-Mdx $first ([ordered]@{ alpha='first body' })
+        [IO.File]::Copy($first,$second)
+        $oldHash = (Get-FileHash -LiteralPath $first).Hash
+        Invoke-Search @('import-indexed','oxford',$first) | Out-Null
+        Invoke-Search @('import-indexed','sanseido',$second) | Out-Null
+        $catalog = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$($env:E_SEARCH_DB);Mode=ReadWrite;Pooling=False")
+        $catalog.Open()
+        function Sql([string]$sqlText) {
+            $command = $catalog.CreateCommand()
+            try { $command.CommandText=$sqlText; $command.ExecuteScalar() } finally { $command.Dispose() }
+        }
+        function Maintain {
+            $ctor = $Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool]))
+            $store = $ctor.Invoke(@($env:E_SEARCH_DB,$false))
+            try { [void]$store.ArchiveExpiredSources() } finally { $store.Dispose() }
+        }
+        $root = $env:E_SEARCH_DB + '.sources'
+        $oldPath = Join-Path $root ($oldHash + '.mdx')
+        $archived = Join-Path (Join-Path $root 'archive') ($oldHash + '.mdx')
+        # 仍被停用词典引用的共享文件始终有效。同一 SHA 可分别对应两个独立的词典身份。
+        $null = Sql "UPDATE dictionary_metadata SET enabled=0 WHERE id='sanseido'"
+        Write-Mdx $first ([ordered]@{ alpha='second body' })
+        Invoke-Search @('import-indexed','oxford',$first) | Out-Null
+        $null = Sql "INSERT OR REPLACE INTO mdx_retired_sources VALUES('$oldHash',0)"
+        Maintain
+        Assert-Equal (Test-Path -LiteralPath $oldPath) $true '共享源仍有第二本词典引用'
+        Assert-Equal (Sql "SELECT count(*) FROM mdx_retired_sources WHERE sha256='$oldHash'") 0 '重新引用取消旧的归档计时'
+
+        # 子进程重导及维护期间保持旧 SQLite 快照。记录已取得，但到改名以后才首次请求打开源句柄。
+        $oldConnection = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$($env:E_SEARCH_DB);Mode=ReadOnly;Pooling=False")
+        $oldConnection.Open()
+        $snapshot = $oldConnection.BeginTransaction($true)
+        $read = $oldConnection.CreateCommand()
+        try {
+            $read.Transaction = $snapshot
+            $read.CommandText = "SELECT d.sha256,r.record_start,r.record_end FROM dictionaries d JOIN mdx_records r ON r.dict=d.id WHERE d.id='sanseido' AND r.ordinal=1"
+            $row = $read.ExecuteReader()
+            try { if (!$row.Read()) { throw '旧快照缺少物理范围' }; $hash=$row.GetString(0); $start=$row.GetInt64(1); $end=$row.GetInt64(2) } finally { $row.Dispose() }
+        } finally { $read.Dispose() }
+        [IO.File]::Copy($first,$second,$true)
+        Invoke-Search @('import-indexed','sanseido',$second) | Out-Null
+        Assert-Equal (Test-Path -LiteralPath $oldPath) $true '最后一个引用消失后保留回滚窗口'
+        Assert-Equal ((Sql "SELECT retired_at FROM mdx_retired_sources WHERE sha256='$oldHash'") -gt 0) $true '回滚期从取消引用后开始'
+
+        $null = Sql "UPDATE mdx_retired_sources SET retired_at=strftime('%s','now')-6*86400 WHERE sha256='$oldHash'"
+        Maintain
+        Assert-Equal (Test-Path -LiteralPath $oldPath) $true '六天仍处于七天回滚窗口'
+        $null = Sql "UPDATE mdx_retired_sources SET retired_at=strftime('%s','now')-8*86400 WHERE sha256='$oldHash'"
+        # 普通只读查词不能触发清理；暂时禁止文件改名的第三方持有者也不能造成数据丢失。
+        Invoke-Search @('entry','oxford','1') | Out-Null
+        Assert-Equal (Test-Path -LiteralPath $oldPath) $true '只读命令不修改保留中的源'
+        $held = [IO.File]::Open($oldPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        Invoke-Search @('import-indexed','oxford',$first) | Out-Null
+        Assert-Equal (Test-Path -LiteralPath $oldPath) $true '其他进程持有的源在无法改名时延迟归档'
+        $held.Dispose(); $held=$null
+        Invoke-Search @('import-indexed','oxford',$first) | Out-Null
+        Assert-Equal (Test-Path -LiteralPath $oldPath) $false '后续写者自动完成过期源归档'
+        Assert-Equal (Get-FileHash -LiteralPath $archived).Hash $oldHash '归档保留原文件所有字节'
+        $body = $Assembly.GetType('ManagedMdx').GetMethod('Body',[Reflection.BindingFlags]'Static,NonPublic')
+        Assert-Equal ($body.Invoke($null,@($env:E_SEARCH_DB,$hash,$start,$end,$null,$false))) 'first body' '旧快照在归档之后仍可读取原始正文'
+        $snapshot.Dispose(); $snapshot=$null
+
+        # 在独立进程中发布源文件并持有尚未提交的 SQLite 写事务，强制结束后验证回滚与孤儿处理。
+        $orphan = Join-Path $directory 'uncommitted.mdx'
+        Write-Mdx $orphan ([ordered]@{ orphan='pending' })
+        $orphanHash = (Get-FileHash -LiteralPath $orphan).Hash
+        $orphanPath = Join-Path $root ($orphanHash + '.mdx')
+        $signalName = 'ESearch-GC-' + [guid]::NewGuid()
+        $signal = [Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,$signalName)
+        $worker = $null
+        try {
+            $workerCode = @'
+$ErrorActionPreference='Stop'
+foreach($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite'){
+    [void][Reflection.Assembly]::LoadFrom((Join-Path $env:ES_GC_LIB "$lib.dll"))
+}
+[SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+$c=[Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$($env:E_SEARCH_DB);Mode=ReadWrite;Pooling=False")
+$c.Open(); $tx=$c.BeginTransaction(); $cmd=$c.CreateCommand(); $cmd.Transaction=$tx
+$cmd.CommandText="UPDATE dictionaries SET sha256='uncommitted' WHERE id='oxford'"
+[void]$cmd.ExecuteNonQuery()
+[IO.File]::Copy($env:ES_GC_INPUT,$env:ES_GC_PUBLISHED)
+[void][Threading.EventWaitHandle]::OpenExisting($env:ES_GC_SIGNAL).Set()
+[Threading.Thread]::Sleep([Threading.Timeout]::Infinite)
+'@
+            # 即使父测试由 dotnet/自定义宿主托管，也启动明确的 PowerShell；读取当前已装载的 SQLite 运行库。
+            $shell = Join-Path $PSHOME 'pwsh.exe'
+            if (![IO.File]::Exists($shell)) { $shell = (Get-Command pwsh -ErrorAction Stop).Path }
+            $processInfo = [Diagnostics.ProcessStartInfo]::new($shell)
+            $processInfo.UseShellExecute=$false
+            $processInfo.CreateNoWindow=$true
+            $processInfo.RedirectStandardError=$true
+            $processInfo.RedirectStandardOutput=$true
+            $processInfo.Environment['E_SEARCH_DB']=[string]$env:E_SEARCH_DB
+            $processInfo.Environment['ES_GC_LIB']=[IO.Path]::GetDirectoryName([SQLitePCL.raw].Assembly.Location)
+            $processInfo.Environment['ES_GC_INPUT']=$orphan
+            $processInfo.Environment['ES_GC_PUBLISHED']=$orphanPath
+            $processInfo.Environment['ES_GC_SIGNAL']=$signalName
+            foreach ($arg in '-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($workerCode)))) {
+                $processInfo.ArgumentList.Add($arg)
+            }
+            $worker=[Diagnostics.Process]::Start($processInfo)
+            $stderr = $worker.StandardError.ReadToEndAsync()
+            $stdout = $worker.StandardOutput.ReadToEndAsync()
+            $wait = [Diagnostics.Stopwatch]::StartNew()
+            while (!$signal.WaitOne(150)) {
+                if ($worker.HasExited) { throw "崩溃夹具子进程提前退出 $($worker.ExitCode)：$($stderr.Result) $($stdout.Result)" }
+                if ($wait.Elapsed.TotalSeconds -gt 45) { throw '写者未在45秒内到达文件发布后的测试中断点' }
+            }
+            Assert-Equal (Sql "SELECT sha256 FROM dictionaries WHERE id='oxford'") (Get-FileHash -LiteralPath $first).Hash '并发读者只见到上次提交'
+        } finally {
+            if ($worker) {
+                if (!$worker.HasExited) { $worker.Kill(); $worker.WaitForExit() }
+                $worker.Dispose()
+            }
+            $signal.Dispose()
+        }
+        Assert-Equal (Sql "SELECT sha256 FROM dictionaries WHERE id='oxford'") (Get-FileHash -LiteralPath $first).Hash '进程崩溃后 SQLite 保留先前版本'
+        [IO.File]::SetLastWriteTimeUtc($orphanPath,[DateTime]::UtcNow.AddYears(-1))
+        Maintain
+        Assert-Equal (Test-Path -LiteralPath $orphanPath) $true '无提交记录的孤儿先进入回滚保留期'
+        $null = Sql "UPDATE mdx_retired_sources SET retired_at=0 WHERE sha256='$orphanHash'"
+        Maintain
+        Assert-Equal (Get-FileHash -LiteralPath (Join-Path (Join-Path $root archive) ($orphanHash+'.mdx'))).Hash $orphanHash '孤儿到期完整归档'
+
+        # 还原含合并卷映射的旧数据库时，可写打开应恢复并保留仅被该卷引用的内容。
+        $null = Sql "CREATE TABLE IF NOT EXISTS merged_volumes(volume TEXT PRIMARY KEY,resource TEXT,revision TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS merged_mdx_volumes(volume TEXT PRIMARY KEY REFERENCES merged_volumes ON DELETE CASCADE,sha256 TEXT NOT NULL) WITHOUT ROWID;
+            INSERT INTO merged_volumes VALUES('archive-fixture',NULL,'test-revision');
+            INSERT INTO merged_mdx_volumes VALUES('archive-fixture','$orphanHash')"
+        Assert-Equal (@(Invoke-Search @('indexed-sources')) -contains $orphanHash) $true '发布清单包含仅合并卷引用的散列'
+        Maintain
+        Assert-Equal (Get-FileHash -LiteralPath $orphanPath).Hash $orphanHash '还原的合并卷可从归档恢复活动源'
+        $staged = Join-Path $root ($orphanHash + '.mdx.' + [guid]::NewGuid().ToString('N') + '.tmp')
+        [IO.File]::WriteAllText($staged,'unfinished')
+        [IO.File]::SetLastWriteTimeUtc($staged,[DateTime]::UtcNow.AddDays(-8))
+        Maintain
+        Assert-Equal (Test-Path -LiteralPath (Join-Path (Join-Path $root archive) ([IO.Path]::GetFileName($staged)))) $true '中断后的过期暂存文件一并归档'
+    } finally {
+        if ($held) { $held.Dispose() }
+        if ($snapshot) { $snapshot.Dispose() }
+        if ($oldConnection) { $oldConnection.Dispose() }
+        if ($catalog) { $catalog.Dispose() }
+        $env:E_SEARCH_DB = $previousDb
+    }
+    Write-Output 'PASS 跨进程旧快照、共享源、回滚保留期与中断后的源归档'
+}
+
 function Test-EngineProbeBinding {
     # 为三个目标生成实际探针并检查编译后的导入表；当前架构另外执行一次本地 SDK 调用。
     foreach ($arch in 'X86','X64','Arm64') {
@@ -3564,6 +4396,211 @@ function Test-EngineProbeBinding {
         }
     }
     Write-Output 'PASS 三种架构的探针绑定及当前架构的原生 SDK 调用'
+}
+
+if ($WpfRenderDirectory) {
+    # 新进程分别启动实际 WPF 浮窗。测试不注册系统快捷键，正常输入、45ms 防抖、查词及详情展开均走产品代码。
+    if (!$RealDatabase -or $WpfColdTrials -lt 1) { throw 'WPF 验收需要 -RealDatabase 和至少一次冷进程试验。' }
+    if (!$WpfRenderHost) {
+        $run = [IO.Directory]::CreateDirectory((Join-Path $WpfRenderDirectory ('run-' + [guid]::NewGuid().ToString('N')))).FullName
+        $exe = Join-Path $PSHOME 'pwsh.exe'
+        function Start-RenderTrial($mode,$database,$variant) {
+            $folder = [IO.Directory]::CreateDirectory((Join-Path $run $variant)).FullName
+            $hostArgs = @('-WpfRenderHost','-WpfRenderMode',$mode,'-WpfRenderDirectory',$folder,'-RealDatabase',$database)
+            if ($GuiExecutable) { $hostArgs += @('-GuiExecutable',(Resolve-Path -LiteralPath $GuiExecutable).Path) }
+            & $exe -NoLogo -NoProfile -NonInteractive -STA -File $PSCommandPath @hostArgs
+            if ($LASTEXITCODE) { throw "WPF $mode 验收失败，原始记录位于 $run" }
+        }
+        $variants = @('baseline')
+        $databases = @{baseline=$RealDatabase}
+        $illustrated = @{}
+        if ($MergedDatabase) { $illustrated.baseline=(Resolve-Path -LiteralPath $MergedDatabase).Path }
+        if ($CompareIndexedDatabase) {
+            # 两份完整双卷分别使用自己的浏览器配置；冷进程交错先后次序，避免一版独占较早的时间段。
+            $variants += 'indexed'
+            $databases.indexed=(Resolve-Path -LiteralPath $CompareIndexedDatabase).Path
+            if (!$MergedDatabase) { $illustrated.baseline=$RealDatabase }
+            $illustrated.indexed=$databases.indexed
+        }
+        foreach ($variant in $variants) { Start-RenderTrial Warm $databases[$variant] $variant }
+        foreach ($i in 1..$WpfColdTrials) {
+            $order = @($variants)
+            if ($i % 2 -eq 0) { [Array]::Reverse($order) }
+            foreach ($variant in $order) {
+                Start-RenderTrial Cold $databases[$variant] $variant
+                if ($illustrated[$variant]) { Start-RenderTrial Image $illustrated[$variant] $variant }
+            }
+        }
+        $samples = @(foreach ($variant in $variants) {
+            Get-ChildItem (Join-Path $run $variant) -Filter '*.jsonl' | Get-Content -Encoding utf8 | ForEach-Object {
+                $row = $_ | ConvertFrom-Json
+                $row | Add-Member -NotePropertyName variant -NotePropertyValue $variant -PassThru
+            }
+        })
+        $summary = foreach ($group in ($samples | Group-Object variant,mode)) {
+            foreach ($metric in 'firstMs','allMs','expandMs','peakWorkingSetBytes') {
+                $values = @($group.Group | ForEach-Object { if ($null -ne $_.$metric) { $_.$metric } } | Sort-Object)
+                if ($values.Count) {
+                    [pscustomobject]@{ variant=$group.Group[0].variant; mode=$group.Group[0].mode; metric=$metric; n=$values.Count
+                        p50=$values[[Math]::Ceiling($values.Count*.50)-1]; p95=$values[[Math]::Ceiling($values.Count*.95)-1]
+                        p99=$values[[Math]::Ceiling($values.Count*.99)-1] }
+                }
+            }
+        }
+        $report = [ordered]@{ createdUtc=[datetime]::UtcNow; os=[Environment]::OSVersion.VersionString
+            cpu=(Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0').ProcessorNameString
+            logicalProcessors=[Environment]::ProcessorCount; availableMemoryBytes=[GC]::GetGCMemoryInfo().TotalAvailableMemoryBytes
+            method='WPF window in fresh STA PowerShell hosts. Input to submitted first/all preview frame, including debounce. Expansion starts at button click. OS file cache retained. Peak working set is the host only.'
+            databases=$databases; imageDatabases=$illustrated; percentiles=$summary }
+        $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $run 'report.json') -Encoding utf8
+        $summary | Format-Table -AutoSize
+        Write-Output "WPF 原始逐次记录和汇总：$run"
+        return
+    }
+    $uiDir = if ($GuiExecutable) { Split-Path -Parent (Resolve-Path -LiteralPath $GuiExecutable).Path } else { Join-Path $PSScriptRoot 'bin/Release/net10.0-windows' }
+    $appSha256 = (Get-FileHash -LiteralPath (Join-Path $uiDir 'E_Search.dll')).Hash
+    Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
+    foreach ($name in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search') {
+        $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $uiDir "$name.dll"))
+    }
+    [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+    Add-Type -Namespace ESearchBench -Name Desktop -MemberDefinition '[System.Runtime.InteropServices.DllImport("dwmapi.dll")] public static extern int DwmFlush();'
+    if ($WpfRenderMode -ne 'Warm' -and (Test-Path -LiteralPath (Join-Path $uiDir 'Microsoft.Web.WebView2.Core.dll'))) {
+        # PowerShell 宿主不读取 E_Search.deps.json，显式使用同一桌面构建的架构匹配加载器。
+        $null = [Reflection.Assembly]::LoadFrom((Join-Path $uiDir 'Microsoft.Web.WebView2.Core.dll'))
+        $arch = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
+        $loaderDirectory = if (Test-Path -LiteralPath (Join-Path $uiDir 'WebView2Loader.dll')) { $uiDir } else { Join-Path $uiDir "runtimes/win-$arch/native" }
+        [Microsoft.Web.WebView2.Core.CoreWebView2Environment]::SetLoaderDllFolderPath($loaderDirectory)
+        $env:WEBVIEW2_USER_DATA_FOLDER = [IO.Path]::GetFullPath((Join-Path $WpfRenderDirectory 'WebView2'))
+    }
+    $env:E_SEARCH_EVERYTHING_EXE = Join-Path $WpfRenderDirectory 'no-personal-engine.exe'
+    $scope = if ($WpfRenderMode -eq 'Image') { 'shinseiki' } else { [Management.Automation.Language.NullString]::Value }
+    $w = [ESearch.SearchWindow]::new($RealDatabase,$scope)
+    $w.ShowActivated = $false
+    $w.Topmost = $true
+    $w.WindowStartupLocation = 'CenterScreen'
+    $fields = [Reflection.BindingFlags]'Instance,NonPublic'
+    $gloss,$other,$query,$picker,$details,$body = 'GlossText','OtherGlosses','QueryBox','CandidatePicker','DetailsButton','EntryText' | ForEach-Object { $w.FindName($_) }
+    $context = [Windows.Threading.DispatcherSynchronizationContext]::new($w.Dispatcher)
+    [Threading.SynchronizationContext]::SetSynchronizationContext($context)
+    # Rendering 在合成前发生。等到下一次不同的 RenderingTime 后再同步 DWM，可确定前一帧已经提交。
+    function Wait-RenderFrame([scriptblock]$Observe) {
+        $frame = [Windows.Threading.DispatcherFrame]::new()
+        $state = @{ first=$null; complete=$false }
+        $tick = [EventHandler]{ param($sender,$eventArgs)
+            if ($null -eq $state.first) {
+                $state.first = $eventArgs.RenderingTime
+                if ($Observe) { & $Observe }
+            }
+            elseif ($state.first -ne $eventArgs.RenderingTime) { $state.complete=$true; $frame.Continue=$false }
+        }
+        $limit = [Windows.Threading.DispatcherTimer]::new()
+        $limit.Interval = [TimeSpan]::FromSeconds(8)
+        $limit.add_Tick({ $frame.Continue=$false })
+        [Windows.Media.CompositionTarget]::add_Rendering($tick)
+        try {
+            $limit.Start()
+            [Windows.Threading.Dispatcher]::PushFrame($frame)
+            if (!$state.complete) { throw '当前桌面未产生两帧合成，无法测量 WPF 显示延迟。' }
+            [Runtime.InteropServices.Marshal]::ThrowExceptionForHR([ESearchBench.Desktop]::DwmFlush())
+        } finally { $limit.Stop(); [Windows.Media.CompositionTarget]::remove_Rendering($tick) }
+    }
+    function Visible-Text($control) {
+        if (!$control -or !$control.IsVisible -or !$control.IsArrangeValid -or $control.ActualHeight -le 0 -or $control.ActualWidth -le 0) { return $false }
+        $p = $control.TranslatePoint([Windows.Point]::new(0,0),$w)
+        return $p.X -ge 0 -and $p.Y -ge 0 -and $p.Y+$control.ActualHeight -le $w.ActualHeight+1
+    }
+    $rawOutput = Join-Path $WpfRenderDirectory "$WpfRenderMode-$PID.jsonl"
+    $process = [Diagnostics.Process]::GetCurrentProcess()
+    try {
+        $w.Show()
+        Wait-RenderFrame
+        $words = if ($WpfRenderMode -eq 'Warm') { @('apple','橋','light','食べる','book','たべる','bank','時間','water','猫','time','taberu') }
+            elseif ($WpfRenderMode -eq 'Image') { @('あ·う') } else { @('apple') }
+        $rounds = if ($WpfRenderMode -eq 'Warm') { 0..5 } else { @(1) }
+        foreach ($round in $rounds) { foreach ($word in $words) {
+            $first = $all = $expand = $images = $renderer = $null
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            $query.Text = $word
+            $drawn = @{ first=$false; all=$false }
+            $inspect = {
+                if (!$picker.SelectedItem -or !$gloss.Text -or $gloss.Text -cne $picker.SelectedItem.Hit.Display -or !(Visible-Text $gloss)) { return }
+                $drawn.first = $true
+                $visible = 0
+                for ($i=0; $i -lt $other.Items.Count; $i++) {
+                    $presenter = $other.ItemContainerGenerator.ContainerFromIndex($i)
+                    if (!$presenter -or ![Windows.Media.VisualTreeHelper]::GetChildrenCount($presenter)) { break }
+                    $label = [Windows.Media.VisualTreeHelper]::GetChild($presenter,0)
+                    if (!(Visible-Text $label) -or $label.Text -cne $other.Items[$i]) { break }
+                    $visible++
+                }
+                $drawn.all = $visible -eq $other.Items.Count
+            }
+            do {
+                # 观察上一绘制帧中的真实文本和已布局的列表项，并在后续 DWM 屏障完成后取时间。
+                Wait-RenderFrame $inspect
+                $elapsed = $watch.Elapsed.TotalMilliseconds
+                if ($drawn.first -and $null -eq $first) { $first=$elapsed }
+                if ($drawn.all) { $all=$elapsed }
+                if ($watch.Elapsed.TotalSeconds -gt 45) { throw "查询 $word 未绘制：$($w.FindName('StatusText').Text)" }
+            } while ($null -eq $all)
+            if ($WpfRenderMode -ne 'Warm') {
+                $watch.Restart()
+                $details.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+                $ready=$false
+                do {
+                    Wait-RenderFrame
+                    $status = $w.FindName('StatusText').Text
+                    if ($watch.Elapsed.TotalSeconds -gt 60 -or $status.StartsWith('无法显示词书排版')) { throw "展开 $word 失败或超时：$status" }
+                    if ($WpfRenderMode -eq 'Image' -or $w.FindName('MergedDetail').IsVisible) {
+                        $web = $w.FindName('MergedWebHost').Content
+                        if (!$web -or !$web.CoreWebView2) { continue }
+                        $script = if ($WpfRenderMode -eq 'Image') {
+                            "(()=>{let a=[...document.images].filter(i=>i.src.includes('/es/'));return performance.getEntriesByName('first-contentful-paint').length&&document.readyState==='complete'&&document.querySelector('.es-source')&&a.length&&a.every(i=>i.complete&&i.naturalWidth>0)?a.map(i=>[i.getAttribute('src'),i.naturalWidth,i.naturalHeight]):[]})()"
+                        } else { "document.readyState==='complete'&&performance.getEntriesByName('first-contentful-paint').length>0&&!!document.querySelector('.es-source')&&document.body.innerText.trim().length>0" }
+                        $task = $web.CoreWebView2.ExecuteScriptAsync($script)
+                        while (!$task.IsCompleted -and $watch.Elapsed.TotalSeconds -lt 60) { Wait-RenderFrame }
+                        if (!$task.IsCompleted) { throw 'WebView2 DOM 查询超时' }
+                        $observed = ConvertFrom-Json -InputObject $task.GetAwaiter().GetResult() -NoEnumerate
+                        if ($WpfRenderMode -eq 'Image') { $images=$observed; $ready=$images.Count -gt 0 } else { $ready=$observed -eq $true }
+                        $renderer = 'WebView2'
+                    } else {
+                        $ready = (Visible-Text $w.FindName('DetailScroll')) -and $body.Text -and $body.Text -ne '正在读取词条…' -and !$body.Text.StartsWith('正文读取失败')
+                        $renderer = 'WPF'
+                    }
+                } while (!$ready)
+                Wait-RenderFrame
+                $expand = $watch.Elapsed.TotalMilliseconds
+                if ($WpfRenderMode -eq 'Image') {
+                    foreach ($number in 1,2) {
+                        $expected = "es/shinseiki/img/ic_number_japanese_$number.png"
+                        if (!($images | Where-Object { $_[0] -ceq $expected -and $_[1] -eq 32 -and $_[2] -eq 32 })) {
+                            throw "已展开「$word」，原书图片 $expected 的解码尺寸与验收样本不一致。"
+                        }
+                    }
+                }
+                $preview = Join-Path $WpfRenderDirectory "$WpfRenderMode.png"
+                if ($renderer -eq 'WebView2' -and !(Test-Path -LiteralPath $preview)) {
+                    # 首次保留浏览器实际绘制的像素，截图在取完耗时后执行。
+                    $stream = [IO.File]::Open($preview,'CreateNew','Write','None')
+                    try {
+                        $capture = $web.CoreWebView2.CapturePreviewAsync([Microsoft.Web.WebView2.Core.CoreWebView2CapturePreviewImageFormat]::Png,$stream)
+                        while (!$capture.IsCompleted -and $watch.Elapsed.TotalSeconds -lt 75) { Wait-RenderFrame }
+                        if (!$capture.IsCompleted) { throw 'WebView2 截图超时' }
+                        $null = $capture.GetAwaiter().GetResult()
+                    } finally { $stream.Dispose() }
+                }
+            }
+            if ($round) {
+                $process.Refresh()
+                [ordered]@{mode=$WpfRenderMode; round=$round; word=$word; pid=$PID; firstMs=$first; allMs=$all; expandMs=$expand
+                    previewCount=1+$other.Items.Count; candidates=$picker.Items.Count; peakWorkingSetBytes=$process.PeakWorkingSet64
+                    renderer=$renderer; images=$images; renderTier=[Windows.Media.RenderCapability]::Tier -shr 16; dpiScale=[Windows.Media.VisualTreeHelper]::GetDpi($w).DpiScaleX
+                    appSha256=$appSha256 } | ConvertTo-Json -Depth 6 -Compress | Add-Content -LiteralPath $rawOutput -Encoding utf8
+            }
+        } }
+    } finally { $w.GetType().GetField('exiting',$fields).SetValue($w,$true); $w.Close() }
+    return
 }
 
 if ($BackendTestDirectory -or $IndexedMdxTestDirectory) {
@@ -3602,6 +4639,7 @@ if ($BackendTestDirectory -or $IndexedMdxTestDirectory) {
     Assert-Equal $url ('https://chatgpt.com/?q=' + [Uri]::EscapeDataString($prompt)) '中文与 URL 特殊字符'
     Write-Output 'PASS AI 前缀、空提示词与 ChatGPT 链接编码'
     Test-ImportIdentity $BackendTestDirectory $assembly
+    Test-MergedPackage $BackendTestDirectory $assembly
     Test-WindowsImportPaths $BackendTestDirectory $assembly
     Test-AdditionalDictionaries $BackendTestDirectory $assembly
     Test-EverythingRecovery $BackendTestDirectory $assembly
@@ -3642,7 +4680,10 @@ function Test-RealIndexedComparison([string]$Baseline, [string]$Indexed) {
     try {
         foreach ($path in $Baseline,$Indexed) { $stores.Add($ctor.Invoke(@($path,$true))) }
         $books = $stores[0].ListDictionaries()
-        Assert-Equal (ConvertTo-Json -Compress -InputObject $stores[1].ListDictionaries()) (ConvertTo-Json -Compress -InputObject $books) '两库词典、内容哈希、顺序和启停'
+        $fields = 'Id','Filename','Language','Priority','Records','Sha256','Enabled'
+        $beforeCatalog = @($books | Select-Object -Property $fields)
+        $afterCatalog = @($stores[1].ListDictionaries() | Select-Object -Property $fields)
+        Assert-Equal (ConvertTo-Json -Compress -InputObject $afterCatalog) (ConvertTo-Json -Compress -InputObject $beforeCatalog) '两库词典、内容哈希、顺序和启停'
         if ($stores[0].IndexedHashes().Count -or !$stores[1].IndexedHashes().Count) { throw '对照需要普通库和至少含一本按需读取 MDX 的索引库。' }
 
         $queries = [Collections.Generic.List[string]]::new()

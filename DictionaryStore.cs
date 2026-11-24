@@ -1,7 +1,17 @@
 using Microsoft.Data.Sqlite;
 using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 
-internal sealed record DictionaryInfo(string Id, string Filename, string Language, int Priority, int Records, string Sha256, bool Enabled);
+internal sealed record DictionaryInfo(string Id, string Filename, string Language, int Priority, int Records, string Sha256, bool Enabled)
+{
+    public bool IndexedSource { get; init; }
+    public bool MissingSource { get; init; }
+}
+internal sealed record MergedArticle(string Group, string Key, string Html, string? ResourceArchive)
+{
+    public string Revision { get; init; } = "";
+}
 internal sealed record TableMapping(int Headword, int Gloss, int? Reading, bool HasHeader)
 {
     public IReadOnlyList<string[]>? PreviewRows { get; init; }
@@ -24,6 +34,7 @@ internal sealed record TableMapping(int Headword, int Gloss, int? Reading, bool 
 internal sealed class DictionaryStore : IDisposable
 {
     private readonly SqliteConnection db;
+    private readonly bool writable;
     private readonly MetadataSchema openedSchema;
     // 摘要标记同时绑定提取格式和导入批次。
     private const string OxfordSummaryFormat = "oxford/1:";
@@ -33,6 +44,7 @@ internal sealed class DictionaryStore : IDisposable
 
     internal DictionaryStore(string path, bool readOnly, bool pooling)
     {
+        writable = !readOnly;
         if (!readOnly) Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         db = new SqliteConnection(new SqliteConnectionStringBuilder {
             DataSource = path, Mode = readOnly ? SqliteOpenMode.ReadOnly : SqliteOpenMode.ReadWriteCreate, Pooling = pooling
@@ -103,14 +115,23 @@ internal sealed class DictionaryStore : IDisposable
             """);
         invalidate.ExecuteNonQuery();
         openedSchema = ReadMetadataSchema();
+        MaintainSources();
     }
 
-    private readonly record struct MetadataSchema(bool HasMetadata, bool HasRevision, bool HasSummaryStamp, bool HasMdxRecords)
+    private readonly record struct MetadataSchema(bool HasMetadata, bool HasRevision, bool HasSummaryStamp, bool HasMdxRecords, bool HasMergedRanges)
     {
         public bool IsCurrent => HasRevision && HasSummaryStamp;
         public string Join => HasMetadata ? "LEFT JOIN dictionary_metadata m ON m.id=d.id" : "";
-        public string RecordJoin => HasMdxRecords ? "LEFT JOIN mdx_records mr ON mr.dict=e.dict AND mr.ordinal=e.ordinal" : "";
-        public string RecordRange => HasMdxRecords ? "mr.record_start,mr.record_end" : "NULL,NULL";
+        public string RecordJoin => (HasMdxRecords ? " LEFT JOIN mdx_records mr ON mr.dict=e.dict AND mr.ordinal=e.ordinal" : "")
+            + (HasMergedRanges ? " LEFT JOIN merged_origins mo ON mo.dict=e.dict AND mo.ordinal=e.ordinal LEFT JOIN merged_mdx_pages mp ON mp.page=mo.page" : "");
+        public string RangeColumn(string field) => (HasMdxRecords, HasMergedRanges) switch
+        {
+            (true, true) => $"COALESCE(mr.{field},mp.{field})",
+            (true, false) => "mr." + field,
+            (false, true) => "mp." + field,
+            _ => "NULL"
+        };
+        public string RecordRange => $"{RangeColumn("record_start")},{RangeColumn("record_end")},{(HasMergedRanges ? "mp.page" : "NULL")}";
         // 旧库首次重导前由文件哈希标识；新版本号还能区分相同文件的不同列映射。
         public string Revision => HasRevision ? "COALESCE(m.revision,d.sha256)" : "d.sha256";
     }
@@ -119,17 +140,18 @@ internal sealed class DictionaryStore : IDisposable
     {
         using var check = Command("""
             SELECT COUNT(*), COUNT(CASE WHEN name='revision' THEN 1 END), COUNT(CASE WHEN name='summary_stamp' THEN 1 END),
-                   EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mdx_records')
+                   EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mdx_records'),
+                   EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='merged_mdx_pages')
             FROM pragma_table_info('dictionary_metadata')
             """, tx);
         using var columns = check.ExecuteReader();
         columns.Read();
-        return new(columns.GetInt32(0) > 0, columns.GetInt32(1) > 0, columns.GetInt32(2) > 0, columns.GetBoolean(3));
+        return new(columns.GetInt32(0) > 0, columns.GetInt32(1) > 0, columns.GetInt32(2) > 0, columns.GetBoolean(3), columns.GetBoolean(4));
     }
 
     // 长时间打开的旧库连接可能遇到另一进程升级。列结构与读取的数据必须来自同一快照。
     private MetadataSchema SchemaIn(SqliteTransaction snapshot) =>
-        openedSchema.IsCurrent && openedSchema.HasMdxRecords ? openedSchema : ReadMetadataSchema(snapshot);
+        openedSchema.IsCurrent && openedSchema.HasMdxRecords && openedSchema.HasMergedRanges ? openedSchema : ReadMetadataSchema(snapshot);
 
     private SqliteCommand Command(string sql, SqliteTransaction? tx = null)
     {
@@ -145,7 +167,11 @@ internal sealed class DictionaryStore : IDisposable
         Console.WriteLine($"{info.Id}\t{info.Records}\t{info.Sha256}");
     }
 
-    public DictionaryInfo ImportDictionary(string path, string language, TableMapping? mapping = null, string? replaceId = null)
+    public DictionaryInfo ImportDictionary(string path, string language, TableMapping? mapping = null, string? replaceId = null) =>
+        ImportDictionaryWithProgress(path, language, mapping, replaceId, null, default);
+
+    public DictionaryInfo ImportDictionaryWithProgress(string path, string language, TableMapping? mapping, string? replaceId,
+        Action<string,long,long>? progress, CancellationToken token)
     {
         if (language is not ("ja" or "en" or "zh")) throw new ArgumentException("请选择词典语言");
         var extension = Path.GetExtension(path).ToLowerInvariant();
@@ -158,7 +184,7 @@ internal sealed class DictionaryStore : IDisposable
                 mapping.Headword == mapping.Gloss || mapping.Reading == mapping.Headword || mapping.Reading == mapping.Gloss)
                 throw new ArgumentException("词头、释义和读音须使用不同的有效列");
         }
-        return ImportCore(path, language, mapping, replaceId, null, indexedMode: mapping != null ? false : null);
+        return ImportCore(path, language, mapping, replaceId, null, indexedMode: mapping != null ? false : null, progress, token);
     }
 
     public DictionaryInfo ImportIndexedMdx(string path, string language, string? replaceId = null, Source? source = null) =>
@@ -173,9 +199,17 @@ internal sealed class DictionaryStore : IDisposable
     }
 
     private DictionaryInfo ImportCore(string path, string language, TableMapping? mapping, string? replaceId, Source? cliSource,
-        bool? indexedMode = false)
+        bool? indexedMode = false, Action<string,long,long>? progress = null, CancellationToken token = default)
     {
+        void Report(string stage, long done = 0, long total = 0)
+        {
+            token.ThrowIfCancellationRequested();
+            progress?.Invoke(stage, done, total);
+            token.ThrowIfCancellationRequested();
+        }
+        Report("hash");
         path = Path.GetFullPath(path);
+        if (IsMergedVolume(path)) throw new ArgumentException("双卷须通过设置页的“打开独立双卷词库”或 import-merged 一起导入。");
         string filename = Path.GetFileName(path);
         using var input = File.OpenRead(path);
         if (mapping?.PreviewRows is { } preview)
@@ -186,7 +220,7 @@ internal sealed class DictionaryStore : IDisposable
                 throw new InvalidDataException("词表的表头或样例已改变，请重新预览并确认列映射。");
             input.Position = 0;
         }
-        var hash = Convert.ToHexString(SHA256.HashData(input));
+        var hash = ManagedMdx.TransferHash(input, null, token, progress == null ? null : (done,total) => Report("hash", done, total));
         input.Position = 0;
         // 在写事务内确定身份及优先级，避免两次并发导入同一路径时创建两个词库。
         using var tx = db.BeginTransaction();
@@ -238,6 +272,12 @@ internal sealed class DictionaryStore : IDisposable
             using var previousMode = Command("SELECT 1 FROM mdx_records WHERE dict=$id LIMIT 1", tx);
             previousMode.Parameters.AddWithValue("$id", id);
             indexed = previousMode.ExecuteScalar() != null;
+        }
+        if (existing != null && HasMergedCatalog(tx))
+        {
+            using var part = Command("SELECT 1 FROM merged_sources WHERE dict=$id", tx);
+            part.Parameters.AddWithValue("$id", id);
+            if (part.ExecuteScalar() != null) throw new InvalidOperationException("此来源属于双卷词库，请通过双卷导入更新。");
         }
         if (replaceId != null && existing == null) throw new ArgumentException("要替换的词典已不存在，请刷新列表");
         if (originalId != null && originalId != id) throw new InvalidDataException("此文件已属于另一词典，请选择对应词典重新导入");
@@ -297,26 +337,7 @@ internal sealed class DictionaryStore : IDisposable
         delete.Parameters.AddWithValue("$id", id);
         delete.ExecuteNonQuery();
 
-        using var entry = Command("INSERT INTO entries VALUES($id,$ord,$head,$read,$src,$gloss,$raw,$link)", tx);
-        entry.Parameters.AddWithValue("$id", id);
-        entry.Parameters.Add("$ord", SqliteType.Integer);
-        foreach (var name in new[]{"$head","$read","$src","$gloss","$raw","$link"})
-            entry.Parameters.Add(name, SqliteType.Text);
-        using var index = Command("INSERT OR IGNORE INTO terms VALUES($id,$ord,$kind,$term)", tx);
-        index.Parameters.AddWithValue("$id", id);
-        index.Parameters.Add("$ord", SqliteType.Integer);
-        index.Parameters.Add("$kind", SqliteType.Integer);
-        index.Parameters.Add("$term", SqliteType.Text);
-        // 一条记录的原始词头、展示词头与别名共用词头索引，读音单独写入另一种索引。
-        var headwordKeys = new HashSet<string>(StringComparer.Ordinal);
-        void AddTerm(string term, bool reading)
-        {
-            var key = reading ? Lookup.NormalizeReading(term) : Lookup.Normalize(term);
-            if (key.Length == 0 || (!reading && !headwordKeys.Add(key))) return;
-            index.Parameters["$kind"].Value = reading ? 1 : 0;
-            index.Parameters["$term"].Value = key;
-            index.ExecuteNonQuery();
-        }
+        Report("entries");
         using var reader = mapping == null ? MdxReader.OpenIndexed(path) : null;
         using var locator = indexed ? CreateLocatorWriter(id, tx) : null;
         IEnumerable<(int Ordinal, string Head, string Raw, ParsedEntry Parsed, long Start, long End)> Rows()
@@ -327,18 +348,7 @@ internal sealed class DictionaryStore : IDisposable
                 foreach (var item in reader.Entries)
                 {
                     var body = reader.ReadImportBody(item.Start, item.End);
-                    var parsed = EntryParser.Parse(parserId, item.Headword, body, language);
-                    // 对新导入版本，按旧查询的条件预存两本日语词典的前缀摘要，普通命中即可跳过解压。
-                    if (indexed && parsed.LinkTarget == null && parserId is "sanseido" or "shogakukan")
-                    {
-                        var gloss = parsed.Gloss;
-                        if (parserId == "sanseido")
-                            gloss = EntryParser.RefreshSanseidoGloss(gloss, SqliteTextPrefix(body, 2048));
-                        else if (gloss.EndsWith('〕') || (gloss.StartsWith('〈') && gloss.EndsWith('〉'))
-                                || (gloss.StartsWith('《') && gloss.EndsWith('》')))
-                            gloss = EntryParser.RefreshShogakukanGloss(gloss, SqliteTextPrefix(body, 4096));
-                        parsed = parsed with { Gloss = gloss };
-                    }
+                    var parsed = ParseMdxEntry(parserId, item.Headword, body, language, indexed);
                     yield return (item.Ordinal, item.Headword, body, parsed, item.Start, item.End);
                 }
             }
@@ -350,16 +360,11 @@ internal sealed class DictionaryStore : IDisposable
         }
 
         int count = 0;
-        foreach (var (ord, key, raw, p, start, end) in Rows())
+        using (var writer = new EntryWriter(this, tx))
+        foreach (var (ord, key, raw, parsed, start, end) in Rows())
         {
-            entry.Parameters["$ord"].Value = ord;
-            entry.Parameters["$head"].Value = p.Headword;
-            entry.Parameters["$read"].Value = (object?)p.Reading ?? DBNull.Value;
-            entry.Parameters["$src"].Value = (object?)p.ReadingSource ?? DBNull.Value;
-            entry.Parameters["$gloss"].Value = p.Gloss;
-            entry.Parameters["$raw"].Value = indexed ? "" : raw;
-            entry.Parameters["$link"].Value = p.LinkTarget is null ? DBNull.Value : Lookup.Normalize(p.LinkTarget);
-            entry.ExecuteNonQuery();
+            token.ThrowIfCancellationRequested();
+            writer.Write(id, ord, key, indexed ? "" : raw, parsed);
             if (locator != null)
             {
                 locator.Parameters["$ord"].Value = ord;
@@ -367,14 +372,10 @@ internal sealed class DictionaryStore : IDisposable
                 locator.Parameters["$end"].Value = end;
                 locator.ExecuteNonQuery();
             }
-            index.Parameters["$ord"].Value = ord;
-            headwordKeys.Clear();
-            AddTerm(key, false);
-            AddTerm(p.Headword, false);
-            foreach (var alias in p.Aliases) AddTerm(alias, false);
-            if (!string.IsNullOrWhiteSpace(p.Reading)) AddTerm(p.Reading, true);
             count++;
+            if (count == 1 || count % 512 == 0) Report("entries", count, reader?.Entries.Count ?? 0);
         }
+        Report("entries", count, count);
         if (count == 0) throw new InvalidDataException("词典没有可导入记录，请检查文件和表头选项");
         using var finish = Command("UPDATE dictionaries SET records=$n WHERE id=$id", tx);
         finish.Parameters.AddWithValue("$n", count);
@@ -383,18 +384,450 @@ internal sealed class DictionaryStore : IDisposable
         // 文件内容已完整校验；先持久保存源，再让其他连接看到引用它的事务。
         if (indexed && reader != null)
         {
-            // 目录只从此次校验过的 reader 生成；同一内容由多个词典引用时共用一行。
-            using var layout = Command("""
-                INSERT INTO mdx_layouts(sha256,directory) VALUES($hash,$directory)
-                ON CONFLICT(sha256) DO UPDATE SET directory=excluded.directory WHERE directory<>excluded.directory
-                """, tx);
-            layout.Parameters.AddWithValue("$hash", hash);
-            layout.Parameters.Add("$directory", SqliteType.Blob).Value = reader.ExportVerifiedDirectory(hash);
-            layout.ExecuteNonQuery();
-            ManagedMdx.Preserve(db.DataSource, path, hash);
+            StoreMdxLayout(tx, reader, hash, token);
+            Report("source");
+            ManagedMdx.Preserve(db.DataSource, path, hash, token);
         }
+        // 外部文件持久化完成后才发布事务。取消或异常会回滚已经写入的词头与目录。
+        Report("publish");
         tx.Commit();
         return new DictionaryInfo(id, filename, language, priority, count, hash, existing?.Enabled ?? true);
+    }
+
+    private static ParsedEntry ParseMdxEntry(string parserId, string head, string body, string language, bool indexed)
+    {
+        var parsed = EntryParser.Parse(parserId, head, body, language);
+        if (!indexed || parsed.LinkTarget != null) return parsed;
+        // 预存查询列表使用的旧版首义。双卷和独立 MDX 都只在展开详情时才需要完整正文。
+        var gloss = parsed.Gloss;
+        if (parserId == "sanseido")
+            gloss = EntryParser.RefreshSanseidoGloss(gloss, SqliteTextPrefix(body, 2048));
+        else if (parserId == "shogakukan" && (gloss.EndsWith('〕') || (gloss.StartsWith('〈') && gloss.EndsWith('〉'))
+                || (gloss.StartsWith('《') && gloss.EndsWith('》'))))
+            gloss = EntryParser.RefreshShogakukanGloss(gloss, SqliteTextPrefix(body, 4096));
+        return parsed with { Gloss = gloss };
+    }
+
+    // 独立词典和双卷共用相同的词条解析结果及索引写法；包内来源可逐条交错。
+    private sealed class EntryWriter : IDisposable
+    {
+        private readonly SqliteCommand entry, index;
+        private readonly HashSet<string> headwordKeys = new(StringComparer.Ordinal);
+
+        internal EntryWriter(DictionaryStore store, SqliteTransaction tx)
+        {
+            entry = store.Command("INSERT INTO entries VALUES($id,$ord,$head,$read,$src,$gloss,$raw,$link)", tx);
+            entry.Parameters.Add("$id", SqliteType.Text);
+            entry.Parameters.Add("$ord", SqliteType.Integer);
+            foreach (var name in new[]{"$head","$read","$src","$gloss","$raw","$link"})
+                entry.Parameters.Add(name, SqliteType.Text);
+            index = store.Command("INSERT OR IGNORE INTO terms VALUES($id,$ord,$kind,$term)", tx);
+            index.Parameters.Add("$id", SqliteType.Text);
+            index.Parameters.Add("$ord", SqliteType.Integer);
+            index.Parameters.Add("$kind", SqliteType.Integer);
+            index.Parameters.Add("$term", SqliteType.Text);
+        }
+
+        private void AddTerm(string term, bool reading)
+        {
+            var key = reading ? Lookup.NormalizeReading(term) : Lookup.Normalize(term);
+            if (key.Length == 0 || (!reading && !headwordKeys.Add(key))) return;
+            index.Parameters["$kind"].Value = reading ? 1 : 0;
+            index.Parameters["$term"].Value = key;
+            index.ExecuteNonQuery();
+        }
+        internal void Write(string id, int ord, string key, string raw, ParsedEntry p)
+        {
+            entry.Parameters["$id"].Value = index.Parameters["$id"].Value = id;
+            entry.Parameters["$ord"].Value = ord;
+            entry.Parameters["$head"].Value = p.Headword;
+            entry.Parameters["$read"].Value = (object?)p.Reading ?? DBNull.Value;
+            entry.Parameters["$src"].Value = (object?)p.ReadingSource ?? DBNull.Value;
+            entry.Parameters["$gloss"].Value = p.Gloss;
+            entry.Parameters["$raw"].Value = raw;
+            entry.Parameters["$link"].Value = p.LinkTarget is null ? DBNull.Value : Lookup.Normalize(p.LinkTarget);
+            entry.ExecuteNonQuery();
+            index.Parameters["$ord"].Value = ord;
+            headwordKeys.Clear();
+            AddTerm(key, false);
+            AddTerm(p.Headword, false);
+            foreach (var alias in p.Aliases) AddTerm(alias, false);
+            if (!string.IsNullOrWhiteSpace(p.Reading)) AddTerm(p.Reading, true);
+        }
+
+        public void Dispose() { entry.Dispose(); index.Dispose(); }
+    }
+
+    internal static bool IsMergedVolume(string path) => Path.GetFileName(path).ToLowerInvariant()
+        is "e_search-zh-en.mdx" or "e_search-zh-ja.mdx";
+
+    internal static string MergedDatabasePath(string currentDatabase)
+    {
+        string path = Path.GetFullPath(currentDatabase);
+        var parent = Directory.GetParent(path)!;
+        return parent.Name.Equals("merged-library", StringComparison.OrdinalIgnoreCase) ? path
+            : Path.Combine(parent.FullName, "merged-library", "dictionaries.db");
+    }
+
+    private bool HasMergedCatalog(SqliteTransaction tx)
+    {
+        using var check = Command("SELECT 1 FROM sqlite_master WHERE type='table' AND name='merged_sources'", tx);
+        return check.ExecuteScalar() != null;
+    }
+
+    // 每次读取在一个快照内核对来源版本；旧应用数据库没有双卷表也可以打开。
+    public MergedArticle? MergedArticleFor(LookupEntry hit) => ReadArticle(hit, null, null, null);
+    public MergedArticle? MergedArticleByKey(string group, string key, string? expectedRevision = null) => ReadArticle(null, group, key, expectedRevision);
+
+    private const string MergePrefix = "<!--ESMERGE1:", HelperPrefix = "<!--ESHELP1-->";
+
+    private MergedArticle? ReadArticle(LookupEntry? hit, string? group, string? key, string? expectedRevision)
+    {
+        using var tx = db.BeginTransaction(deferred: true);
+        if (!HasMergedCatalog(tx)) return null;
+        bool indexed = SchemaIn(tx).HasMergedRanges;
+        string range = indexed ? "vm.sha256,p.record_start,p.record_end" : "NULL,NULL,NULL";
+        string select = $"SELECT a.volume,a.head,a.html,v.resource,v.revision,{range} FROM merged_articles a JOIN merged_volumes v ON v.volume=a.volume "
+            + (indexed ? "LEFT JOIN merged_mdx_volumes vm ON vm.volume=a.volume LEFT JOIN merged_mdx_pages p ON p.page=a.page " : "");
+        using var command = Command(select + (hit == null ? "WHERE a.volume=$group AND a.head=$key AND ($expected IS NULL OR v.revision=$expected)" : """
+            JOIN merged_origins o ON o.page=a.page JOIN dictionary_metadata m ON m.id=o.dict
+            WHERE o.dict=$id AND o.ordinal=$ordinal AND m.revision=$revision
+            """), tx);
+        if (hit == null)
+        {
+            command.Parameters.AddWithValue("$group", group!);
+            command.Parameters.AddWithValue("$key", key!);
+            command.Parameters.AddWithValue("$expected", (object?)expectedRevision ?? DBNull.Value);
+        }
+        else
+        {
+            command.Parameters.AddWithValue("$id", hit.DictionaryId);
+            command.Parameters.AddWithValue("$ordinal", hit.EntryId);
+            command.Parameters.AddWithValue("$revision", (object?)hit.DictionaryRevision ?? DBNull.Value);
+        }
+        using var rows = command.ExecuteReader();
+        if (!rows.Read()) return null;
+        var article = new MergedArticle(rows.GetString(0), rows.GetString(1), rows.GetString(2),
+            rows.IsDBNull(3) ? null : ManagedArchivePath(db.DataSource, rows.GetString(3))) { Revision = rows.GetString(4) };
+        if (rows.IsDBNull(6)) return article;
+        string hash = rows.GetString(5);
+        long start = rows.GetInt64(6), end = rows.GetInt64(7);
+        rows.Close();
+        tx.Commit();
+        string page = ReadIndexedBody(hash, start, end, exact: true);
+        int prefixEnd = page.IndexOf("-->", StringComparison.Ordinal);
+        if (prefixEnd < 0 || !(page.StartsWith(MergePrefix, StringComparison.Ordinal) || page.StartsWith(HelperPrefix, StringComparison.Ordinal)))
+            throw new InvalidDataException("合并词页缺少来源标记。");
+        return article with { Html = page[(prefixEnd + 3)..] };
+    }
+
+    public void ImportMerged(string directory, Action<string,int>? progress = null) =>
+        ImportMergedWithProgress(directory, progress == null ? null : (stage,done,total) => {
+            if (stage is "zh-en" or "zh-ja") progress(stage, checked((int)done));
+        }, default);
+
+    public void ImportMergedWithProgress(string directory, Action<string,long,long>? progress, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        directory = Path.GetFullPath(directory);
+        using var manifest = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(directory, "E_search-merge.json")));
+        var root = manifest.RootElement;
+        var fields = new HashSet<string>(StringComparer.Ordinal);
+        if (root.ValueKind != JsonValueKind.Object || root.EnumerateObject().Any(field => !fields.Add(field.Name)))
+            throw new InvalidDataException("双卷清单字段重复或格式无效。");
+        if (root.GetProperty("format").GetInt32() != 1) throw new InvalidDataException("双卷清单版本不受支持。");
+        var counts = root.GetProperty("sources").EnumerateObject().ToDictionary(p => p.Name, p => p.Value.GetInt32(), StringComparer.Ordinal);
+        var sources = Source.All.ToDictionary(s => s.Id, StringComparer.Ordinal);
+        if (sources.Count != counts.Count || sources.Keys.Any(s => !counts.TryGetValue(s, out int n) || n < 1))
+            throw new InvalidDataException("双卷清单缺少来源或词条数无效。");
+        string[] groups = ["zh-en", "zh-ja"];
+        var hashes = root.GetProperty("files").EnumerateObject().ToDictionary(p => p.Name,
+            p => p.Value.GetString() ?? "", StringComparer.Ordinal);
+        var expected = groups.Select(g => $"E_search-{g}.mdx").ToHashSet(StringComparer.Ordinal);
+        // 本协议的八本真实来源中，新世纪日汉双解使用 MDD 及随书资源。
+        expected.Add("E_search-zh-ja.mdd");
+        foreach (var group in groups)
+        {
+            foreach (var path in Directory.EnumerateFiles(directory, $"E_search-{group}*.mdd"))
+                expected.Add(Path.GetFileName(path));
+        }
+        if (expected.Any(name => !(IsMergedVolume(name) || name is "E_search-zh-ja.mdd" or "E_search-zh-en.mdd")) ||
+            !expected.SetEquals(hashes.Keys)) throw new InvalidDataException("实际双卷文件与清单不符，请检查 MDX、MDD 和编号卷。");
+
+        // Windows 的共享只读句柄贯穿哈希校验、读入及提交，避免校验之后输入被替换。
+        var files = new Dictionary<string, FileStream>(StringComparer.Ordinal);
+        try
+        {
+            foreach (var (name, hash) in hashes)
+            {
+                var input = File.OpenRead(Path.Combine(directory, name));
+                files.Add(name, input);
+                if (!ManagedMdx.TransferHash(input, null, token, progress == null ? null : (n,total) => progress("hash",n,total)).Equals(hash, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException($"双卷文件校验失败：{name}");
+                input.Position = 0;
+                if (name.EndsWith(".mdd", StringComparison.OrdinalIgnoreCase))
+                {
+                    // 哈希能固定文件身份；实际读完所有块，确认归档及资源键可供当前阅读器使用。
+                    var keys = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var row in MdxReader.ReadResources(input.Name))
+                    {
+                        token.ThrowIfCancellationRequested();
+                        if (row.Key.Length == 0 || !keys.Add(row.Key)) throw new InvalidDataException($"资源键无效或重复：{row.Key}");
+                    }
+                    if (keys.Count == 0) throw new InvalidDataException("双卷资源归档为空：" + name);
+                }
+            }
+            using var tx = db.BeginTransaction();
+            using var schema = Command("""
+                CREATE TABLE IF NOT EXISTS merged_volumes(volume TEXT PRIMARY KEY, resource TEXT, revision TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS mdx_layouts(sha256 TEXT PRIMARY KEY, directory BLOB NOT NULL) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS merged_mdx_volumes(volume TEXT PRIMARY KEY REFERENCES merged_volumes ON DELETE CASCADE, sha256 TEXT NOT NULL) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS merged_sources(dict TEXT PRIMARY KEY REFERENCES dictionaries ON DELETE CASCADE,
+                    volume TEXT NOT NULL REFERENCES merged_volumes);
+                CREATE TABLE IF NOT EXISTS merged_articles(page INTEGER PRIMARY KEY,volume TEXT NOT NULL REFERENCES merged_volumes,
+                    head TEXT NOT NULL,html TEXT NOT NULL,UNIQUE(volume,head));
+                CREATE TABLE IF NOT EXISTS merged_mdx_pages(page INTEGER PRIMARY KEY REFERENCES merged_articles ON DELETE CASCADE,
+                    record_start INTEGER NOT NULL CHECK(record_start>=0), record_end INTEGER NOT NULL CHECK(record_end>=record_start));
+                CREATE TABLE IF NOT EXISTS merged_origins(dict TEXT NOT NULL,ordinal INTEGER NOT NULL,page INTEGER NOT NULL REFERENCES merged_articles,
+                    PRIMARY KEY(dict,ordinal),FOREIGN KEY(dict,ordinal) REFERENCES entries ON DELETE CASCADE) WITHOUT ROWID;
+                """, tx);
+            schema.ExecuteNonQuery();
+            using (var conflict = Command("SELECT id FROM dictionaries WHERE id NOT IN (SELECT dict FROM merged_sources)", tx))
+            using (var ids = conflict.ExecuteReader())
+            {
+                while (ids.Read())
+                    if (sources.ContainsKey(ids.GetString(0))) throw new InvalidOperationException($"库内已有独立来源 {ids.GetString(0)}，请选独立双卷数据库。");
+            }
+
+            // 同一份包可从另一目录或重排后的 JSON 清单重新打开。索引格式变更时递增版本以触发重建。
+            var identity = new StringBuilder("E_Search merged index 2\n");
+            foreach (var file in hashes.OrderBy(k => k.Key, StringComparer.Ordinal))
+                identity.Append(file.Key).Append(' ').AppendLine(file.Value.ToUpperInvariant());
+            foreach (var item in counts.OrderBy(k => k.Key, StringComparer.Ordinal))
+                identity.Append(item.Key).Append(' ').AppendLine(item.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            string revision = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity.ToString())));
+            using var current = Command("SELECT COUNT(*) FROM merged_volumes WHERE revision=$revision", tx);
+            current.Parameters.AddWithValue("$revision", revision);
+            // 仅在归档经校验并确保受管理的资源缓存仍存在之后复用已建好的索引。
+            var archives = new Dictionary<string, string?>(StringComparer.Ordinal);
+            foreach (var group in groups)
+            {
+                var name = $"E_search-{group}.mdd";
+                archives[group] = files.TryGetValue(name, out var stream) ? CacheArchive(db.DataSource, stream, hashes[name], token) : null;
+            }
+            if (Convert.ToInt32(current.ExecuteScalar()) == groups.Length)
+            {
+                // 用已核对的归档名更新旧库中的绝对路径，无需重建数百万个词条。
+                using var relocate = Command("UPDATE merged_volumes SET resource=$resource WHERE volume=$group AND resource IS NOT $resource", tx);
+                relocate.Parameters.Add("$resource", SqliteType.Text);
+                relocate.Parameters.Add("$group", SqliteType.Text);
+                foreach (var (group, archive) in archives)
+                {
+                    string mdx = $"E_search-{group}.mdx";
+                    ManagedMdx.Preserve(db.DataSource, files[mdx].Name, hashes[mdx], token);
+                    relocate.Parameters["$group"].Value = group;
+                    relocate.Parameters["$resource"].Value = (object?)archive ?? DBNull.Value;
+                    relocate.ExecuteNonQuery();
+                }
+                progress?.Invoke("publish",0,0);
+                token.ThrowIfCancellationRequested();
+                tx.Commit();
+                return;
+            }
+            using var clear = Command("""
+                DELETE FROM entries WHERE dict IN (SELECT dict FROM merged_sources);
+                DELETE FROM merged_articles;
+                DELETE FROM merged_sources;
+                DELETE FROM merged_volumes;
+                """, tx);
+            clear.ExecuteNonQuery();
+            using var writer = new EntryWriter(this, tx);
+            using var article = Command("INSERT INTO merged_articles(volume,head,html) VALUES($group,$key,'') RETURNING page", tx);
+            foreach (var name in new[]{"$group","$key"}) article.Parameters.Add(name, SqliteType.Text);
+            using var location = Command("INSERT INTO merged_mdx_pages VALUES($page,$start,$end)", tx);
+            foreach (var name in new[]{"$page","$start","$end"}) location.Parameters.Add(name, SqliteType.Integer);
+            using var origin = Command("INSERT INTO merged_origins VALUES($id,$ordinal,$page)", tx);
+            origin.Parameters.Add("$id", SqliteType.Text);
+            origin.Parameters.Add("$ordinal", SqliteType.Integer);
+            origin.Parameters.Add("$page", SqliteType.Integer);
+            var seen = sources.Keys.ToDictionary(s => s, _ => 0, StringComparer.Ordinal);
+            foreach (var group in groups)
+            {
+                string name = $"E_search-{group}.mdx";
+                int pages = 0;
+                progress?.Invoke(group, pages, 0);
+                using var volume = Command("INSERT INTO merged_volumes VALUES($group,$resource,$revision)", tx);
+                volume.Parameters.AddWithValue("$group", group);
+                volume.Parameters.AddWithValue("$resource", (object?)archives[group] ?? DBNull.Value);
+                volume.Parameters.AddWithValue("$revision", revision);
+                volume.ExecuteNonQuery();
+                foreach (var source in sources.Values.Where(s => s.MergeGroup == group))
+                    InstallMergedSource(tx, source, counts[source.Id], hashes[name], revision);
+                article.Parameters["$group"].Value = group;
+                using var reader = MdxReader.OpenIndexed(files[name].Name);
+                string hash = hashes[name].ToUpperInvariant();
+                using var managedVolume = Command("INSERT INTO merged_mdx_volumes VALUES($group,$hash)", tx);
+                managedVolume.Parameters.AddWithValue("$group", group);
+                managedVolume.Parameters.AddWithValue("$hash", hash);
+                managedVolume.ExecuteNonQuery();
+                foreach (var physical in reader.Entries)
+                {
+                    string head = physical.Headword;
+                    string body = reader.ReadImportExact(physical.Start, physical.End);
+                    token.ThrowIfCancellationRequested();
+                    if (++pages % 1024 == 0) progress?.Invoke(group, pages, 0);
+                    const string prefix = MergePrefix, helper = HelperPrefix;
+                    bool auxiliary = body.StartsWith(helper, StringComparison.Ordinal);
+                    int end = auxiliary ? helper.Length - 3 : body.IndexOf("-->", StringComparison.Ordinal);
+                    if (!auxiliary && (!body.StartsWith(prefix, StringComparison.Ordinal) || end <= prefix.Length))
+                        throw new InvalidDataException($"双卷词条缺少来源清单：{head}");
+                    article.Parameters["$key"].Value = head;
+                    long page = Convert.ToInt64(article.ExecuteScalar());
+                    location.Parameters["$page"].Value = page;
+                    location.Parameters["$start"].Value = physical.Start;
+                    location.Parameters["$end"].Value = physical.End;
+                    location.ExecuteNonQuery();
+                    if (auxiliary) continue;
+                    using var records = JsonDocument.Parse(Convert.FromBase64String(body[prefix.Length..end]));
+                    if (records.RootElement.GetArrayLength() == 0) throw new InvalidDataException($"词条没有原记录：{head}");
+                    origin.Parameters["$page"].Value = page;
+                    foreach (var row in records.RootElement.EnumerateArray())
+                    {
+                        if (row.GetArrayLength() != 4 || row[0].GetString() is not string sourceId ||
+                            !sources.TryGetValue(sourceId, out var source) || source.MergeGroup != group ||
+                            row[2].GetString() != head || row[3].GetString() is not string raw)
+                            throw new InvalidDataException($"来源记录的分组、词头或正文无效：{head}");
+                        int ordinal = row[1].GetInt32();
+                        if (ordinal < 1 || ordinal > counts[sourceId]) throw new InvalidDataException($"无效原序号：{sourceId}/{ordinal}");
+                        writer.Write(sourceId, ordinal, head, "", ParseMdxEntry(sourceId, head, raw, source.Language, indexed: true));
+                        origin.Parameters["$id"].Value = sourceId;
+                        origin.Parameters["$ordinal"].Value = ordinal;
+                        origin.ExecuteNonQuery();
+                        seen[sourceId]++;
+                    }
+                }
+                StoreMdxLayout(tx, reader, hash, token);
+                ManagedMdx.Preserve(db.DataSource, files[name].Name, hash, token);
+                progress?.Invoke(group, pages, 0);
+            }
+            // SQLite 主键已排除重复；计数和序号上界共同验证 1..N 无缺口。
+            foreach (var (id_, count) in counts)
+                if (seen[id_] != count) throw new InvalidDataException($"原记录数量不符：{id_}，预期 {count}，实际 {seen[id_]}。");
+            progress?.Invoke("publish",0,0);
+            token.ThrowIfCancellationRequested();
+            tx.Commit();
+        }
+        finally { foreach (var input in files.Values) input.Dispose(); }
+    }
+
+    private void InstallMergedSource(SqliteTransaction tx, Source source, int records, string hash, string revision)
+    {
+        // 词书换版保留用户对逻辑来源保存的优先级和启用状态。
+        using var install = Command("""
+            INSERT INTO dictionaries VALUES($id,$language,$priority,$name,$hash,$records)
+            ON CONFLICT(id) DO UPDATE SET filename=excluded.filename,sha256=excluded.sha256,records=excluded.records;
+            INSERT INTO dictionary_metadata(id,parser_id,revision,summary_stamp) VALUES($id,$id,$revision,$stamp)
+            ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,summary_stamp=excluded.summary_stamp;
+            INSERT INTO merged_sources VALUES($id,$group);
+            """, tx);
+        install.Parameters.AddWithValue("$id", source.Id);
+        install.Parameters.AddWithValue("$language", source.Language);
+        install.Parameters.AddWithValue("$priority", source.Priority);
+        install.Parameters.AddWithValue("$name", Path.GetFileName(source.RelativePath));
+        install.Parameters.AddWithValue("$hash", hash.ToUpperInvariant());
+        install.Parameters.AddWithValue("$records", records);
+        install.Parameters.AddWithValue("$revision", revision);
+        install.Parameters.AddWithValue("$group", source.MergeGroup);
+        install.Parameters.AddWithValue("$stamp", source.Id switch
+        {
+            "oxford" => OxfordSummaryFormat + revision,
+            "sanseido" or "shogakukan" => JapaneseSummaryFormat + revision,
+            _ => (object)DBNull.Value
+        });
+        install.ExecuteNonQuery();
+    }
+
+    private static string ManagedArchivePath(string databasePath, string stored)
+    {
+        // 旧版保存了绝对路径。只提取原缓存内的内容哈希，始终从当前数据库旁打开资源。
+        var parts = stored.Replace('\\', '/').Split('/');
+        string filename = parts[^1];
+        if (parts.Length < 2 || !parts[^2].Equals("merged-resources", StringComparison.OrdinalIgnoreCase) ||
+            (parts.Length != 2 && !Path.IsPathFullyQualified(stored)) || filename.Length != 68 ||
+            !filename.EndsWith(".mdd", StringComparison.OrdinalIgnoreCase) ||
+            !filename.Take(64).All(char.IsAsciiHexDigit))
+            throw new InvalidDataException("合并词典的资源缓存路径无效。");
+        string directory = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(databasePath))!, "merged-resources");
+        string path = Path.Combine(directory, filename);
+        if (new DirectoryInfo(directory).LinkTarget != null || new FileInfo(path).LinkTarget != null)
+            throw new InvalidDataException("合并词典的资源缓存不能重定向到其他位置。");
+        return path;
+    }
+
+    public IReadOnlyList<string> MergedResourceHashes()
+    {
+        using var tx = db.BeginTransaction(deferred: true);
+        if (!HasMergedCatalog(tx)) return [];
+        using var assets = Command("SELECT DISTINCT resource FROM merged_volumes WHERE resource IS NOT NULL ORDER BY resource", tx);
+        using var rows = assets.ExecuteReader();
+        var hashes = new SortedSet<string>(StringComparer.Ordinal);
+        while (rows.Read())
+            hashes.Add(Path.GetFileNameWithoutExtension(ManagedArchivePath(db.DataSource, rows.GetString(0))).ToUpperInvariant());
+        return hashes.ToList();
+    }
+
+    internal void CopySeedResources(string sourceDatabase, string destinationDatabase)
+    {
+        foreach (var hash in MergedResourceHashes())
+        {
+            using var source = File.OpenRead(ManagedArchivePath(sourceDatabase, "merged-resources/" + hash + ".mdd"));
+            CacheArchive(destinationDatabase, source, hash, CancellationToken.None);
+        }
+    }
+
+    private static string CacheArchive(string databasePath, FileStream source, string hash, CancellationToken token)
+    {
+        string relative = "merged-resources/" + hash.ToUpperInvariant() + ".mdd";
+        string path = ManagedArchivePath(databasePath, relative);
+        string directory = Path.GetDirectoryName(path)!;
+        Directory.CreateDirectory(directory);
+        bool CurrentMatches()
+        {
+            using var existing = File.OpenRead(path);
+            return ManagedMdx.TransferHash(existing, null, token).Equals(hash, StringComparison.OrdinalIgnoreCase);
+        }
+        if (File.Exists(path) && CurrentMatches()) return relative;
+        // 可见的文件名只指向完整归档，失败的复制保留在单独的暂存目录。
+        var stagingDirectory = new DirectoryInfo(Path.Combine(directory, "staging"));
+        if (stagingDirectory.LinkTarget != null) throw new InvalidDataException("资源暂存目录不能重定向到其他位置。");
+        string staging = Directory.CreateDirectory(stagingDirectory.FullName).FullName;
+        string temporary = Path.Combine(staging, Guid.NewGuid().ToString("N"));
+        source.Position = 0;
+        using (var dest = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            if (!ManagedMdx.TransferHash(source, dest, token).Equals(hash, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("双卷资源在复制过程中发生变化。");
+            dest.Flush(flushToDisk: true);
+        }
+        try { File.Move(temporary, path); }
+        catch (IOException) when (File.Exists(path))
+        {
+            // 原资源损坏时原子替换，保留旧字节；并发发布相同内容时复用已经校验的文件。
+            if (!CurrentMatches()) File.Replace(temporary, path, Path.Combine(staging, Guid.NewGuid().ToString("N") + ".damaged"));
+        }
+        return relative;
+    }
+
+    private void StoreMdxLayout(SqliteTransaction tx, MdxReader.IndexedReader reader, string hash, CancellationToken token)
+    {
+        // 目录只从此次校验过的 reader 生成；同一内容由多个词典引用时共用一行。
+        using var layout = Command("""
+            INSERT INTO mdx_layouts(sha256,directory) VALUES($hash,$directory)
+            ON CONFLICT(sha256) DO UPDATE SET directory=excluded.directory WHERE directory<>excluded.directory
+            """, tx);
+        layout.Parameters.AddWithValue("$hash", hash);
+        layout.Parameters.Add("$directory", SqliteType.Blob).Value = reader.ExportVerifiedDirectory(hash, token);
+        layout.ExecuteNonQuery();
     }
 
     private SqliteCommand CreateLocatorWriter(string id, SqliteTransaction tx)
@@ -462,7 +895,49 @@ internal sealed class DictionaryStore : IDisposable
             throw new InvalidDataException($"表格没有第 {mapping.Reading + 1} 列，请重新选择读音列");
     }
 
-    public IReadOnlyList<DictionaryInfo> ListDictionaries() => ReadCatalog(null);
+    public IReadOnlyList<DictionaryInfo> ListDictionaries()
+    {
+        using var tx = db.BeginTransaction(deferred: true);
+        var indexed = IndexedSourceIds(tx);
+        return ReadCatalog(tx).Select(book => indexed.Contains(book.Id) ? book with {
+            IndexedSource = true, MissingSource = !ManagedMdx.HasSource(db.DataSource, book.Sha256)
+        } : book).ToArray();
+    }
+
+    private HashSet<string> IndexedSourceIds(SqliteTransaction tx)
+    {
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        using var schema = Command("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('mdx_records','merged_mdx_volumes')", tx);
+        var selects = new List<string>();
+        using (var tables = schema.ExecuteReader())
+            while (tables.Read())
+                selects.Add(tables.GetString(0) == "mdx_records"
+                    ? "SELECT d.id FROM dictionaries d WHERE EXISTS(SELECT 1 FROM mdx_records r WHERE r.dict=d.id)"
+                    : "SELECT s.dict FROM merged_sources s JOIN merged_mdx_volumes v ON v.volume=s.volume");
+        if (selects.Count == 0) return ids;
+        using var query = Command(string.Join(" UNION ", selects), tx);
+        using var rows = query.ExecuteReader();
+        while (rows.Read()) ids.Add(rows.GetString(0));
+        return ids;
+    }
+
+    public void RestoreIndexedSource(string id, string path, Action<string,long,long>? progress, CancellationToken token)
+    {
+        using var input = File.OpenRead(path);
+        progress?.Invoke("hash", 0, input.Length);
+        string hash = ManagedMdx.TransferHash(input, null, token, progress == null ? null : (n,total) => progress("hash", n,total));
+        // 在写者事务内重新检查身份。重定位只恢复已发布版本需要的字节，不替换索引或词典设置。
+        using var tx = db.BeginTransaction();
+        using var book = Command("SELECT sha256 FROM dictionaries WHERE id=$id", tx);
+        book.Parameters.AddWithValue("$id", id);
+        if (!IndexedSourceIds(tx).Contains(id) || book.ExecuteScalar() is not string expected)
+            throw new InvalidOperationException("所选词典已变更或未使用托管 MDX，请刷新词典列表。");
+        if (!hash.Equals(expected, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("所选文件的 SHA-256 与当前词典不匹配，请选择这一版本的 MDX 原档。");
+        progress?.Invoke("source", 0, input.Length);
+        ManagedMdx.Preserve(db.DataSource, path, hash, token);
+        tx.Commit();
+    }
 
     public string InstalledId(Source source)
     {
@@ -582,6 +1057,13 @@ internal sealed class DictionaryStore : IDisposable
             AND old.kind=0 AND old.term<>{key} AND term_key(old.term)=term_key({key})
         """;
 
+    // 卷只限定可参加检索的原书；英文还原、假名、短语以及同书重定向仍走原来的检索流程。
+    private static readonly Dictionary<string,string> VolumeIds = Source.All.GroupBy(s => s.MergeGroup)
+        .ToDictionary(g => g.Key, g => string.Join(",", g.Select(s => "'" + s.Id + "'")), StringComparer.Ordinal);
+    private static string ScopeSql(string? scope, string column) =>
+        scope != null && VolumeIds.TryGetValue(scope, out var ids) ? $"($only IS NOT NULL AND {column} IN ({ids}))"
+            : $"($only IS NULL OR {column}=$only)";
+
     private HashSet<string> ExistingTerms(IEnumerable<string> keys, bool reading, string language, string? only,
         SqliteTransaction snapshot, MetadataSchema schema, CancellationToken token)
     {
@@ -605,7 +1087,7 @@ internal sealed class DictionaryStore : IDisposable
             using var cmd = Command($"""
                 {prefix} SELECT DISTINCT t.term FROM terms t JOIN dictionaries d ON t.dict=d.id {schema.Join}
                 WHERE t.term IN ({candidates}) AND (t.kind=$kind {(kanaAliases ? linkedAlias : "")}) AND d.language=$lang
-                    AND ($only IS NULL OR d.id=$only) {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
+                    AND {ScopeSql(only,"d.id")} {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
                 """, snapshot);
             cmd.Parameters.AddWithValue("$kind", reading ? 1 : 0);
             cmd.Parameters.AddWithValue("$lang", language);
@@ -705,8 +1187,8 @@ internal sealed class DictionaryStore : IDisposable
         // 仅在原词典内跟随 MDX 重定向；UNION 去重可终止循环引用。
         bool legacyChinese = !reading && !phrasalSenses && EntryParser.IsChineseExpression(key);
         // 旧汉英库的索引只有「中文 英译」或「中文{学科} 英译」。两个窄区间均能使用 terms_lookup。
-        const string legacyCandidates = """
-            UNION ALL SELECT dict,ordinal,NULL,1 FROM terms WHERE kind=0 AND ($only IS NULL OR dict=$only)
+        string legacyCandidates = $"""
+            UNION ALL SELECT dict,ordinal,NULL,1 FROM terms WHERE kind=0 AND {ScopeSql(only,"dict")}
                 AND ((term >= $startSpace AND term < $endSpace) OR (term >= $startTag AND term < $endTag))
             """;
         var hanyingParser = $"""
@@ -718,16 +1200,16 @@ internal sealed class DictionaryStore : IDisposable
         // 非假名直接从 terms_lookup 出发，无需为了读音查询词典和正文。
         bool kana = Lookup.IsKana(key);
         string currentSummary = schema.IsCurrent ? "COALESCE(m.summary_stamp = ($summaryFormat || m.revision),0)" : "0";
-        string needsJapanesePrefix = schema.IsCurrent && schema.HasMdxRecords
-            ? $"AND (mr.record_start IS NULL OR NOT COALESCE(m.summary_stamp=('{JapaneseSummaryFormat}' || m.revision),0))" : "";
+        string needsJapanesePrefix = schema.IsCurrent && (schema.HasMdxRecords || schema.HasMergedRanges)
+            ? $"AND ({schema.RangeColumn("record_start")} IS NULL OR NOT COALESCE(m.summary_stamp=('{JapaneseSummaryFormat}' || m.revision),0))" : "";
         string physicalKeys = !reading && Lookup.HasLatinJoiner(key)
             ? $"IN (SELECT $key UNION ALL {LegacyLatinTerms("$key")})" : "=$key";
         string seed = kana ? $"""
             SELECT t.dict,t.ordinal,CASE WHEN e.link IS NOT NULL AND d.language='ja' THEN COALESCE(e.reading,e.head) END
             FROM terms t JOIN entries e USING(dict,ordinal) JOIN dictionaries d ON d.id=t.dict
-            WHERE ($only IS NULL OR t.dict=$only) AND ((t.term=$key AND t.kind=$kind)
+            WHERE {ScopeSql(only,"t.dict")} AND ((t.term=$key AND t.kind=$kind)
                 {(reading ? "OR (t.kind=0 AND t.term IN ($key,$katakana) AND e.link IS NOT NULL AND d.language='ja')" : "")})
-            """ : $"SELECT dict,ordinal,NULL FROM terms WHERE term {physicalKeys} AND kind=$kind AND ($only IS NULL OR dict=$only)";
+            """ : $"SELECT dict,ordinal,NULL FROM terms WHERE term {physicalKeys} AND kind=$kind AND {ScopeSql(only,"dict")}";
         using var cmd = Command($"""
             WITH RECURSIVE found(dict,ordinal,aliasReading) AS (
                 {seed}
@@ -789,7 +1271,7 @@ internal sealed class DictionaryStore : IDisposable
             {
                 if (triedBody) return managedBody;
                 triedBody = true;
-                try { managedBody = ReadIndexedBody(db.DataSource, r.GetString(15), r.GetInt64(16), r.GetInt64(17)); }
+                try { managedBody = ReadSourceBody(r.GetString(15), r.GetInt64(16), r.GetInt64(17), !r.IsDBNull(18), entry.DictionaryId, entry.EntryId); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or NotSupportedException)
                 {
                     // 单本源文件缺失或损坏时，仍显示已存首义及其他词典命中；详情读取会报告文件错误。
@@ -886,11 +1368,27 @@ internal sealed class DictionaryStore : IDisposable
         snapshot.Commit();
         if (result == null) return null;
         var row = result.Value;
-        return (row.Evidence, row.Hash == null ? row.Raw : ReadIndexedBody(db.DataSource, row.Hash, row.Start, row.End));
+        return (row.Evidence, row.Hash == null ? row.Raw : ReadSourceBody(row.Hash, row.Start, row.End, row.Merged, id, ordinal));
     }
 
-    private static string ReadIndexedBody(string databasePath, string hash, long start, long end) =>
-        ManagedMdx.Body(databasePath, hash, start, end, () => ReadVerifiedDirectory(databasePath, hash));
+    private string ReadSourceBody(string hash, long start, long end, bool merged, string source, long ordinal)
+    {
+        string body = ReadIndexedBody(hash, start, end, merged);
+        if (!merged) return body;
+        // 一页可含多个同名来源或同一来源的多个义项，用原物理序号还原调用者选中的原文。
+        int endHeader = body.IndexOf("-->", StringComparison.Ordinal);
+        if (body.StartsWith(MergePrefix, StringComparison.Ordinal) && endHeader > MergePrefix.Length)
+        {
+            using var records = JsonDocument.Parse(Convert.FromBase64String(body[MergePrefix.Length..endHeader]));
+            foreach (var row in records.RootElement.EnumerateArray())
+                if (row[0].GetString() == source && row[1].GetInt64() == ordinal)
+                    return row[3].GetString()!;
+        }
+        throw new InvalidDataException($"合并页缺少来源记录 {source}/{ordinal}。");
+    }
+
+    private string ReadIndexedBody(string hash, long start, long end, bool exact) =>
+        ManagedMdx.Body(db.DataSource, hash, start, end, () => ReadVerifiedDirectory(db.DataSource, hash), exact);
 
     private static byte[]? ReadVerifiedDirectory(string databasePath, string hash)
     {
@@ -909,7 +1407,7 @@ internal sealed class DictionaryStore : IDisposable
         return cmd.ExecuteScalar() as byte[];
     }
 
-    private (string? Evidence, string Raw, string? Hash, long Start, long End)? FindBody(string id, long ordinal, string? revision,
+    private (string? Evidence, string Raw, string? Hash, long Start, long End, bool Merged)? FindBody(string id, long ordinal, string? revision,
         SqliteTransaction snapshot, MetadataSchema schema)
     {
         using var cmd = Command($"""
@@ -923,8 +1421,8 @@ internal sealed class DictionaryStore : IDisposable
         using var r = cmd.ExecuteReader();
         if (!r.Read()) return null;
         string? evidence = r.IsDBNull(0) ? null : r.GetString(0);
-        return r.IsDBNull(3) ? (evidence, r.GetString(1), null, 0, 0)
-            : (evidence, "", r.GetString(2), r.GetInt64(3), r.GetInt64(4));
+        return r.IsDBNull(3) ? (evidence, r.GetString(1), null, 0, 0, false)
+            : (evidence, "", r.GetString(2), r.GetInt64(3), r.GetInt64(4), !r.IsDBNull(5));
     }
 
     public void List()
@@ -937,16 +1435,114 @@ internal sealed class DictionaryStore : IDisposable
     public IReadOnlyList<string> IndexedHashes()
     {
         using var snapshot = db.BeginTransaction(deferred: true);
-        if (!SchemaIn(snapshot).HasMdxRecords) return [];
-        // 只列出仍有词条引用的原书。旧导入版本可以保留在磁盘，不应随新发布包分发。
-        using var query = Command("""
-            SELECT DISTINCT d.sha256 FROM dictionaries d
-            WHERE EXISTS (SELECT 1 FROM mdx_records r WHERE r.dict=d.id) ORDER BY d.sha256
-            """, snapshot);
+        return ActiveSourceHashes(snapshot);
+    }
+
+    private List<string> ActiveSourceHashes(SqliteTransaction snapshot)
+    {
+        var queries = new List<string>();
+        if (SchemaIn(snapshot).HasMdxRecords)
+            queries.Add("SELECT d.sha256 FROM dictionaries d WHERE EXISTS (SELECT 1 FROM mdx_records r WHERE r.dict=d.id)");
+        if (HasMergedMdxVolumes(snapshot)) queries.Add("SELECT sha256 FROM merged_mdx_volumes");
+        if (queries.Count == 0) return [];
+        using var query = Command("SELECT DISTINCT sha256 FROM (" + string.Join(" UNION ALL ", queries) + ") ORDER BY sha256", snapshot);
         using var rows = query.ExecuteReader();
         var hashes = new List<string>();
         while (rows.Read()) hashes.Add(rows.GetString(0));
         return hashes;
+    }
+
+    private bool HasMergedMdxVolumes(SqliteTransaction tx)
+    {
+        using var check = Command("SELECT 1 FROM sqlite_master WHERE type='table' AND name='merged_mdx_volumes'", tx);
+        return check.ExecuteScalar() != null;
+    }
+
+    private void MaintainSources()
+    {
+        if (!writable) return;
+        try { ArchiveExpiredSources(); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or SqliteException)
+        {
+            // 维护失败保留源及待办记录；不将已提交的导入误报为失败，之后的可写打开会重试。
+            System.Diagnostics.Trace.TraceWarning("MDX 归档待下次重试：{0}", ex.Message);
+        }
+    }
+
+    public int ArchiveExpiredSources()
+    {
+        if (!writable) throw new InvalidOperationException("只读词库不能执行归档");
+        // SQLite 的内存库和临时库没有持久数据库路径，也没有需要维护的托管目录。
+        if (string.IsNullOrEmpty(db.DataSource) || db.DataSource == ":memory:") return 0;
+        var directory = ManagedMdx.CheckedPath(ManagedMdx.DirectoryFor(db.DataSource));
+        if (!Directory.Exists(directory)) return 0;
+        // 与所有索引发布共用 SQLite 单写者锁。文件先改名再提交；若中断，旧快照仍能从归档读同一内容。
+        using var tx = db.BeginTransaction(deferred: false);
+        using var schema = Command("CREATE TABLE IF NOT EXISTS mdx_retired_sources(sha256 TEXT PRIMARY KEY, retired_at INTEGER NOT NULL) WITHOUT ROWID", tx);
+        schema.ExecuteNonQuery();
+        void ResetAgeOnPublish(string table)
+        {
+            foreach (var change in new[] { "INSERT", "UPDATE OF sha256" })
+            {
+                var action = change == "INSERT" ? "add" : "change";
+                using var trigger = Command($"""
+                    CREATE TRIGGER IF NOT EXISTS mdx_reactivated_{table}_{action}
+                    AFTER {change} ON {table} BEGIN
+                        DELETE FROM mdx_retired_sources WHERE sha256=NEW.sha256;
+                    END
+                    """, tx);
+                trigger.ExecuteNonQuery();
+            }
+        }
+        ResetAgeOnPublish("dictionaries");
+        if (HasMergedMdxVolumes(tx)) ResetAgeOnPublish("merged_mdx_volumes");
+        var active = ActiveSourceHashes(tx).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        using var referenced = Command("DELETE FROM mdx_retired_sources WHERE sha256=$hash", tx);
+        var clearHash = referenced.Parameters.Add("$hash", SqliteType.Text);
+        foreach (var hash in active)
+        {
+            clearHash.Value = hash;
+            referenced.ExecuteNonQuery();
+            try { ManagedMdx.RestoreArchivedSource(db.DataSource, hash); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException)
+            {
+                // 归档也可能在外部被移动或损坏。保持索引与所有副本，仍允许用户重新定位和导入。
+                System.Diagnostics.Trace.TraceWarning("MDX 归档恢复待重试：{0}", ex.Message);
+            }
+        }
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        long cutoff = now - (long)TimeSpan.FromDays(7).TotalSeconds;
+        using var mark = Command("INSERT OR IGNORE INTO mdx_retired_sources VALUES($hash,$now)", tx);
+        var markHash = mark.Parameters.Add("$hash", SqliteType.Text);
+        mark.Parameters.AddWithValue("$now", now);
+        using var expired = Command("SELECT 1 FROM mdx_retired_sources WHERE sha256=$hash AND retired_at<=$cutoff", tx);
+        var expiredHash = expired.Parameters.Add("$hash", SqliteType.Text);
+        expired.Parameters.AddWithValue("$cutoff", cutoff);
+        int count = 0;
+        foreach (var file in Directory.EnumerateFiles(directory, "*.mdx"))
+        {
+            string hash = Path.GetFileNameWithoutExtension(file);
+            if (!Path.GetExtension(file).Equals(".mdx", StringComparison.OrdinalIgnoreCase)
+                || hash.Length != 64 || !hash.All(char.IsAsciiHexDigit) || active.Contains(hash)) continue;
+            // 首次见到的孤儿从今天计时：文件创建日期可能早于一次近期的重导或崩溃。
+            markHash.Value = expiredHash.Value = hash;
+            mark.ExecuteNonQuery();
+            if (expired.ExecuteScalar() == null || !ManagedMdx.TryArchive(file)) continue;
+            clearHash.Value = hash;
+            referenced.ExecuteNonQuery();
+            count++;
+        }
+        // 只回收本产品命名且已超过同一宽限期的暂存副本；发布方持有写句柄时 Windows 会拒绝改名。
+        foreach (var file in Directory.EnumerateFiles(directory, "*.tmp"))
+        {
+            string[] parts = Path.GetFileName(file).Split('.');
+            if (parts.Length == 4 && parts[0].Length == 64 && parts[0].All(char.IsAsciiHexDigit)
+                && parts[1] == "mdx" && Guid.TryParseExact(parts[2], "N", out _)
+                && File.GetLastWriteTimeUtc(ManagedMdx.CheckedPath(file)) <= DateTimeOffset.FromUnixTimeSeconds(cutoff).UtcDateTime
+                && ManagedMdx.TryArchive(file)) count++;
+        }
+        tx.Commit();
+        return count;
     }
 
     public void Compact()
@@ -960,7 +1556,11 @@ internal sealed class DictionaryStore : IDisposable
             throw new IOException("词库已整理，其他连接仍占用 WAL；关闭这些连接后可再次整理。");
     }
 
-    public void Dispose() => db.Dispose();
+    public void Dispose()
+    {
+        try { if (db.State == System.Data.ConnectionState.Open) MaintainSources(); }
+        finally { db.Dispose(); }
+    }
 }
 
 // 每个数据库拥有可随库搬迁的原书目录。索引只引用已发布且按内容命名的文件。
@@ -968,64 +1568,175 @@ internal static class ManagedMdx
 {
     internal static string DirectoryFor(string databasePath) => Path.GetFullPath(databasePath) + ".sources";
 
-    private static string SourcePath(string databasePath, string hash)
+    internal static string SourcePath(string databasePath, string hash)
     {
         if (hash.Length != 64 || !hash.All(char.IsAsciiHexDigit))
             throw new InvalidDataException("索引中的 MDX 文件哈希无效。");
         return Path.Combine(DirectoryFor(databasePath), hash.ToUpperInvariant() + ".mdx");
     }
 
+    // 检查现有目录、文件和悬空链接。尚未创建的普通路径可在通过检查的上级目录下建立。
+    internal static string CheckedPath(string path)
+    {
+        try
+        {
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidDataException($"托管 MDX 路径不可重定向：{path}");
+        }
+        catch (FileNotFoundException) { }
+        catch (DirectoryNotFoundException) { }
+        return path;
+    }
+
+    private static string CheckedSource(string path)
+    {
+        CheckedPath(Path.GetDirectoryName(path)!);
+        return CheckedPath(path);
+    }
+
+    private static string ArchivedPath(string path)
+    {
+        string root = CheckedPath(Path.GetDirectoryName(path)!);
+        string folder = CheckedPath(Path.Combine(root, "archive"));
+        return CheckedPath(Path.Combine(folder, Path.GetFileName(path)));
+    }
+
+    internal static bool HasSource(string databasePath, string hash)
+    {
+        try
+        {
+            string path = CheckedSource(SourcePath(databasePath, hash));
+            return File.Exists(path) || File.Exists(ArchivedPath(path));
+        }
+        catch (InvalidDataException) { return false; }
+    }
+
+    internal static void RestoreArchivedSource(string databasePath, string hash)
+    {
+        // 还原旧库备份后，活动散列可能只存在于归档。复用已有校验和原子发布机制恢复活动路径。
+        string path = CheckedSource(SourcePath(databasePath, hash));
+        string archived = ArchivedPath(path);
+        if (!File.Exists(path) && File.Exists(archived)) Preserve(databasePath, archived, hash);
+    }
+
+    internal static bool TryArchive(string path)
+    {
+        CheckedSource(path);
+        string archived = ArchivedPath(path);
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(archived)!);
+            if (!File.Exists(archived)) File.Move(path, archived);
+            else
+            {
+                // 同一内容可在回滚后再次退役。保留已有归档及新的实物，任何副本都不被覆盖。
+                string copies = CheckedPath(Path.Combine(Path.GetDirectoryName(archived)!, "duplicates"));
+                Directory.CreateDirectory(copies);
+                File.Move(path, Path.Combine(copies, Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N")));
+            }
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            System.Diagnostics.Trace.TraceWarning("MDX 归档尚未完成：{0}", ex.Message);
+            return false;
+        }
+    }
+
     internal static void CopySources(string stagedDatabase, string sourceDatabase, string destinationDatabase)
     {
         using var seed = new DictionaryStore(stagedDatabase, readOnly: true, pooling: false);
+        seed.CopySeedResources(sourceDatabase, destinationDatabase);
         foreach (string hash in seed.IndexedHashes())
-            Preserve(destinationDatabase, SourcePath(sourceDatabase, hash), hash);
+        {
+            string path = CheckedSource(SourcePath(sourceDatabase, hash));
+            try { Preserve(destinationDatabase, path, hash); }
+            catch (FileNotFoundException) when (File.Exists(ArchivedPath(path)))
+            { Preserve(destinationDatabase, ArchivedPath(path), hash); }
+        }
     }
 
-    internal static string Preserve(string databasePath, string inputPath, string hash)
+    internal static string TransferHash(Stream input, Stream? destination, CancellationToken token, Action<long,long>? progress = null)
     {
-        string path = SourcePath(databasePath, hash);
+        // 一次顺序读同时复制与计算 SHA，按固定字节间隔通知界面，取消只丢弃暂存文件。
+        token.ThrowIfCancellationRequested();
+        if (destination == null && progress == null && !token.CanBeCanceled)
+            return Convert.ToHexString(SHA256.HashData(input));
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(128 * 1024);
+        long total = input.Length, done = 0, nextUpdate = 0;
+        try
+        {
+            int count;
+            while ((count = input.Read(buffer)) > 0)
+            {
+                token.ThrowIfCancellationRequested();
+                hash.AppendData(buffer, 0, count);
+                destination?.Write(buffer, 0, count);
+                done += count;
+                if (done >= nextUpdate || done == total)
+                {
+                    progress?.Invoke(done, total);
+                    nextUpdate = done + 4 * 1024 * 1024;
+                }
+            }
+            token.ThrowIfCancellationRequested();
+            return Convert.ToHexString(hash.GetHashAndReset());
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(buffer); }
+    }
+
+    internal static string Preserve(string databasePath, string inputPath, string hash, CancellationToken token = default)
+    {
+        string path = CheckedSource(SourcePath(databasePath, hash));
         bool MatchesExisting()
         {
             using var source = File.OpenRead(path);
-            return Convert.ToHexString(SHA256.HashData(source)).Equals(hash, StringComparison.OrdinalIgnoreCase);
+            return TransferHash(source, null, token).Equals(hash, StringComparison.OrdinalIgnoreCase);
         }
-        if (File.Exists(path) && MatchesExisting()) return path;
+        // 恢复前，缓存的句柄可能仍指向已移出或归档的物理文件。正在读取的请求保留自己的租约。
+        void RebindReaders()
+        {
+            lock (sources)
+            {
+                var stale = FindOpenSource(path);
+                if (stale != null) Retire(stale);
+            }
+        }
+        if (File.Exists(path) && MatchesExisting())
+        {
+            RebindReaders();
+            return path;
+        }
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        string temporary = CheckedSource(path + "." + Guid.NewGuid().ToString("N") + ".tmp");
         try
         {
             // 哈希校验和持久化均在发布前完成。并发导入相同内容时复用已经发布的副本。
             using (var input = File.OpenRead(inputPath))
             using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
             {
-                input.CopyTo(output);
-                output.Position = 0;
-                if (!Convert.ToHexString(SHA256.HashData(output)).Equals(hash, StringComparison.OrdinalIgnoreCase))
+                if (!TransferHash(input, output, token).Equals(hash, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException("复制过程中 MDX 内容发生变化，请重新导入。");
                 output.Flush(flushToDisk: true);
             }
-            try { File.Move(temporary, path); }
+            try { File.Move(CheckedSource(temporary), CheckedSource(path)); }
             catch (IOException) when (File.Exists(path))
             {
                 if (!MatchesExisting())
                 {
                     // 原件已损坏时用已校验的副本原子修复，坏文件留下供核对。
-                    string retired = Path.Combine(Path.GetDirectoryName(path)!, "retired");
+                    string retired = CheckedPath(Path.Combine(CheckedPath(Path.GetDirectoryName(path)!), "retired"));
                     Directory.CreateDirectory(retired);
-                    string backup = Path.Combine(retired, Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N"));
+                    string backup = CheckedPath(Path.Combine(retired, Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N")));
                     try { File.Replace(temporary, path, backup); }
                     catch (IOException) when (File.Exists(path) && MatchesExisting()) { }
-                    lock (sources)
-                    {
-                        var stale = FindOpenSource(path);
-                        if (stale != null) Retire(stale);
-                    }
                 }
             }
+            RebindReaders();
             return path;
         }
-        finally { File.Delete(temporary); }
+        finally { File.Delete(CheckedSource(temporary)); }
     }
 
     private sealed class OpenSource(string path, string hash)
@@ -1041,8 +1752,11 @@ internal static class ManagedMdx
                 if (Reader != null) return Reader;
                 // 新索引在读取块时校验其 SHA；旧索引首次打开时校验全书。目录只在缓存缺失时查询一次。
                 var directory = loadDirectory?.Invoke();
-                return Reader = directory == null ? MdxReader.OpenRecords(Path, hash)
-                    : MdxReader.OpenRecords(Path, hash, directory);
+                MdxReader.IndexedReader Open(string path) => directory == null ? MdxReader.OpenRecords(path, hash)
+                    : MdxReader.OpenRecords(path, hash, directory);
+                // 已打开的句柄允许改名。较迟才展开的旧快照在同一卷上原子改名之后可用同一散列读归档。
+                try { return Reader = Open(CheckedSource(Path)); }
+                catch (FileNotFoundException) when (File.Exists(ArchivedPath(Path))) { return Reader = Open(ArchivedPath(Path)); }
             }
         }
     }
@@ -1064,7 +1778,7 @@ internal static class ManagedMdx
         if (node.Value.Users == 0) node.Value.Reader?.Dispose();
     }
 
-    internal static string Body(string databasePath, string hash, long start, long end, Func<byte[]?>? loadDirectory = null)
+    internal static string Body(string databasePath, string hash, long start, long end, Func<byte[]?>? loadDirectory = null, bool exact = false)
     {
         string path = SourcePath(databasePath, hash);
         LinkedListNode<OpenSource> node;
@@ -1079,7 +1793,8 @@ internal static class ManagedMdx
         try
         {
             // 校验文件、定位及解压都在锁外进行，读者持有租约期间不会关闭其句柄。
-            return node.Value.GetReader(loadDirectory).ReadBody(start, end);
+            var reader = node.Value.GetReader(loadDirectory);
+            return exact ? reader.ReadExactBody(start, end, importing: false) : reader.ReadBody(start, end);
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
         {

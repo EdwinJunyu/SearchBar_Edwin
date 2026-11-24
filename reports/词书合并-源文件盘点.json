@@ -1,0 +1,597 @@
+{
+  "source_root": "D:\\D_Main\\JP\\日语\\文法词汇查阅excel+GoldenDict电子词典+potplayer播放器+honeyview看图器\\GoldenDict\\辞书",
+  "inventory_basis": "MDX 原档 SHA-256、物理头部条数与 E_Search 项目库记录核对。原书目录已递归盘点。缺件引用统计取自这些哈希对应的已有 E_Search 原文索引，序号从 1 开始。",
+  "total_records": 3271081,
+  "sources": [
+    {
+      "source": "shogakukan",
+      "volume": "zh-ja",
+      "primary": true,
+      "path": "中日\\[5《小学馆V2日汉辞典》.mdx",
+      "sha256": "9fd3b83f4f3ca78fc11a0534d93f65005ef2b25dcd1eaf098ba2cfc67793506c",
+      "bytes": 9131848,
+      "physical_record_count": 70307,
+      "engine": "1.2",
+      "encoding": "UTF-16",
+      "encrypted": "No",
+      "key_case_sensitive": "No",
+      "strip_key": null
+    },
+    {
+      "source": "oxford",
+      "volume": "zh-en",
+      "primary": true,
+      "path": "英语\\[英-汉] ◆【牛津高阶学习词典英汉双解第7版】【全新孤雷排版】【2011.7.31】.mdx",
+      "sha256": "d17d6c63ea4eb757fb5d3211cff43d7a1e445cb662cc690f09b8ee2086e0a896",
+      "bytes": 15599710,
+      "physical_record_count": 42481,
+      "engine": "1.2",
+      "encoding": "UTF-16",
+      "encrypted": "No",
+      "key_case_sensitive": "No",
+      "strip_key": null
+    },
+    {
+      "source": "hanying",
+      "volume": "zh-en",
+      "primary": false,
+      "path": "英语\\现代汉英综合大辞典.mdx",
+      "sha256": "f573eda9bcadf86b5bfed9dc715cd8a79cd4c784822d98a211cb8f7ec1a283cb",
+      "bytes": 23591792,
+      "physical_record_count": 376636,
+      "engine": "2.0",
+      "encoding": "UTF-8",
+      "encrypted": "0",
+      "key_case_sensitive": "No",
+      "strip_key": "Yes"
+    },
+    {
+      "source": "sanseido",
+      "volume": "zh-ja",
+      "primary": false,
+      "path": "中日\\[3三省堂超级大辞林第二版.mdx",
+      "sha256": "0ab9f10a785e179bdd6ad11cc23f865bf3b7fb1b22f5d8d04e48caaf5088aa36",
+      "bytes": 52152027,
+      "physical_record_count": 520678,
+      "engine": "2.0",
+      "encoding": "UTF-16",
+      "encrypted": "2",
+      "key_case_sensitive": "No",
+      "strip_key": "Yes"
+    },
+    {
+      "source": "shinseiki",
+      "volume": "zh-ja",
+      "primary": false,
+      "path": "中日\\新世纪日汉双解\\xsjrihanshuangjie.mdx",
+      "sha256": "fda375da3c19c8c54ea53045ce61bb2c049dc80afacabb63a71802cb4598a3bf",
+      "bytes": 45944733,
+      "physical_record_count": 403511,
+      "engine": "2.0",
+      "encoding": "UTF-8",
+      "encrypted": "2",
+      "key_case_sensitive": "No",
+      "strip_key": "Yes"
+    },
+    {
+      "source": "sango",
+      "volume": "zh-ja",
+      "primary": false,
+      "path": "中日\\[1其他语种] 三合一日語辭典《新日汉大辞典》、《实用汉日辞典》、 《详解日本外来语辞典》[172761](090126).mdx",
+      "sha256": "fa2e9364347ce57bf34c74cb6fab504f71c905c6a3f6e365bc2e6b6725ea40b1",
+      "bytes": 10495757,
+      "physical_record_count": 172761,
+      "engine": "1.2",
+      "encoding": "UTF-16",
+      "encrypted": "No",
+      "key_case_sensitive": "No",
+      "strip_key": null
+    },
+    {
+      "source": "eijiro",
+      "volume": "zh-ja",
+      "primary": false,
+      "path": "中日\\《英辞郎v86英和辞典》[090412].mdx",
+      "sha256": "327e39674d05ad443a199fcee9b9d3b5c8d93883fcb80c82e9f45b65f911fd39",
+      "bytes": 56070000,
+      "physical_record_count": 1604742,
+      "engine": "1.2",
+      "encoding": "UTF-16",
+      "encrypted": "No",
+      "key_case_sensitive": "No",
+      "strip_key": null
+    },
+    {
+      "source": "shogakukan-zhja",
+      "volume": "zh-ja",
+      "primary": false,
+      "path": "中日\\[7《小学馆V2中日辞典》.mdx",
+      "sha256": "d7a4466ee2d11fd540e246ce1711b9ec2876e21472092bd6518597618e69e46a",
+      "bytes": 8257334,
+      "physical_record_count": 79965,
+      "engine": "1.2",
+      "encoding": "UTF-16",
+      "encrypted": "No",
+      "key_case_sensitive": "No",
+      "strip_key": null
+    }
+  ],
+  "companion_assets": [
+    {
+      "source": "shinseiki",
+      "path": "中日\\新世纪日汉双解\\xinrihanshuangjie.css",
+      "sha256": "7d8f151e5754b2ccad021a5a3ac8c6c5f225e6ec77f4a1e1ea80d4b6dc5399f0",
+      "bytes": 1448
+    },
+    {
+      "source": "shinseiki",
+      "path": "中日\\新世纪日汉双解\\xsjrihanshuangjie.jpg",
+      "sha256": "73baec88cc7d484e2978199667ffea358321890eab7231350380b754bd499aa8",
+      "bytes": 34611
+    },
+    {
+      "source": "shinseiki",
+      "path": "中日\\新世纪日汉双解\\xsjrihanshuangjie.mdd",
+      "sha256": "6e8e032aa1c2f27fa4ceb3ff830d8e79881fb408a475bc6c414da5b06ea1b4bc",
+      "bytes": 3632424,
+      "physical_resource_count": 1040
+    }
+  ],
+  "oxford_missing_images": {
+    "affected_records": 124,
+    "references": 184,
+    "files": [
+      {
+        "path": "38126.gif",
+        "references": 7,
+        "source_ordinals_1based": [
+          6305,
+          8225,
+          9393,
+          13744,
+          27826,
+          28259
+        ]
+      },
+      {
+        "path": "65126.gif",
+        "references": 3,
+        "source_ordinals_1based": [
+          3810,
+          16142
+        ]
+      },
+      {
+        "path": "6559126.gif",
+        "references": 26,
+        "source_ordinals_1based": [
+          677,
+          2383,
+          8067,
+          8241,
+          8832,
+          9872,
+          11065,
+          11904,
+          12165,
+          12256,
+          12309,
+          12320,
+          12332,
+          12341,
+          18455,
+          27230,
+          29633,
+          34825,
+          40857
+        ]
+      },
+      {
+        "path": "7959126.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          28201
+        ]
+      },
+      {
+        "path": "81126.gif",
+        "references": 54,
+        "source_ordinals_1based": [
+          677,
+          757,
+          2383,
+          2653,
+          3027,
+          4222,
+          4368,
+          4373,
+          8067,
+          8241,
+          8832,
+          8833,
+          9872,
+          11065,
+          11904,
+          12165,
+          12256,
+          12309,
+          12320,
+          12332,
+          12341,
+          12377,
+          14867,
+          15490,
+          16132,
+          16133,
+          17954,
+          18455,
+          20815,
+          27187,
+          27230,
+          27743,
+          28201,
+          29633,
+          30166,
+          30241,
+          32834,
+          34825,
+          38085,
+          40857
+        ]
+      },
+      {
+        "path": "SpChar1.gif",
+        "references": 7,
+        "source_ordinals_1based": [
+          3796,
+          9036,
+          10985,
+          18742,
+          22389
+        ]
+      },
+      {
+        "path": "SpChar10.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          41236
+        ]
+      },
+      {
+        "path": "SpChar11.gif",
+        "references": 12,
+        "source_ordinals_1based": [
+          8583,
+          9097,
+          11258,
+          29970,
+          36168,
+          39035,
+          41910,
+          41911
+        ]
+      },
+      {
+        "path": "SpChar12.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          36609
+        ]
+      },
+      {
+        "path": "SpChar14.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          16590
+        ]
+      },
+      {
+        "path": "SpChar15.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          31370
+        ]
+      },
+      {
+        "path": "SpChar16.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          15469
+        ]
+      },
+      {
+        "path": "SpChar17.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          25602
+        ]
+      },
+      {
+        "path": "SpChar18.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          25602
+        ]
+      },
+      {
+        "path": "SpChar19.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          25602
+        ]
+      },
+      {
+        "path": "SpChar2.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          2923
+        ]
+      },
+      {
+        "path": "SpChar20.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          11453
+        ]
+      },
+      {
+        "path": "SpChar21.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          4133
+        ]
+      },
+      {
+        "path": "SpChar22.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          10220
+        ]
+      },
+      {
+        "path": "SpChar23.gif",
+        "references": 3,
+        "source_ordinals_1based": [
+          16366,
+          32252
+        ]
+      },
+      {
+        "path": "SpChar24.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          22931
+        ]
+      },
+      {
+        "path": "SpChar25.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          17034
+        ]
+      },
+      {
+        "path": "SpChar26.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          32796
+        ]
+      },
+      {
+        "path": "SpChar27.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          22138
+        ]
+      },
+      {
+        "path": "SpChar28.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          18362
+        ]
+      },
+      {
+        "path": "SpChar29.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          21466
+        ]
+      },
+      {
+        "path": "SpChar3.gif",
+        "references": 7,
+        "source_ordinals_1based": [
+          3699,
+          4326,
+          9660,
+          10880,
+          14631,
+          16324,
+          41583
+        ]
+      },
+      {
+        "path": "SpChar30.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          23713
+        ]
+      },
+      {
+        "path": "SpChar4.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          3816
+        ]
+      },
+      {
+        "path": "SpChar5.gif",
+        "references": 8,
+        "source_ordinals_1based": [
+          795,
+          4952,
+          14633,
+          19888,
+          27918,
+          32664,
+          37667,
+          42362
+        ]
+      },
+      {
+        "path": "SpChar6.gif",
+        "references": 8,
+        "source_ordinals_1based": [
+          7334,
+          7557,
+          12282,
+          13184,
+          13193,
+          21439,
+          39398
+        ]
+      },
+      {
+        "path": "SpChar7.gif",
+        "references": 4,
+        "source_ordinals_1based": [
+          28436
+        ]
+      },
+      {
+        "path": "SpChar8.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          22692
+        ]
+      },
+      {
+        "path": "SpChar9.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          37586
+        ]
+      },
+      {
+        "path": "amacr.gif",
+        "references": 2,
+        "source_ordinals_1based": [
+          40600,
+          40763
+        ]
+      },
+      {
+        "path": "blarrow.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          1881
+        ]
+      },
+      {
+        "path": "cuberoot.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          9007
+        ]
+      },
+      {
+        "path": "epsi.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          12459
+        ]
+      },
+      {
+        "path": "flat.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          14022
+        ]
+      },
+      {
+        "path": "frac14.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          29892
+        ]
+      },
+      {
+        "path": "frac34.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          34311
+        ]
+      },
+      {
+        "path": "half.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          23859
+        ]
+      },
+      {
+        "path": "natur.gif",
+        "references": 4,
+        "source_ordinals_1based": [
+          24516
+        ]
+      },
+      {
+        "path": "partial.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          32600
+        ]
+      },
+      {
+        "path": "pause.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          26992
+        ]
+      },
+      {
+        "path": "phis.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          27566
+        ]
+      },
+      {
+        "path": "sharp.gif",
+        "references": 3,
+        "source_ordinals_1based": [
+          33182,
+          33482,
+          38314
+        ]
+      },
+      {
+        "path": "swastika.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          36879
+        ]
+      },
+      {
+        "path": "upsi_lower.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          40225
+        ]
+      },
+      {
+        "path": "upsi_upper.gif",
+        "references": 1,
+        "source_ordinals_1based": [
+          40225
+        ]
+      }
+    ]
+  },
+  "hanying_missing_stylesheet": {
+    "path": "sf_cb.css",
+    "affected_records": 376636
+  }
+}
