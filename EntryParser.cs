@@ -19,6 +19,36 @@ internal static partial class EntryParser
     [GeneratedRegex("""<font face="Kingsoft Phonetic Plain, Tahoma" (?:color=(?:red|#fb8c42|#0000ff)|style="font-weight:normal")>([^<>]+)</font>""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex OxfordPhoneticFont();
 
+    private const string OxfordStyleQuote = """<FONT style="font-weight:normal">'</FONT>""";
+    private const string OxfordFormula = """<SPAN style="FONT-WEIGHT: normal; FONT-SIZE: 7pt; VERTICAL-ALIGN: (?<align>sub|super); FONT-STYLE: normal; FONT-FAMILY: """
+        + OxfordStyleQuote + "Arial" + OxfordStyleQuote + ", " + OxfordStyleQuote + "细明体" + OxfordStyleQuote + "\">(?<digits>-?[0-9]+)";
+
+    [GeneratedRegex(OxfordFormula + @"(?=</(?:SPAN|font)>|\z)")]
+    private static partial Regex OxfordFormulaNumber();
+
+    [GeneratedRegex("(?<first>" + OxfordFormula + ")</font>(?<tail>[^<>]*(?:" + OxfordFormula + "</SPAN>[^<>]*)?)</SPAN>")]
+    private static partial Regex OxfordSwappedFormulaEnds();
+
+    internal static string NormalizeOxfordFormulas(string html)
+    {
+        if (!html.Contains("FONT-FAMILY: <FONT", StringComparison.Ordinal)) return html;
+        // 十一处译义或例句在数字后误关 font，在单位等正文后误关 SPAN。交换等长闭标签，
+        // 让单位仍属于原译义；维生素 B₂ 的同一译义尾部还包含第二个下标。
+        html = OxfordSwappedFormulaEnds().Replace(html, "${first}</SPAN>${tail}</font>");
+        return OxfordFormulaNumber().Replace(html, match => string.Create(match.Length, match, (result, token) =>
+        {
+            // 两种详情共用 Unicode 上下标。空格填在开标签内部，不产生可见空白；
+            // 总长度与原书相同，查词和反查义项返回的仍是原始正文坐标。
+            result.Fill(' ');
+            "<SPAN".AsSpan().CopyTo(result);
+            var digits = token.Groups["digits"].ValueSpan;
+            int at = result.Length - digits.Length;
+            result[at - 1] = '>';
+            string alphabet = token.Groups["align"].ValueSpan.SequenceEqual("sub") ? "₀₁₂₃₄₅₆₇₈₉₋" : "⁰¹²³⁴⁵⁶⁷⁸⁹⁻";
+            foreach (char digit in digits) result[at++] = alphabet[digit == '-' ? 10 : digit - '0'];
+        }));
+    }
+
     internal static string DecodeOxfordFont(string html) => OxfordPhoneticFont().Replace(html, match =>
     {
         var text = match.Groups[1].Value;
@@ -42,13 +72,25 @@ internal static partial class EntryParser
                        ("\u2072","²"), ("\u2073","³")],
         // 仅这一组英日例句之间有 72 个全角填充空格；其它缩进和分隔符具有排版意义。
         ["eijiro"] = [("death?" + new string('　',72) + " あなたのお父様","death? あなたのお父様")],
-        ["oxford"] = [("防\uE40C","防卫"), ("守\uE40C队员","守卫队员")],
-        ["sango"] = [("?ngstr?m","ångström"), ("se\uE570or","señor")],
-        ["shogakukan"] = [("\uE116","²"), ("\uE46E","→"), ("\uE7C8g","ǹg")],
+        ["oxford"] = [("防\uE40C","防卫"), ("守\uE40C队员","守卫队员"),
+                      ("BUY NOW&NDASH;PAY LATER","BUY NOW–PAY LATER"), ("56&half; inches in Britain","56½ inches in Britain")],
+        // 三合一本书另收有完整的德语、葡语及法语词形；三处法语撇号均见于紧邻的同义词条。
+        ["sango"] = [("?ngstr?m","ångström"), ("se\uE570or","señor"), ("D?bel","Dübel"),
+                     ("Independ?ncia","Independência"), ("l?art pour l?art","l'art pour l'art"),
+                     ("ballon d?essai","ballon d'essai"), ("trompe－l?oeil","trompe－l'oeil"), ("\uE0C8","𝄋")],
+        // 两卷的同码未必同字。仅采用本卷读音、词义与中日卷词头对应的用例。
+        // 核黄素一条在原文保有 B；其摘要只剩下标，需连同维生素名恢复。
+        ["shogakukan"] = [("\uE116","²"), ("\uE46E","→"), ("\uE7C8g","ǹg"),
+                          ("\uE184","𫚕"), ("眍\uE18C","眍䁖"), ("\uE185裆","𮖁裆"),
+                          ("竹\uE1AA鱼","竹䇲鱼"), ("\uE217\uE218","𮩛𫗩"),
+                          ("B\uE119","B₂"), ("核黄素,维生素\uE119","核黄素,维生素B₂"),
+                          ("」が異体字になっていたので修正した。\">","」が異体字になっていたので修正した。")],
         // 小学馆中日的「外字（繁字）读音」与 Unihan 17 的双向唯一简繁对及读音对照。
         // 只收录已知繁字、缺简字的方向；括注外字可能是同音异体，不能反向推断。
         ["shogakukan-zhja"] = [
             ("C\uE117I","C³I"), ("\uE11F","『量』"),
+            // 原书直接给出三个符号的名称或笔形：阴爻、提笔、竹字头。
+            ("\uE11E","⚋"), ("\uE121","㇀"), ("\uE123","⺮"),
             // #39909 和 #41519 把第四声写在韵尾；其余实例在 #16961，是独立成音节的 ǹ。
             ("欠qia\uE7C8","欠qiàn"), ("碰壁pe\uE7C8gbì","碰壁pèngbì"), ("\uE7C8","ǹ"),
             ("\uE184","𫚕"), ("\uE185","𮖁"), ("\uE18C","䁖"), ("\uE1A5","褝"),
@@ -82,6 +124,20 @@ internal static partial class EntryParser
         ["shinseiki"] = [
             // 秋田等三个原表头保有 U+2219；生卒年、例句中的普通问号不参与替换。
             ("市 ? 郡 ? 町 ? 村名","市 ∙ 郡 ∙ 町 ∙ 村名"),
+            // 火偏、日偏的中文对译逐字列出相同例字与部首。只还原日文的这两个例句。
+            ("「炉」「煽」などの「??」の部分。","「炉」「煽」などの「火」の部分。"),
+            ("「明」「昨」などの「鲉」の部分。","「明」「昨」などの「日」の部分。"),
+            // 同书国家代码模板在句号处结束；E5E7 在书内也见于句中，限这两句。
+            ("ISOの国·地域コードの一。\uE5E7","ISOの国·地域コードの一。"),
+            ("IOCの国·地域コードの一。\uE5E7","IOCの国·地域コードの一。"),
+            // 对照同条已经印出的「原词」，只恢复原文与译文能够逐字核对的引用。
+            ("\uE526院\uE527","「院」"), ("\uE526殿\uE527","「殿」"), ("\uE526かみ(上)\uE527","「かみ(上)」"),
+            ("\uE526とがりょう\uE527","「とがりょう」"), ("\uE526科料\uE527","「科料」"),
+            ("\uE526あやまちりょう\uE527","「あやまちりょう」"), ("\uE526けんこつ\uE527","「けんこつ」"),
+            ("\uE526黄土色\uE527","「黄土色」"), ("Queir\uE7B2s","Queirós"),
+            // 释义点名符号；E788 在同书还用于 phi，仅修复明示读作プサイ的粒子名。
+            ("J/\uE788","J/ψ"), ("\uE02F","∀"), ("\uE055","∃"), ("\uE59E","©"),
+            ("\uE0C8","𝄋"), ("\uE0AF","♠"), ("\uE080","$"), ("\uE054","℉"), ("\uE54F","∅"),
             // 法语 vasectomie 的元音无重音，须在本书常见的 é 字形前处理这个完整拼写。
             ("vas\uE7B0ctomie","vasectomie"),
             ("\uE003","様"), ("\uE578","ç"), ("\uE7B0","é"), ("\uE548","ł"), ("\uE568","ë"),
@@ -117,13 +173,38 @@ internal static partial class EntryParser
         // 普通文本占绝大多数；只在出现该书已核对的标记时遍历规则。
         if (!value.AsSpan().ContainsAnyInRange('\uE000','\uF8FF')
             && !(sourceId == "hanying" && value.AsSpan().ContainsAny('ⁱ','\u2072','\u2073'))
-            && !(sourceId == "sango" && value.Contains("?ngstr?m", StringComparison.Ordinal))
-            && !(sourceId == "shinseiki" && value.Contains("市 ? 郡", StringComparison.Ordinal))
+            && !(sourceId == "sango" && value.Contains('?'))
+            && !(sourceId == "oxford" && value.Contains('&'))
+            && !(sourceId == "shogakukan" && value.Contains("\">", StringComparison.Ordinal))
+            && !(sourceId == "shinseiki" && value.AsSpan().ContainsAny('?','鲉'))
             && !(sourceId == "eijiro" && value.Contains('　'))) return value;
         foreach (var (before, after) in DisplayReplacements(sourceId))
             value = value.Replace(before, after, StringComparison.Ordinal);
         return value;
     }
+
+    internal static string DisplayHeadword(string sourceId, string head)
+    {
+        head = DisplayText(sourceId, head);
+        if (sourceId is not ("sanseido" or "shinseiki") || !head.AsSpan().ContainsAny('<', '&')) return head;
+        // #365232 的空记录留下了半个标题；同书 #232068 给出了完整拼写。两条物理记录仍独立。
+        if (sourceId == "sanseido" && head == "取(り)澄ます】<br></font></font>") return "取(り)澄ます";
+        const string subDigits = "₀₁₂₃₄₅₆₇₈₉";
+        head = HeadSubscript().Replace(head, m => m.Groups[1].Value == "x" ? "ₓ" :
+            string.Concat(m.Groups[1].Value.Select(digit => subDigits[digit - '0'])));
+        if (sourceId == "shinseiki")
+            return head.Replace("<sup>2</sup>", "²", StringComparison.Ordinal)
+                .Replace("Nuku<sup>'</sup>alofa", "Nuku'alofa", StringComparison.Ordinal)
+                .Replace("牧<sub>ノ</sub>原", "牧ノ原", StringComparison.Ordinal);
+        // 物理词头只解一层；释义中的 <I>、<A> 等例句占位符有独立含义。
+        return SanseidoHeadMarkup().Replace(head, "${text}").Replace("&amp;", "&", StringComparison.Ordinal);
+    }
+
+    [GeneratedRegex("<sub>([0-9]+|x)</sub>")]
+    private static partial Regex HeadSubscript();
+
+    [GeneratedRegex("""<i>(?<text>[A-Za-z])</i>|<font color="#008000">(?<text>\([0-9]+\)|\[[^\[\]<>]+\])</font>""")]
+    private static partial Regex SanseidoHeadMarkup();
 
     public static ParsedEntry Parse(string sourceId, string key, string raw, string? language = null)
     {
@@ -269,6 +350,7 @@ internal static partial class EntryParser
 
     internal static IEnumerable<(string Part, string Gloss, Range RawSpan)> OxfordSenses(string body)
     {
+        body = NormalizeOxfordFormulas(body);
         int divDepth = 0, noteDepth = 0, fontDepth = 0, start = 0, formsEnd = 0;
         string part = "";
         bool inPhrases = false;
@@ -279,7 +361,7 @@ internal static partial class EntryParser
                 if (tag.Groups["openFont"].Success) fontDepth++;
                 if (tag.Groups["closeFont"].Success && --fontDepth == 0)
                 {
-                    var sense = Plain(body[start..tag.Index]).TrimStart('•', ' ');
+                    var sense = Plain(DecodePrintedScripts(body[start..tag.Index], "oxford")).TrimStart('•', ' ');
                     if (sense.Length != 0) yield return (part, sense, start..tag.Index);
                 }
                 continue;
@@ -313,6 +395,7 @@ internal static partial class EntryParser
 
     internal static IEnumerable<(string Gloss, Range Span, string Examples, string Definition)> OxfordReverseSenses(string body)
     {
+        body = NormalizeOxfordFormulas(body);
         // 例句的中文译文只支持它紧随的主词义；进入习语、短语、用法说明后停止采样。
         var senses = OxfordSenses(body).ToArray();
         for (int i = 0; i < senses.Length; i++)
@@ -642,7 +725,7 @@ internal static partial class EntryParser
         var written = title.Success && !title.Groups[1].Value.Contains('<') ? WrittenForms(title.Groups[1].Value) : [];
         var head = written.Contains(key) ? key : written.FirstOrDefault() ?? key;
         var gloss = SanseidoSense(body);
-        return new(head, reading, evidence, Preview(FirstSentence(gloss), body), null,
+        return new(head, reading, evidence, Preview(FirstSentence(gloss), gloss == null ? DecodePrintedScripts(body, "sanseido") : body), null,
             written.Where(s => s != head).ToArray());
     }
 
@@ -656,7 +739,8 @@ internal static partial class EntryParser
     private static string? SanseidoSense(string body)
     {
         var original = body[..Math.Min(body.Length, 2048)];
-        var prefix = SanseidoLinkText(original);
+        var printed = DecodePrintedScripts(original, "sanseido");
+        var prefix = SanseidoLinkText(printed);
         static string? ReadSense(string text)
         {
             var lines = Lines(text, 1536);
@@ -683,7 +767,8 @@ internal static partial class EntryParser
             var lineBreak = prefix.IndexOf("<br>", IgnoreCase);
             if (lineBreak >= 0) return ReadSense(prefix[(lineBreak + 4)..]);
         }
-        if (prefix.Length != original.Length)
+        if (prefix.Length != printed.Length || (printed.Length != original.Length &&
+            original.Contains("<a href=\"entry://", StringComparison.Ordinal) && SanseidoCopiedLink().IsMatch(original)))
         {
             // 部分参见条没有 </body2>，正文紧跟外文标题或「(連語)」。先读真实释义，
             // 即使后面的交叉引用带绿色 (1)，也不把它当作词条自己的首义。
@@ -697,7 +782,7 @@ internal static partial class EntryParser
             if (oldFirst is >= 0 and < 768)
                 foreach (Match link in SanseidoCopiedLink().Matches(original))
                     if (oldFirst >= link.Index && oldFirst < link.Index + link.Length)
-                        return Plain(link.Groups["label"].Value);
+                        return Plain(DecodePrintedScripts(link.Groups["label"].Value, "sanseido"));
         }
         return null;
     }
@@ -712,8 +797,64 @@ internal static partial class EntryParser
     [GeneratedRegex("""<a href="entry://(?<label>(?=[^"<>]*<)(?:[^"<>]|<font color="#008000">[^"<>]*</font>|<i>[^"<>]*</i>|<sub>[^"<>]*</sub>)+)">\k<label></a>""")]
     private static partial Regex SanseidoCopiedLink();
 
-    private static ParsedEntry Shinseiki(string key, string body)
+    internal const string ShinseikiBrokenSub = "<sub><</sub>";
+    private const string BrokenIndex = ShinseikiBrokenSub + "sup>";
+    private const string BrokenExponent = "<sup>" + ShinseikiBrokenSub + "/sup>";
+    // 同一词条的日中释义两次写出相同的式子。己烷的 14 后紧跟“5種”，5 不能算作氢原子数。
+    private static readonly (string Head, string Raw, string Print)[] ShinseikiFormulas =
+    [
+        ("造血薬", $"B{BrokenIndex}12", "B₁₂"),
+        ("単糖类", $"CnH{BrokenIndex}2nOn", "CₙH₂ₙOₙ"),
+        ("ソルビット", $"C{BrokenIndex}6H{BrokenIndex}14O{BrokenIndex}6", "C₆H₁₄O₆"),
+        ("ソルビン酸", $"C{BrokenIndex}5H{BrokenIndex}7COOH", "C₅H₇COOH"),
+        ("ヘキサデカン", $"C{BrokenIndex}16H{BrokenIndex}34", "C₁₆H₃₄"),
+        ("ヘキサン", $"C{BrokenIndex}6H{BrokenIndex}14", "C₆H₁₄"),
+        ("ヘキソース", $"C{BrokenIndex}6H{BrokenIndex}12O{BrokenIndex}6", "C₆H₁₂O₆"),
+        ("幂級数", $"a{BrokenIndex}0+a{BrokenIndex}1x+a{BrokenIndex}2x<sup><sub>2</sub>+</sup>a{BrokenIndex}3x<sup><sub>3</sub>+</sup>…+a{BrokenIndex}nx{BrokenExponent}n+…", "a₀+a₁x+a₂x²+a₃x³+…+aₙxⁿ+…"),
+        ("幂指数", $"a{BrokenExponent}n", "aⁿ"),
+        ("幂集合", $"2{BrokenExponent}M", "2ᴹ")
+    ];
+
+    internal static string NormalizeShinseikiFormulas(string body, string? original = null)
     {
+        if (!body.Contains(ShinseikiBrokenSub, StringComparison.Ordinal)) return body;
+        // 详情反查按原始坐标分段。片段可从中文公式起始，标题与后续闭标签仍须在完整原文中查证。
+        original ??= body;
+        foreach (var (head, raw, print) in ShinseikiFormulas)
+        {
+            if (!body.Contains(raw, StringComparison.Ordinal) || !ShinseikiTitle().Matches(original)
+                .Any(title => title.Groups["word"].Value == head || title.Groups["form"].Value == head)) continue;
+            // 三个数学词还把公式后的一整句包进上标。只有这一句直接在 span 末尾闭合才恢复原来的基线。
+            body = raw.Contains(BrokenExponent, StringComparison.Ordinal)
+                ? Regex.Replace(body, Regex.Escape(raw) + @"(?<sentence>[^<>]*)</sup>(?=</span>|\z)", match =>
+                    original.Contains(match.Value + "</span>", StringComparison.Ordinal) ? print + match.Groups["sentence"].Value : match.Value)
+                : body.Replace(raw, print, StringComparison.Ordinal);
+        }
+        return body;
+    }
+
+    internal static string ShinseikiDisplayGloss(string head, string gloss)
+    {
+        // 两条旧摘要误收了原书的半截注释；其余字面示例仍保留。
+        if (head == "後唐" && gloss.EndsWith("后被其重臣石敬塘所灭。<!--", StringComparison.Ordinal)
+            || head == "新興" && gloss == "新しく勢いが盛んになること。新たに興ること。<!--") return gloss[..^4];
+        if (gloss.Contains("sup>", StringComparison.Ordinal))
+            foreach (var rule in ShinseikiFormulas)
+                if (head == rule.Head) return gloss.Replace(Plain(rule.Raw), rule.Print, StringComparison.Ordinal);
+        return gloss;
+    }
+
+    internal static string RefreshShinseikiScriptGloss(string head, string stored, string body)
+    {
+        // 旧版摘要已经没有标签。只有原书的旧提取结果也等于当前摘要，才采用带上下标的读法。
+        if (!body.Contains("<su", StringComparison.OrdinalIgnoreCase)) return stored;
+        var formatted = Shinseiki(head, body).Gloss;
+        return formatted != stored && Shinseiki(head, body, printScripts: false).Gloss == stored ? formatted : stored;
+    }
+
+    private static ParsedEntry Shinseiki(string key, string body, bool printScripts = true)
+    {
+        body = NormalizeShinseikiFormulas(body);
         var title = ShinseikiTitle().Match(body, 0, Math.Min(body.Length, 1536));
         string display = key;
         string? reading = Kana(key);
@@ -749,11 +890,12 @@ internal static partial class EntryParser
             if (divider >= 0)
             {
                 int close = body.IndexOf("</span>", divider, end - divider, IgnoreCase);
-                if (close >= 0) sense = Plain(body[(close + "</span>".Length)..end]);
+                if (close >= 0) sense = ReadSense(body[(close + "</span>".Length)..end]);
             }
             if (string.IsNullOrWhiteSpace(sense))
-                sense = Plain(body[start..(divider >= 0 ? divider : end)]);
+                sense = ReadSense(body[start..(divider >= 0 ? divider : end)]);
         }
+        string ReadSense(string segment) => Plain(printScripts ? DecodePrintedScripts(RepairShinseikiScriptBoundaries(segment), "shinseiki") : segment);
         // 少数原条目只给参见或标音，甚至留下空的义项标签；仍展示原书能确定的内容。
         if (string.IsNullOrWhiteSpace(sense)) sense = Between(body, "<p class=\"cat-unit\">", "</p>");
         if (string.IsNullOrWhiteSpace(sense) && reading != null) sense = "原书注音 " + reading;
@@ -827,7 +969,8 @@ internal static partial class EntryParser
                 start = open + "<span>".Length;
                 int close = body.LastIndexOf("</span>", limit - 1, limit - start, IgnoreCase);
                 if (close <= start) continue;
-                string gloss = Plain(body[start..close]);
+                var segment = NormalizeShinseikiFormulas(body[start..close], body);
+                string gloss = Plain(DecodePrintedScripts(RepairShinseikiScriptBoundaries(segment), "shinseiki"));
                 if (gloss.Length == 0) continue;
                 // Span 始终使用原 HTML 的 UTF-16 偏移，sup/sub、实体与中文标点留给详情视图统一转换。
                 yield return (gloss, start..close, "", "");
@@ -992,6 +1135,58 @@ internal static partial class EntryParser
         return BlockBreak().Replace(sample, "\n").Split(['\r', '\n'])
             .Select(Plain).Where(s => s.Length > 0).ToArray();
     }
+
+    internal static string RepairShinseikiScriptBoundaries(string html)
+    {
+        if (!html.Contains("<su", StringComparison.Ordinal)) return html;
+        // 日中两栏都给出完整公式。还原误入上下标的运算符、对数的真数及两种酸根的电荷位置。
+        return html.Replace("x<sup>２+4</sup>x+4(=(x+2)", "x<sup>２</sup>+4x+4(=(x+2)", StringComparison.Ordinal)
+            .Replace("a<sub>１+</sub>a<sub>２</sub>=2", "a<sub>１</sub>+a<sub>２</sub>=2", StringComparison.Ordinal)
+            .Replace("x<sup>n+</sup>y<sup>n</sup>=z<sup>n</sup>", "x<sup>n</sup>+y<sup>n</sup>=z<sup>n</sup>", StringComparison.Ordinal)
+            .Replace("log<sub>1021</sub>＝1.3222", "log<sub>10</sub>21＝1.3222", StringComparison.Ordinal)
+            .Replace("log<sub>1021</sub>＝1 . 3222", "log<sub>10</sub>21＝1 . 3222", StringComparison.Ordinal)
+            .Replace("SO<sup>2</sup>-<sub>3</sub>", "SO<sub>3</sub><sup>2-</sup>", StringComparison.Ordinal)
+            .Replace("CO<sup>2</sup>-<sub>3</sub>", "CO<sub>3</sub><sup>2-</sup>", StringComparison.Ordinal);
+    }
+
+    [GeneratedRegex("""<(?<tag>su[bp])>(?<value>[-+0-9０-９－A-Za-zθ]+)</\k<tag>>""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex PrintedScriptTag();
+
+    [GeneratedRegex("""<sup>1</sup>/(?<quarter>4)(?![0-9])|<sup>5</sup>/(?<eighths>8)(?![0-9])|<sup>1</sup>/16(?![0-9])""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex OxfordPrintedFraction();
+
+    internal static string DecodePrintedScripts(string html, string sourceId)
+    {
+        if (!html.Contains("<su", StringComparison.OrdinalIgnoreCase)) return html;
+        if (sourceId == "oxford")
+        {
+            html = RepairOxfordPrintedSigns(html);
+            // 保留小分数的整体，例如 mixed number 的 3¼；1/16 没有单一码点。
+            html = OxfordPrintedFraction().Replace(html, m => m.Groups["quarter"].Success ? "¼" :
+                m.Groups["eighths"].Success ? "⅝" : "¹⁄₁₆");
+        }
+        return PrintedScriptTag().Replace(html, match =>
+        {
+            bool sub = match.Groups["tag"].ValueSpan.Equals("sub", StringComparison.OrdinalIgnoreCase);
+            string letters = sub ? "0123456789+-aeikmnrx" : "0123456789+-Mbcimnrtxyθ";
+            string glyphs = sub ? "₀₁₂₃₄₅₆₇₈₉₊₋ₐₑᵢₖₘₙᵣₓ" : "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻ᴹᵇᶜⁱᵐⁿʳᵗˣʸᶿ";
+            // 只在整段都有对应字形时转写。假名、汉文训读点和脚注正文仍沿用原书文字。
+            var value = match.Groups["value"].ValueSpan;
+            var mapped = new StringBuilder(value.Length);
+            foreach (char ch in value)
+            {
+                char basic = ch is >= '０' and <= '９' ? (char)('0' + ch - '０') : ch == '－' ? '-' : ch;
+                int index = letters.IndexOf(basic);
+                if (index < 0) return match.Value;
+                mapped.Append(glyphs[index]);
+            }
+            return mapped.ToString();
+        });
+    }
+
+    internal static string RepairOxfordPrintedSigns(string html) =>
+        html.Replace("(font size=-2><sup>TM</sup></font>", "™", StringComparison.Ordinal)
+            .Replace("<Sup>1</up>/8加仑", "⅛加仑", StringComparison.Ordinal);
 
     private static string Plain(string value) =>
         WebUtility.HtmlDecode(Tags().Replace(value, "")).Trim().TrimEnd('\0').TrimEnd();

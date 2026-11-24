@@ -2,6 +2,3249 @@
   "schema": 1,
   "database": ".data/dictionaries.db",
   "rows": 3271081,
+  "第二轮显示复核": {
+    "基线提交": "7b73ffc",
+    "口径": "先逐条读取物理词头、已存摘要及原文，区分跳转记录。修前运行当时的显示方法；修后验证用 LookupEntry 的词头/摘要显示属性和 SearchWindow.FormatDetail。按需重新解析旧索引的速览、富文本及补全入口另外抽验。物理记录、同一记录的多处匹配及重复的合并页分别计数。分组可能重叠。",
+    "分书覆盖与残余信号": {
+      "eijiro": {
+        "rows": 1604742,
+        "aliases": 0,
+        "body": 1604742,
+        "summary": 1604730,
+        "rawEmpty": 12,
+        "empty": 12,
+        "基线显示程序SHA256": "6D42BE6D5B11235A0F84F61B1126D02C1CD36F429B8BDE5A798DBBD2ADBD90CC",
+        "复查显示程序SHA256": "6B850F88DCF4FBC1091F933281CE338FBA928E35198D8D2E68A1FF5694DF1545",
+        "模式前后对照": {
+          "longRun": {
+            "before": {
+              "Rows": 2,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 2
+            },
+            "after": {
+              "Rows": 2,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 2
+            }
+          },
+          "oddQuote": {
+            "before": {
+              "Rows": 23,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 23
+            },
+            "after": {
+              "Rows": 23,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 23
+            }
+          },
+          "placeholder": {
+            "before": {
+              "Rows": 3,
+              "Head": 0,
+              "Summary": 3,
+              "Detail": 3
+            },
+            "after": {
+              "Rows": 3,
+              "Head": 0,
+              "Summary": 3,
+              "Detail": 3
+            }
+          }
+        },
+        "残余信号": [
+          {
+            "模式": "oddQuote",
+            "记录": 23,
+            "词头": 0,
+            "已存摘要": 0,
+            "正文": 23,
+            "样例": [
+              {
+                "ord": 39055,
+                "head": "Al Bayda'",
+                "field": "detail",
+                "token": "'>",
+                "excerpt": "{地名} : <→AL-BAYDA'>"
+              },
+              {
+                "ord": 39058,
+                "head": "Al Bayda'",
+                "field": "detail",
+                "token": "'>",
+                "excerpt": "{地名} : <→AL-BAYDA'>"
+              },
+              {
+                "ord": 39059,
+                "head": "AlBayda'",
+                "field": "detail",
+                "token": "'>",
+                "excerpt": "{地名} : <→AL-BAYDA'>"
+              },
+              {
+                "ord": 91926,
+                "head": "AsSuwayda'",
+                "field": "detail",
+                "token": "'>",
+                "excerpt": "{地名} : <→AS-SUWAYDA'>"
+              },
+              {
+                "ord": 414344,
+                "head": "earth shaped icon labeled \"The Internet\"",
+                "field": "detail",
+                "token": "\">",
+                "excerpt": "<→EARTH-SHAPED icon labeled \"The Internet\">"
+              }
+            ]
+          },
+          {
+            "模式": "placeholder",
+            "记录": 3,
+            "词头": 0,
+            "已存摘要": 3,
+            "正文": 3,
+            "样例": [
+              {
+                "ord": 159190,
+                "head": "Born Free",
+                "field": "summary",
+                "token": "？？？？？？",
+                "excerpt": "966《監督》ジェームズ・ヒル《出演》ヴァージニア・マッケナ、ビル・トラヴァース《受賞》アカデミー音楽賞？？？？？？（ジョ…"
+              },
+              {
+                "ord": 159190,
+                "head": "Born Free",
+                "field": "detail",
+                "token": "？？？？？？",
+                "excerpt": "966《監督》ジェームズ・ヒル《出演》ヴァージニア・マッケナ、ビル・トラヴァース《受賞》アカデミー音楽賞？？？？？？（ジョン・バリー）"
+              },
+              {
+                "ord": 771469,
+                "head": "Junky",
+                "field": "summary",
+                "token": "？？？？？？？？？？？",
+                "excerpt": "1953《著》ウィリアム・バロウズ(William S. Burroughs)◆無削除版の刊行は1977？？？？？？？？？？？…"
+              },
+              {
+                "ord": 771469,
+                "head": "Junky",
+                "field": "detail",
+                "token": "？？？？？？？？？？？？",
+                "excerpt": "1953《著》ウィリアム・バロウズ(William S. Burroughs)◆無削除版の刊行は1977？？？？？？？？？？？？"
+              },
+              {
+                "ord": 771470,
+                "head": "Junky",
+                "field": "summary",
+                "token": "？？？？？？？？？？？",
+                "excerpt": "1953《著》ウィリアム・バロウズ(William S. Burroughs)◆無削除版の刊行は1977？？？？？？？？？？？…"
+              }
+            ]
+          },
+          {
+            "模式": "longRun",
+            "记录": 2,
+            "词头": 0,
+            "已存摘要": 0,
+            "正文": 2,
+            "样例": [
+              {
+                "ord": 25850,
+                "head": "Advanced Level",
+                "field": "detail",
+                "token": "uk/CIE/WebSite/qualificationsandawa",
+                "excerpt": "合格することが大学入学許可の条件◆【略】A level◆【URL】http://www.cie.org.uk/CIE/WebSite/qualificationsandawardshub/qualificationhubs/recognition/recognition.jsp"
+              },
+              {
+                "ord": 25853,
+                "head": "Advanced Level",
+                "field": "detail",
+                "token": "uk/CIE/WebSite/qualificationsandawa",
+                "excerpt": "合格することが大学入学許可の条件◆【略】A level◆【URL】http://www.cie.org.uk/CIE/WebSite/qualificationsandawardshub/qualificationhubs/recognition/recognition.jsp"
+              }
+            ]
+          }
+        ]
+      },
+      "hanying": {
+        "rows": 376636,
+        "aliases": 0,
+        "body": 376636,
+        "summary": 376636,
+        "rawEmpty": 0,
+        "empty": 0,
+        "基线显示程序SHA256": "6D42BE6D5B11235A0F84F61B1126D02C1CD36F429B8BDE5A798DBBD2ADBD90CC",
+        "复查显示程序SHA256": "6B850F88DCF4FBC1091F933281CE338FBA928E35198D8D2E68A1FF5694DF1545",
+        "模式前后对照": {
+          "oddQuote": {
+            "before": {
+              "Rows": 1,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 1
+            },
+            "after": {
+              "Rows": 1,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 1
+            }
+          }
+        },
+        "残余信号": [
+          {
+            "模式": "oddQuote",
+            "记录": 1,
+            "词头": 0,
+            "已存摘要": 0,
+            "正文": 1,
+            "样例": [
+              {
+                "ord": 117455,
+                "head": "尖括号",
+                "field": "detail",
+                "token": "<>",
+                "excerpt": "尖括号\r\n尖括号[jiān kuò hào]\r\n1.■angle brackets (<>)"
+              }
+            ]
+          }
+        ]
+      },
+      "oxford": {
+        "rows": 42481,
+        "aliases": 0,
+        "body": 42481,
+        "summary": 42481,
+        "rawEmpty": 0,
+        "empty": 0,
+        "基线显示程序SHA256": "6D42BE6D5B11235A0F84F61B1126D02C1CD36F429B8BDE5A798DBBD2ADBD90CC",
+        "复查显示程序SHA256": "7BB95CC1FE2FC94772D9D2E84D31B461A405B40F9C5D275385C2F99D2242DADD",
+        "模式前后对照": {
+          "entity": {
+            "before": {
+              "Rows": 2,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 2
+            },
+            "after": {
+              "Rows": 0,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 0
+            }
+          },
+          "oddQuote": {
+            "before": {
+              "Rows": 52,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 52
+            },
+            "after": {
+              "Rows": 0,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 0
+            }
+          },
+          "placeholder": {
+            "before": {
+              "Rows": 1,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 1
+            },
+            "after": {
+              "Rows": 1,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 1
+            }
+          }
+        },
+        "残余信号": [
+          {
+            "模式": "placeholder",
+            "记录": 1,
+            "词头": 0,
+            "已存摘要": 0,
+            "正文": 1,
+            "样例": [
+              {
+                "ord": 28689,
+                "head": "pound",
+                "field": "detail",
+                "token": "???",
+                "excerpt": "ammer :\r\n▪ [V]\r\n»Heavy rain pounded on the roof.\r\n暴雨???地砸在屋顶上。\r\n»Someone was pounding at the door.\r\n有人在砰砰地敲门。\r\n»T"
+              }
+            ]
+          }
+        ]
+      },
+      "sango": {
+        "rows": 172761,
+        "aliases": 0,
+        "body": 172761,
+        "summary": 172761,
+        "rawEmpty": 0,
+        "empty": 0,
+        "基线显示程序SHA256": "6D42BE6D5B11235A0F84F61B1126D02C1CD36F429B8BDE5A798DBBD2ADBD90CC",
+        "复查显示程序SHA256": "6B850F88DCF4FBC1091F933281CE338FBA928E35198D8D2E68A1FF5694DF1545",
+        "模式前后对照": {},
+        "残余信号": []
+      },
+      "sanseido": {
+        "rows": 520678,
+        "aliases": 0,
+        "body": 520678,
+        "summary": 520677,
+        "rawEmpty": 1,
+        "empty": 1,
+        "基线显示程序SHA256": "6D42BE6D5B11235A0F84F61B1126D02C1CD36F429B8BDE5A798DBBD2ADBD90CC",
+        "复查显示程序SHA256": "7BB95CC1FE2FC94772D9D2E84D31B461A405B40F9C5D275385C2F99D2242DADD",
+        "模式前后对照": {
+          "attribute": {
+            "before": {
+              "Rows": 7,
+              "Head": 7,
+              "Summary": 0,
+              "Detail": 0
+            },
+            "after": {
+              "Rows": 0,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 0
+            }
+          },
+          "entity": {
+            "before": {
+              "Rows": 38,
+              "Head": 38,
+              "Summary": 0,
+              "Detail": 0
+            },
+            "after": {
+              "Rows": 0,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 0
+            }
+          },
+          "html": {
+            "before": {
+              "Rows": 2145,
+              "Head": 29,
+              "Summary": 1016,
+              "Detail": 2116
+            },
+            "after": {
+              "Rows": 2116,
+              "Head": 0,
+              "Summary": 1016,
+              "Detail": 2116
+            }
+          },
+          "oddQuote": {
+            "before": {
+              "Rows": 784,
+              "Head": 0,
+              "Summary": 781,
+              "Detail": 3
+            },
+            "after": {
+              "Rows": 784,
+              "Head": 0,
+              "Summary": 781,
+              "Detail": 3
+            }
+          },
+          "placeholder": {
+            "before": {
+              "Rows": 2,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 2
+            },
+            "after": {
+              "Rows": 2,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 2
+            }
+          },
+          "separator": {
+            "before": {
+              "Rows": 3,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 3
+            },
+            "after": {
+              "Rows": 3,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 3
+            }
+          },
+          "space": {
+            "before": {
+              "Rows": 73,
+              "Head": 0,
+              "Summary": 11,
+              "Detail": 73
+            },
+            "after": {
+              "Rows": 73,
+              "Head": 0,
+              "Summary": 11,
+              "Detail": 73
+            }
+          }
+        },
+        "残余信号": [
+          {
+            "模式": "html",
+            "记录": 2116,
+            "词头": 0,
+            "已存摘要": 1016,
+            "正文": 2116,
+            "样例": [
+              {
+                "ord": 24020,
+                "head": "few",
+                "field": "detail",
+                "token": "<a",
+                "excerpt": "**few\r\nn.，a.<a　をつけない場合> 少ない，余り(ほとんど)ない；<a　をつける場合> 多少(の)，少しは(ある)　(a　～　days　2，3　日).\r\n◎a　good　few，　or　quite　a　few<話"
+              },
+              {
+                "ord": 24020,
+                "head": "few",
+                "field": "detail",
+                "token": "<a",
+                "excerpt": "**few\r\nn.，a.<a　をつけない場合> 少ない，余り(ほとんど)ない；<a　をつける場合> 多少(の)，少しは(ある)　(a　～　days　2，3　日).\r\n◎a　good　few，　or　quite　a　few<話"
+              },
+              {
+                "ord": 37591,
+                "head": "kind",
+                "field": "detail",
+                "token": "<a",
+                "excerpt": "**kind²\r\nn.種類；種族，類；本質，性質；<a　～　of　で> 一種の；…みたいなもの.\r\n◎in　kind　(金でなく)現物で；同じ(種類の)物で；本質的に.\r\n◎kind　of<話> 幾分，やや，ちょっと；どちら"
+              },
+              {
+                "ord": 75302,
+                "head": "virgule",
+                "field": "detail",
+                "token": "<A",
+                "excerpt": "vir・gule  [və´：rgju：l]\r\nn.どちらの意味を取ってもいいことを示す斜線<A　and／or　B> ."
+              },
+              {
+                "ord": 88856,
+                "head": "誤る",
+                "field": "detail",
+                "token": "<A",
+                "excerpt": "stake；\r\nerr；\r\nmake　an　error；\r\nfail<in> (しくじる)；\r\ntake<A　for　B> (とり違える).\r\n(2)[惑わす]mislead.\r\n方針を～　take　a　wrong　cour"
+              }
+            ]
+          },
+          {
+            "模式": "oddQuote",
+            "记录": 784,
+            "词头": 0,
+            "已存摘要": 781,
+            "正文": 3,
+            "样例": [
+              {
+                "ord": 322,
+                "head": "accelerator",
+                "field": "summary",
+                "token": "\">",
+                "excerpt": "\">アクセル(1)"
+              },
+              {
+                "ord": 675,
+                "head": "Adam　Smith",
+                "field": "summary",
+                "token": "\">",
+                "excerpt": "\">スミス(1)"
+              },
+              {
+                "ord": 1575,
+                "head": "albino",
+                "field": "summary",
+                "token": "\">",
+                "excerpt": "(2)\">白子(シラコ)(2)"
+              },
+              {
+                "ord": 2419,
+                "head": "anabolism",
+                "field": "summary",
+                "token": "\">",
+                "excerpt": "(3)\">同化(ドウカ)(3)"
+              },
+              {
+                "ord": 67949,
+                "head": "swell",
+                "field": "detail",
+                "token": "<>",
+                "excerpt": "n.ふくれ(ること)；増大；はれ上がった部分；(土地の)隆起；大波；《楽》(音の)増減(装置)；その記号<> ；<話> 名士，しゃれ者."
+              }
+            ]
+          },
+          {
+            "模式": "space",
+            "记录": 73,
+            "词头": 0,
+            "已存摘要": 11,
+            "正文": 73,
+            "样例": [
+              {
+                "ord": 62847,
+                "head": "SI",
+                "field": "detail",
+                "token": "　　　　　　　　　　",
+                "excerpt": "(基本単位)\r\n量　　　　　　　　　　名称　　　　　　　　　　記号\r\n長さ　　　　　　　　メートル　　　　　　m\r\n質量　　　　　　　　キログラム　　　　kg\r\n時間　　　　　　　　秒　　　　　　　　　　　　s\r\n電流　　　　　　　　アンペ"
+              },
+              {
+                "ord": 62847,
+                "head": "SI",
+                "field": "detail",
+                "token": "　　　　　　　　　　",
+                "excerpt": "(基本単位)\r\n量　　　　　　　　　　名称　　　　　　　　　　記号\r\n長さ　　　　　　　　メートル　　　　　　m\r\n質量　　　　　　　　キログラム　　　　kg\r\n時間　　　　　　　　秒　　　　　　　　　　　　s\r\n電流　　　　　　　　アンペ"
+              },
+              {
+                "ord": 62847,
+                "head": "SI",
+                "field": "detail",
+                "token": "　　　　　　　　",
+                "excerpt": "(基本単位)\r\n量　　　　　　　　　　名称　　　　　　　　　　記号\r\n長さ　　　　　　　　メートル　　　　　　m\r\n質量　　　　　　　　キログラム　　　　kg\r\n時間　　　　　　　　秒　　　　　　　　　　　　s\r\n電流　　　　　　　　ア"
+              },
+              {
+                "ord": 62847,
+                "head": "SI",
+                "field": "detail",
+                "token": "　　　　　　　　",
+                "excerpt": "量　　　　　　　　　　名称　　　　　　　　　　記号\r\n長さ　　　　　　　　メートル　　　　　　m\r\n質量　　　　　　　　キログラム　　　　kg\r\n時間　　　　　　　　秒　　　　　　　　　　　　s\r\n電流　　　　　　　　アンペア　　　　　"
+              },
+              {
+                "ord": 62847,
+                "head": "SI",
+                "field": "detail",
+                "token": "　　　　　　　　　　　　",
+                "excerpt": "　　　　　メートル　　　　　　m\r\n質量　　　　　　　　キログラム　　　　kg\r\n時間　　　　　　　　秒　　　　　　　　　　　　s\r\n電流　　　　　　　　アンペア　　　　　　A\r\n熱力学温度　　ケルビン　　　　　　K\r\n物質量　　　　　　モル　"
+              }
+            ]
+          },
+          {
+            "模式": "separator",
+            "记录": 3,
+            "词头": 0,
+            "已存摘要": 0,
+            "正文": 3,
+            "样例": [
+              {
+                "ord": 399794,
+                "head": "律令制",
+                "field": "detail",
+                "token": "───────────────",
+                "excerpt": "─中務省\r\n┌┤　　　　　　　　　　　　　　　　　　　　　　　　　　├─式部省\r\n││　　　　　　　　┌───────────────┐　├─治部省\r\n││　　　　　　　　│左大臣　　　　　　┌─左弁官───┴─民部省\r\n│└─太政官　………│太政大"
+              },
+              {
+                "ord": 399794,
+                "head": "律令制",
+                "field": "detail",
+                "token": "───────────────",
+                "excerpt": "納言　│\r\n│　　　　　　　　　│右大臣　　　　　　└─右弁官───┬─兵部省\r\n│　　　　　　　　　└───────────────┘　├─刑部省\r\n│　　　　　　　　　　　　　　　　　　　　　　　　　　　├─大蔵省\r\n│　　　　　　　　　　　　<"
+              },
+              {
+                "ord": 426343,
+                "head": "桓武平氏",
+                "field": "detail",
+                "token": "─────────────────────────────────",
+                "excerpt": "望王─┬─国香──貞盛─────┐\r\n├─良将──将門　　　　　│\r\n└─良文──忠頼──忠常　│\r\n┌─────────────────────────────────┘\r\n├─維将──維時(北条氏祖)\r\n└─維衡──正度──正衡──正盛─┬─忠盛─┬─清盛─┬─重盛──維盛\r\n└─"
+              },
+              {
+                "ord": 438682,
+                "head": "清和源氏",
+                "field": "detail",
+                "token": "──────────────────────────",
+                "excerpt": "(略系図)\r\n(源)\r\n清和天皇──貞純親王──経基──満仲─┬─頼光\r\n└─頼信──頼義─┐\r\n┌──────────────────────────┘\r\n└┬─義家─┬─義親───為義──────┬─義朝──────┐\r\n└─義光　└─義国─┬─義重(新田氏祖)│　　"
+              },
+              {
+                "ord": 438682,
+                "head": "清和源氏",
+                "field": "detail",
+                "token": "──────────────────────────────",
+                "excerpt": "\r\n└─義康(足利氏祖)├─義賢──義仲　　│\r\n├─為朝　　　　　　│\r\n└─行家　　　　　　│\r\n┌──────────────────────────────┘\r\n└┬─義平\r\n├─頼朝─┬─頼家──公暁\r\n├─範頼　└─実朝\r\n└─義経"
+              }
+            ]
+          },
+          {
+            "模式": "placeholder",
+            "记录": 2,
+            "词头": 0,
+            "已存摘要": 0,
+            "正文": 2,
+            "样例": [
+              {
+                "ord": 146572,
+                "head": "下駄",
+                "field": "detail",
+                "token": "〓",
+                "excerpt": "から)\r\n印刷で，ふせ字。\r\n(校正刷りなどで，所要の活字がないときに活字をさかさにして代わりに入れる「〓」の形)\r\n――と焼き味噌(ミソ)\r\n(みそを板につけて焼いた形が下駄に似るところから)\r\n外形は似ていても実質が非"
+              },
+              {
+                "ord": 338655,
+                "head": "下駄",
+                "field": "detail",
+                "token": "〓",
+                "excerpt": "から)\r\n印刷で，ふせ字。\r\n(校正刷りなどで，所要の活字がないときに活字をさかさにして代わりに入れる「〓」の形)\r\n――と焼き味噌(ミソ)\r\n(みそを板につけて焼いた形が下駄に似るところから)\r\n外形は似ていても実質が非"
+              }
+            ]
+          }
+        ]
+      },
+      "shinseiki": {
+        "rows": 403511,
+        "aliases": 249190,
+        "body": 154321,
+        "summary": 154320,
+        "rawEmpty": 0,
+        "empty": 1,
+        "基线显示程序SHA256": "6D42BE6D5B11235A0F84F61B1126D02C1CD36F429B8BDE5A798DBBD2ADBD90CC",
+        "复查显示程序SHA256": "29FE97A6630006AA30474151711B48D15FFB172BCA22CE92ABF233F837638ED8",
+        "模式前后对照": {
+          "attribute": {
+            "before": {
+              "Rows": 9,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 9
+            },
+            "after": {
+              "Rows": 0,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 0
+            }
+          },
+          "html": {
+            "before": {
+              "Rows": 80,
+              "Head": 18,
+              "Summary": 2,
+              "Detail": 62
+            },
+            "after": {
+              "Rows": 27,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 27
+            }
+          },
+          "oddQuote": {
+            "before": {
+              "Rows": 2,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 2
+            },
+            "after": {
+              "Rows": 2,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 2
+            }
+          },
+          "placeholder": {
+            "before": {
+              "Rows": 10,
+              "Head": 6,
+              "Summary": 1,
+              "Detail": 6
+            },
+            "after": {
+              "Rows": 10,
+              "Head": 6,
+              "Summary": 1,
+              "Detail": 6
+            }
+          }
+        },
+        "残余信号": [
+          {
+            "模式": "html",
+            "记录": 27,
+            "词头": 0,
+            "已存摘要": 0,
+            "正文": 27,
+            "样例": [
+              {
+                "ord": 38285,
+                "head": "後ろ",
+                "field": "detail",
+                "token": "-->",
+                "excerpt": "向后看；回头看。\r\n2.(事物に方向があると考えて)\r\n(认为事物有方向)\r\n裏面の方向，または場所。<-->前\r\n后，后面，后边。背面的方向或场所。\r\n⇒本棚の—に置く\r\n放在书架的后面。\r\n⇒—で糸を引く\r\n背后指挥；暗中"
+              },
+              {
+                "ord": 63817,
+                "head": "がいせつ",
+                "field": "detail",
+                "token": "-->",
+                "excerpt": "，称该球与多面体外接。\r\n多面体のすべての面が一つの球に接する時，この多面体はその球に外接するという。<-->内接\r\n外接。多面体的所有的面与一个球相接时，称该多面体与球外接。\r\nがいせつ【概説】\r\nスル\r\n事柄の内容のあらま"
+              },
+              {
+                "ord": 63819,
+                "head": "外接",
+                "field": "detail",
+                "token": "-->",
+                "excerpt": "，称该球与多面体外接。\r\n多面体のすべての面が一つの球に接する時，この多面体はその球に外接するという。<-->内接\r\n外接。多面体的所有的面与一个球相接时，称该多面体与球外接。"
+              },
+              {
+                "ord": 83546,
+                "head": "げんじつ",
+                "field": "detail",
+                "token": "-->",
+                "excerpt": "为事实已经感受到，亦指其事物。\r\n[哲]\r\n理想に対してその素材や障害となる日常的·物質的なもの。状。<-->理想\r\n现实。实现理想的素材或成为障碍的日常性、物质性事物。\r\n[哲]\r\n現に存在し活動するもの。想像·虚构や可能性"
+              }
+            ]
+          },
+          {
+            "模式": "placeholder",
+            "记录": 10,
+            "词头": 6,
+            "已存摘要": 1,
+            "正文": 6,
+            "样例": [
+              {
+                "ord": 1567,
+                "head": "ATR",
+                "field": "detail",
+                "token": "???",
+                "excerpt": "換率が高い，プルトニウム燃料·厂土力管型·重水减速·軽水冷却型の原子炉をさす。\r\n新型热转换反应堆。指U???向Pu转换率高的，钚燃料、压力管型、重水慢化、轻水冷却型的核反应堆。"
+              },
+              {
+                "ord": 16851,
+                "head": "Phan B?〓·i Chau",
+                "field": "head",
+                "token": "〓",
+                "excerpt": "Phan B?〓·i Chau"
+              },
+              {
+                "ord": 98559,
+                "head": "谌岐岩",
+                "field": "summary",
+                "token": "????",
+                "excerpt": "玻基方辉安山岩。濑户内海周边出产的古铜辉石安山岩，黑色、致密而质硬，因敲击有声，故亦称????岩，可用作石器用石材。"
+              },
+              {
+                "ord": 98559,
+                "head": "谌岐岩",
+                "field": "detail",
+                "token": "????",
+                "excerpt": "。サヌカイト。\r\n玻基方辉安山岩。濑户内海周边出产的古铜辉石安山岩，黑色、致密而质硬，因敲击有声，故亦称????岩，可用作石器用石材。"
+              },
+              {
+                "ord": 267745,
+                "head": "ポルトガル〓 paulista",
+                "field": "head",
+                "token": "〓",
+                "excerpt": "ポルトガル〓 paulista"
+              }
+            ]
+          },
+          {
+            "模式": "oddQuote",
+            "记录": 2,
+            "词头": 0,
+            "已存摘要": 0,
+            "正文": 2,
+            "样例": [
+              {
+                "ord": 57186,
+                "head": "かっこ",
+                "field": "detail",
+                "token": "<>",
+                "excerpt": "个的个体。\r\nかっこ【括弧】\r\n文·語·文字などを囲み，ほかと区別するために用いる記号。「」『』［］{}<>など。\r\n括号，括弧。把句子、词语、字等括起来，用以区别其他的符号。如「」『』［］{}<>等。\r\nかっこ【羯鼓】\r\n"
+              },
+              {
+                "ord": 57186,
+                "head": "かっこ",
+                "field": "detail",
+                "token": "<>",
+                "excerpt": "」『』［］{}<>など。\r\n括号，括弧。把句子、词语、字等括起来，用以区别其他的符号。如「」『』［］{}<>等。\r\nかっこ【羯鼓】\r\n〔五胡の一つ羯族の用いた鼓〕\r\n羯鼓。〔五胡之一羯族使用的鼓〕\r\n1.雅楽で用いる太鼓の一"
+              },
+              {
+                "ord": 57192,
+                "head": "括弧",
+                "field": "detail",
+                "token": "<>",
+                "excerpt": "かっこ【括弧】\r\n文·語·文字などを囲み，ほかと区別するために用いる記号。「」『』［］{}<>など。\r\n括号，括弧。把句子、词语、字等括起来，用以区别其他的符号。如「」『』［］{}<>等。"
+              },
+              {
+                "ord": 57192,
+                "head": "括弧",
+                "field": "detail",
+                "token": "<>",
+                "excerpt": "」『』［］{}<>など。\r\n括号，括弧。把句子、词语、字等括起来，用以区别其他的符号。如「」『』［］{}<>等。"
+              }
+            ]
+          }
+        ]
+      },
+      "shogakukan": {
+        "rows": 70307,
+        "aliases": 0,
+        "body": 70307,
+        "summary": 70307,
+        "rawEmpty": 0,
+        "empty": 0,
+        "基线显示程序SHA256": "6D42BE6D5B11235A0F84F61B1126D02C1CD36F429B8BDE5A798DBBD2ADBD90CC",
+        "复查显示程序SHA256": "1B11E5C114977ABAE1655798E0E2F851EF8F516F04065FE1EE0A6A55524DA9B8",
+        "模式前后对照": {
+          "oddQuote": {
+            "before": {
+              "Rows": 1,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 1
+            },
+            "after": {
+              "Rows": 0,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 0
+            }
+          }
+        },
+        "残余信号": []
+      },
+      "shogakukan-zhja": {
+        "rows": 79965,
+        "aliases": 0,
+        "body": 79965,
+        "summary": 79965,
+        "rawEmpty": 0,
+        "empty": 0,
+        "基线显示程序SHA256": "6D42BE6D5B11235A0F84F61B1126D02C1CD36F429B8BDE5A798DBBD2ADBD90CC",
+        "复查显示程序SHA256": "6B850F88DCF4FBC1091F933281CE338FBA928E35198D8D2E68A1FF5694DF1545",
+        "模式前后对照": {
+          "oddQuote": {
+            "before": {
+              "Rows": 4,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 4
+            },
+            "after": {
+              "Rows": 0,
+              "Head": 0,
+              "Summary": 0,
+              "Detail": 0
+            }
+          }
+        },
+        "残余信号": []
+      }
+    },
+    "已核实模式": [
+      {
+        "词书": "shinseiki",
+        "模式": "完整 divide-imgs 图片分隔符",
+        "物理记录数": 146791,
+        "处理": "纯文本在日中释义之间保留行界；富文本保留图片。",
+        "样例": [
+          [
+            1,
+            "?"
+          ],
+          [
+            24331,
+            "あ·く"
+          ],
+          [
+            24334,
+            "開く"
+          ],
+          [
+            38285,
+            "後ろ"
+          ]
+        ],
+        "次数": 220026
+      },
+      {
+        "词书": "hanying",
+        "模式": "CK / JS / JX / LY / LS / section_title / DX",
+        "物理记录数": 144844,
+        "处理": "恢复缺失样式表承担的义项、例句和子项分行。仅应用于 CK 模板。",
+        "样例": [
+          [
+            82,
+            "X射线",
+            "对某人进行X射线透视put sb. under X-ray;去医院作X射线检查go to hospital for an X-ray常用词组1.■X射"
+          ],
+          [
+            288,
+            "○",
+            "五○六号No. 506 (number five-oh-six);一九九○年1990 (nineteen ninety)"
+          ],
+          [
+            299,
+            "䁖",
+            "让我䁖一眼。Let me have a look."
+          ],
+          [
+            108105,
+            "安全",
+            "安全转移 ↵ move to places of safety;"
+          ]
+        ],
+        "字段次数": {
+          "JS": 144844,
+          "JX": 391202,
+          "LJ": 74535,
+          "LY": 74535,
+          "LS": 74535,
+          "section_title": 30917,
+          "DX": 10121
+        },
+        "字段覆盖": {
+          "JS": 144844,
+          "JX": 144833,
+          "LJ": 25892,
+          "LY": 25892,
+          "LS": 25892,
+          "section_title": 30917,
+          "DX": 6899
+        }
+      },
+      {
+        "词书": "oxford",
+        "模式": "<hr color=blue noshade>",
+        "物理记录数": 42481,
+        "处理": "纯文本保留词头、读音栏及分节的行界，原书的重复词形继续显示。",
+        "样例": [
+          [
+            1,
+            "A"
+          ],
+          [
+            261,
+            "acetylene"
+          ],
+          [
+            8717,
+            "credit"
+          ],
+          [
+            15359,
+            "gauge"
+          ]
+        ],
+        "次数": 46794
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "example-source 紧接译文 span",
+        "物理记录数": 25983,
+        "处理": "纯文本把有独立标记的日文例句与中文译文分开；unit-example 从新行开始。相邻对照在原富页已有分行。",
+        "样例": [
+          [
+            38285,
+            "後ろ",
+            "—を振り返る ↵ 向后看；回头看。"
+          ],
+          [
+            24331,
+            "あ·く",
+            "穴が—·く ↵ 漏了个洞。"
+          ],
+          [
+            1569,
+            "アットランダム",
+            "class=\"dot\">⇒—に例をあげる随便举个例子。</div"
+          ],
+          [
+            1890,
+            "バン",
+            "class=\"dot\">⇒—スタイル刘海儿发型。"
+          ]
+        ],
+        "次数": 43618
+      },
+      {
+        "词书": "sango",
+        "模式": "首行词头 &+{n}",
+        "物理记录数": 5343,
+        "处理": "同形词编号显示为〔n〕。每组完整覆盖 1 到该组条目数。",
+        "样例": [
+          [
+            3,
+            "&",
+            1
+          ],
+          [
+            4,
+            "&",
+            2
+          ],
+          [
+            11,
+            "a",
+            3
+          ],
+          [
+            12,
+            "a",
+            4
+          ],
+          [
+            13,
+            "a",
+            5
+          ]
+        ],
+        "同形词组数": 2010,
+        "复验": {
+          "sanseido": 95,
+          "shinseiki": 18,
+          "sangoPhysical": 5343,
+          "sangoMergedPages": 2010,
+          "sangoMergedNumbers": 5343
+        }
+      },
+      {
+        "词书": "sanseido",
+        "模式": "含原生 sub / sup 标记的实书复核子集",
+        "物理记录数": 3888,
+        "处理": "可确认的数字和符号保留上下标；误入上下标的运算符按同书公式复核。此处物理记录数是遍历的子集大小，正文及摘要的修后差异与其他分组可能重叠。",
+        "样例": [
+          {
+            "source": "sanseido",
+            "ordinal": 13,
+            "head": "a",
+            "old_text": "10-¹8",
+            "new_text": "10⁻¹⁸"
+          },
+          {
+            "source": "sanseido",
+            "ordinal": 461,
+            "head": "acetylene",
+            "old_text": "C2H2",
+            "new_text": "C₂H₂"
+          },
+          {
+            "source": "sanseido",
+            "ordinal": 540,
+            "head": "acre",
+            "old_text": "4046.8m2",
+            "new_text": "4046.8m²"
+          }
+        ],
+        "前后差异": {
+          "physical_rows_with_script_tag_start": 3888,
+          "plain_changed": 3456,
+          "imported_summary_changed": 357
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "含原生 sub / sup 标记的实书复核子集",
+        "物理记录数": 1235,
+        "处理": "可确认的数字和符号保留上下标；误入上下标的运算符按同书公式复核。此处物理记录数是遍历的子集大小，正文及摘要的修后差异与其他分组可能重叠。",
+        "样例": [
+          {
+            "source": "shinseiki",
+            "ordinal": 8246,
+            "head": "ガル",
+            "old_text": "cm/s2",
+            "new_text": "cm/s²"
+          },
+          {
+            "source": "shinseiki",
+            "ordinal": 62476,
+            "head": "完全平方",
+            "old_text": "x２+4x+4",
+            "new_text": "x²+4x+4"
+          },
+          {
+            "source": "shinseiki",
+            "ordinal": 105716,
+            "head": "しひょう",
+            "old_text": "log1021",
+            "new_text": "log₁₀21"
+          },
+          {
+            "source": "shinseiki",
+            "ordinal": 237056,
+            "head": "オイラーの多面体の定理",
+            "old_text": "a１+a２",
+            "new_text": "a₁+a₂"
+          }
+        ],
+        "前后差异": {
+          "physical_rows_with_script_tag_start": 1235,
+          "plain_changed": 1178,
+          "imported_summary_changed": 650
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "破损的 HTML 结构标签、注释或图片标签直接接闭标签",
+        "物理记录数": 298,
+        "处理": "移除残留结构，对损坏的图片保留占位，后续正文保留。",
+        "样例": [
+          [
+            15406,
+            "None"
+          ],
+          [
+            24331,
+            "あ·く"
+          ],
+          [
+            55670,
+            "迦葉"
+          ],
+          [
+            76112,
+            "口"
+          ],
+          [
+            182220,
+            "火"
+          ]
+        ],
+        "次数": 341,
+        "其中截断图片": 268
+      },
+      {
+        "词书": "oxford",
+        "模式": "FONT-FAMILY 属性误含 FONT 标签",
+        "物理记录数": 46,
+        "处理": "依原书 sub/super 恢复 Unicode 上下标，交错的两个结束标签按原有长度复位，保留义项范围。",
+        "样例": [
+          [
+            261,
+            "acetylene"
+          ],
+          [
+            1201,
+            "ammonia"
+          ],
+          [
+            1357,
+            "angstrom"
+          ],
+          [
+            2229,
+            "atto-"
+          ],
+          [
+            4313,
+            "boric acid"
+          ]
+        ],
+        "次数": 65,
+        "交错闭标签": 11,
+        "受影响首义": [
+          [
+            "angstrom",
+            "埃(量度的单位,等于 10'Arial', '细明体'\">-10",
+            "埃(量度的单位,等于 10⁻¹⁰ 米,表示波长和原子间的距离)"
+          ],
+          [
+            "chi-square test",
+            "* X'Arial', '细明体'\">2",
+            "* X² 检验；卡方检验"
+          ],
+          [
+            "light year",
+            "n. 光年(指光在一年中走过的距离:9.4607 × 10'Arial', '细明体'\">12 / 很长时间；很久",
+            "n. 光年(指光在一年中走过的距离:9.4607 × 10¹² 公里) / 很长时间；很久"
+          ],
+          [
+            "megabyte",
+            "兆字节,百万字节, 百万位元 (计算机存贮单位,相当于 2'Arial', '细明体'\">20",
+            "兆字节,百万字节, 百万位元 (计算机存贮单位,相当于 2²⁰ 字节)"
+          ],
+          [
+            "riboflavin",
+            "核黄素；维生素 B'Arial', '细明体'\">2",
+            "核黄素；维生素 B₂ ；维他命 B₂"
+          ],
+          [
+            "septillion",
+            "* 10'Arial', '细明体'\">24",
+            "* 10²⁴ ；百万的四次方"
+          ]
+        ]
+      },
+      {
+        "词书": "sanseido",
+        "模式": "物理词头 &amp;",
+        "物理记录数": 38,
+        "处理": "候选使用还原后的词头，查询和跳转仍使用原键。",
+        "样例": [
+          [
+            35,
+            "A&amp;R"
+          ],
+          [
+            2316,
+            "&amp;"
+          ],
+          [
+            2318,
+            "&amp;"
+          ],
+          [
+            2433,
+            "anaesthesia，　&amp;c."
+          ],
+          [
+            4162,
+            "AT&amp;T"
+          ]
+        ]
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "ISOの国·地域コードの一。",
+        "物理记录数": 38,
+        "处理": "ISOの国·地域コードの一。",
+        "样例": [
+          {
+            "ordinal": 261,
+            "head": "AD",
+            "field": "body",
+            "context": "アンドラ。ISOの国·地域コードの一。"
+          },
+          {
+            "ordinal": 1417,
+            "head": "AS",
+            "field": "body",
+            "context": "アメリカ領サモア。ISOの国·地域コードの一。"
+          },
+          {
+            "ordinal": 1594,
+            "head": "AU",
+            "field": "body",
+            "context": "オーストラリア。ISOの国·地域コードの一。"
+          }
+        ],
+        "依据": "本书 ISO 同模板 177 条中 139 条句号结尾无外字；IOC 174 条中 149 条无外字。只修复两个完整模板。",
+        "字段": {
+          "body": {
+            "rows": 38,
+            "hits": 38
+          }
+        }
+      },
+      {
+        "词书": "sanseido",
+        "模式": "物理词头 <i>",
+        "物理记录数": 28,
+        "处理": "候选使用还原后的词头，查询和跳转仍使用原键。",
+        "样例": [
+          [
+            18173,
+            "d<i>l</i>"
+          ],
+          [
+            32500,
+            "<i>a</i>"
+          ],
+          [
+            32705,
+            "<i>d</i>体，D体"
+          ],
+          [
+            32740,
+            "<i>e</i>"
+          ],
+          [
+            32767,
+            "<i>g</i>"
+          ]
+        ]
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "IOCの国·地域コードの一。",
+        "物理记录数": 25,
+        "处理": "IOCの国·地域コードの一。",
+        "样例": [
+          {
+            "ordinal": 397,
+            "head": "AFG",
+            "field": "body",
+            "context": "アフガニスタン。IOCの国·地域コードの一。"
+          },
+          {
+            "ordinal": 1641,
+            "head": "AUS",
+            "field": "body",
+            "context": "オーストラリア。IOCの国·地域コードの一。"
+          },
+          {
+            "ordinal": 1652,
+            "head": "AUT",
+            "field": "body",
+            "context": "オーストリア。IOCの国·地域コードの一。"
+          }
+        ],
+        "依据": "本书 ISO 同模板 177 条中 139 条句号结尾无外字；IOC 174 条中 149 条无外字。只修复两个完整模板。",
+        "字段": {
+          "body": {
+            "rows": 25,
+            "hits": 25
+          }
+        }
+      },
+      {
+        "词书": "sanseido",
+        "模式": "物理词头 <sub>",
+        "物理记录数": 21,
+        "处理": "候选使用还原后的词头，查询和跳转仍使用原键。",
+        "样例": [
+          [
+            15607,
+            "C<sub>1</sub>　chemistry"
+          ],
+          [
+            15608,
+            "C<sub>1</sub>化学"
+          ],
+          [
+            15609,
+            "C<sub>3</sub>　植物"
+          ],
+          [
+            15610,
+            "C<sub>4</sub>植物"
+          ],
+          [
+            26158,
+            "F<sub>1</sub>"
+          ]
+        ]
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "物理词头 <sub>",
+        "物理记录数": 12,
+        "处理": "候选使用还原后的词头，查询和跳转仍使用原键。",
+        "样例": [
+          [
+            5066,
+            "C<sub>3</sub>植物"
+          ],
+          [
+            5067,
+            "C<sub>4</sub>植物"
+          ],
+          [
+            10055,
+            "H<sub>2</sub>エッチツーブロッカー"
+          ],
+          [
+            250775,
+            "シーさんしょくぶつ[C<sub>3</sub>植物]"
+          ],
+          [
+            250779,
+            "シーよんしょくぶつ[C<sub>4</sub>植物]"
+          ]
+        ]
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "交错的 sub / sup 标签导致化学式或数学表达式损坏",
+        "物理记录数": 10,
+        "处理": "核对两种语言及同书定义，恢复词内的完整公式和单位。",
+        "样例": [
+          [
+            136699,
+            "造血薬",
+            "B₁₂"
+          ],
+          [
+            142897,
+            "単糖类",
+            "CₙH₂ₙOₙ"
+          ],
+          [
+            195338,
+            "幂級数",
+            "a₀+a₁x+a₂x²+a₃x³+…+aₙxⁿ+…"
+          ],
+          [
+            195342,
+            "幂指数",
+            "aⁿ"
+          ],
+          [
+            195344,
+            "幂集合",
+            "2ᴹ"
+          ]
+        ],
+        "原文命中": 20
+      },
+      {
+        "词书": "oxford",
+        "模式": "含原生 sub / sup 标记的实书复核子集",
+        "物理记录数": 9,
+        "处理": "可确认的数字和符号保留上下标；误入上下标的运算符按同书公式复核。此处物理记录数是遍历的子集大小，正文及摘要的修后差异与其他分组可能重叠。",
+        "样例": [
+          {
+            "source": "oxford",
+            "ordinal": 15994,
+            "head": "google",
+            "old_text": "(font size=-2>TM",
+            "new_text": "Google™"
+          },
+          {
+            "source": "oxford",
+            "ordinal": 23628,
+            "head": "mixed number",
+            "old_text": "31/4",
+            "new_text": "3¼"
+          },
+          {
+            "source": "oxford",
+            "ordinal": 27863,
+            "head": "pint",
+            "old_text": "1/8加仑",
+            "new_text": "⅛加仑"
+          }
+        ],
+        "前后差异": {
+          "physical_rows_with_script_tag_start": 9,
+          "plain_changed": 9,
+          "imported_summary_changed": 2
+        }
+      },
+      {
+        "词书": "sanseido",
+        "模式": "物理词头 <font ",
+        "物理记录数": 7,
+        "处理": "候选使用还原后的词头，查询和跳转仍使用原键。",
+        "样例": [
+          [
+            100352,
+            "うねり<font color=\"#008000\">(2)</font>"
+          ],
+          [
+            109420,
+            "おどかし<font color=\"#008000\">[す]</font>"
+          ],
+          [
+            121860,
+            "かわばた<font color=\"#008000\">[べり]</font>"
+          ],
+          [
+            242419,
+            "ね<font color=\"#008000\">[ねえ]</font>"
+          ],
+          [
+            245005,
+            "のりかける<font color=\"#008000\">[かかる]</font>"
+          ]
+        ]
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "物理词头 <sup>",
+        "物理记录数": 6,
+        "处理": "候选使用还原后的词头，查询和跳转仍使用原键。",
+        "样例": [
+          [
+            5643,
+            "Dial Q<sup>2</sup>"
+          ],
+          [
+            15548,
+            "Nuku<sup>'</sup>alofa"
+          ],
+          [
+            24312,
+            "χ<sup>2</sup>分布"
+          ],
+          [
+            24313,
+            "χ<sup>2</sup>検定"
+          ],
+          [
+            257278,
+            "ダイヤルキューツー[Dial Q<sup>2</sup>]"
+          ]
+        ]
+      },
+      {
+        "词书": "shogakukan",
+        "模式": "",
+        "物理记录数": 6,
+        "处理": "𫚕",
+        "样例": [
+          {
+            "ordinal": 3073,
+            "head": "いなだ",
+            "field": "gloss",
+            "context": "〈動〉鱼的幼鱼"
+          },
+          {
+            "ordinal": 3073,
+            "head": "いなだ",
+            "field": "body",
+            "context": "〈動〉鱼的幼鱼shīyú de yòu"
+          },
+          {
+            "ordinal": 10551,
+            "head": "かんぱち",
+            "field": "gloss",
+            "context": "〈動〉紫zǐshī"
+          }
+        ],
+        "依据": "日汉卷各处译义和拼音核对中日卷，再核对 Unihan 17 双向简繁及读音。中日卷 [79380, '\\ue184（鰤）shī']。E1A7、E237 两卷音义不同，未套用。",
+        "字段": {
+          "gloss": {
+            "rows": 6,
+            "hits": 7
+          },
+          "body": {
+            "rows": 6,
+            "hits": 9
+          }
+        }
+      },
+      {
+        "词书": "oxford",
+        "模式": "(COLLOC) 后的孤立引号及右尖括号",
+        "物理记录数": 6,
+        "处理": "保留 (COLLOC) 和编者正文，去除发生在译文和闭标签之间的定界符。",
+        "样例": [
+          [
+            3501,
+            "big",
+            "nbsp;&nbsp;他在电台广播节目中一直极力推荐这张 CD。 </font></SPAN>(</SPAN>COLLOC)\"&gt;</SPAN p-g seven=\"ys\" eid=\"39\">\r\n"
+          ],
+          [
+            6787,
+            "classic",
+            "-size:90%\">&nbsp;&nbsp;古希腊与古罗马文化研究的学位 </font>(</SPAN>COLLOC)\"&gt;</SPAN eid=\"10\" n-g n=\"3\"></SPAN>\r\n"
+          ],
+          [
+            7714,
+            "condition",
+            "#039;font-size:90%\">&nbsp;&nbsp;皮革护理油 </font>(</SPAN>COLLOC)\"&gt;</SPAN eid=\"21\" n-g n=\"3\"></SPAN>\r\n"
+          ],
+          [
+            11039,
+            "double",
+            "font-size:90%\">&nbsp;&nbsp;我痛得直不起身子。 </font></SPAN>(</SPAN>COLLOC)\"&gt;</SPAN></SPAN p-g eid=\"70\">\r\n"
+          ],
+          [
+            11937,
+            "electric",
+            ":#039;font-size:90%\">&nbsp;&nbsp;我已经付电费了。 </font>(</SPAN>COLLOC)\"&gt;</SPAN p-g eid=\"10\" st=\"new\">\r\n"
+          ]
+        ]
+      },
+      {
+        "词书": "shogakukan-zhja",
+        "模式": "孤立例：接第二词头与相同红色标题",
+        "物理记录数": 4,
+        "处理": "去除两篇之间空的“例：”标记，保留第二个词头、拼音与两篇例句。",
+        "样例": [
+          [
+            2516,
+            "中止",
+            "中指"
+          ],
+          [
+            17139,
+            "噪声污染",
+            "噪音"
+          ],
+          [
+            31594,
+            "承修",
+            "承印"
+          ],
+          [
+            69442,
+            "软炸",
+            "软脂"
+          ]
+        ]
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "かみ(上)",
+        "物理记录数": 3,
+        "处理": "「かみ(上)」",
+        "样例": [
+          {
+            "ordinal": 59067,
+            "head": "かみがた",
+            "field": "body",
+            "context": "上方。〔かみ(上)意指皇宫所在地〕都城方面，京都及"
+          },
+          {
+            "ordinal": 59068,
+            "head": "上方",
+            "field": "gloss",
+            "context": "上方。〔かみ(上)意指皇宫所在地〕都城方面，京都及"
+          },
+          {
+            "ordinal": 59068,
+            "head": "上方",
+            "field": "body",
+            "context": "上方。〔かみ(上)意指皇宫所在地〕都城方面，京都及"
+          }
+        ],
+        "依据": "每个词在受影响记录的原文中都有可逐字核对的「かみ(上)」。以完整括注为单位。",
+        "字段": {
+          "body": {
+            "rows": 3,
+            "hits": 3
+          },
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "shogakukan",
+        "模式": "眍",
+        "物理记录数": 3,
+        "处理": "眍䁖",
+        "样例": [
+          {
+            "ordinal": 6561,
+            "head": "落ち窪む",
+            "field": "body",
+            "context": "凹陷进去的眼睛;眍kōulou眼"
+          },
+          {
+            "ordinal": 6567,
+            "head": "落ち込む",
+            "field": "body",
+            "context": "眼睛眍kōulou进去"
+          },
+          {
+            "ordinal": 14685,
+            "head": "窪む",
+            "field": "body",
+            "context": "因为疲劳眼睛┏眍kōulou〔眍进去〕"
+          }
+        ],
+        "依据": "日汉卷各处译义和拼音核对中日卷，再核对 Unihan 17 双向简繁及读音。中日卷 [79390, '\\ue18c（瞜）lōu']。E1A7、E237 两卷音义不同，未套用。",
+        "字段": {
+          "body": {
+            "rows": 3,
+            "hits": 3
+          }
+        }
+      },
+      {
+        "词书": "shogakukan",
+        "模式": "竹鱼",
+        "物理记录数": 3,
+        "处理": "竹䇲鱼",
+        "样例": [
+          {
+            "ordinal": 33710,
+            "head": "叩き",
+            "field": "body",
+            "context": "拍松的竹鱼肉"
+          },
+          {
+            "ordinal": 47557,
+            "head": "干物",
+            "field": "body",
+            "context": "把竹鱼zhújiāyú晒成干鱼"
+          },
+          {
+            "ordinal": 47803,
+            "head": "開き",
+            "field": "body",
+            "context": "干竹鱼zhújiāyú"
+          }
+        ],
+        "依据": "日汉卷各处译义和拼音核对中日卷，再核对 Unihan 17 双向简繁及读音。中日卷 [79421, '\\ue1aa（筴）cè']。E1A7、E237 两卷音义不同，未套用。",
+        "字段": {
+          "body": {
+            "rows": 3,
+            "hits": 3
+          }
+        }
+      },
+      {
+        "词书": "shogakukan-zhja",
+        "模式": "",
+        "物理记录数": 3,
+        "处理": "⚋",
+        "样例": [
+          {
+            "ordinal": 8156,
+            "head": "八卦",
+            "field": "body",
+            "context": "るとされた．「━」で陽を表し,「」で陰を表す．この記号3本をひと"
+          },
+          {
+            "ordinal": 12788,
+            "head": "卦",
+            "field": "gloss",
+            "context": "易で陽爻（こう）「━」と陰爻「」の組み合わせで示される形象．卦"
+          },
+          {
+            "ordinal": 12788,
+            "head": "卦",
+            "field": "body",
+            "context": "「━」と陰爻「」の組み合わせで示される形象．卦"
+          }
+        ],
+        "依据": "中文词头与日文解释直接指认 阴爻 #8156、#12788、#47949，对照 UnicodeData 正式字符名称。",
+        "字段": {
+          "body": {
+            "rows": 3,
+            "hits": 3
+          },
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "shogakukan-zhja",
+        "模式": "",
+        "物理记录数": 3,
+        "处理": "㇀",
+        "样例": [
+          {
+            "ordinal": 11008,
+            "head": "剔",
+            "field": "body",
+            "context": "右上へ斜めにはねる“”"
+          },
+          {
+            "ordinal": 33292,
+            "head": "挑",
+            "field": "body",
+            "context": "右上へ斜めにはねる“”"
+          },
+          {
+            "ordinal": 34287,
+            "head": "提",
+            "field": "body",
+            "context": "右上へ斜めにはねる“”"
+          }
+        ],
+        "依据": "中文词头与日文解释直接指认 提画、右上斜挑 #11008、#33292、#34287，对照 UnicodeData 正式字符名称。",
+        "字段": {
+          "body": {
+            "rows": 3,
+            "hits": 3
+          }
+        }
+      },
+      {
+        "词书": "sango",
+        "模式": "",
+        "物理记录数": 3,
+        "处理": "𝄋",
+        "样例": [
+          {
+            "ordinal": 1996,
+            "head": "dal s.",
+            "field": "gloss",
+            "context": "〔音乐〕请回到记号处，重奏(演奏演唱提示语)。"
+          },
+          {
+            "ordinal": 1996,
+            "head": "dal s.",
+            "field": "body",
+            "context": "l segno】 〔音乐〕请回到记号处，重奏(演奏演唱提示语)。"
+          },
+          {
+            "ordinal": 18987,
+            "head": "アル·セーニョ",
+            "field": "gloss",
+            "context": "〔音乐〕回到开始，再到(意为再演奏一遍)。"
+          }
+        ],
+        "依据": "同书 dal segno / al segno 三条均明确指明演奏反复记号。对照 UnicodeData MUSICAL SYMBOL SEGNO。",
+        "字段": {
+          "gloss": {
+            "rows": 3,
+            "hits": 3
+          },
+          "body": {
+            "rows": 3,
+            "hits": 3
+          }
+        }
+      },
+      {
+        "词书": "oxford",
+        "模式": "双重转义 &amp;NDASH; 与 &amp;half;",
+        "物理记录数": 2,
+        "处理": "按完整上下文显示为 – 与 ½，保留其它字面实体。",
+        "样例": [
+          [
+            8717,
+            "credit"
+          ],
+          [
+            15359,
+            "gauge"
+          ]
+        ]
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "已存摘要以残缺的 HTML 注释开头符收尾",
+        "物理记录数": 2,
+        "处理": "只去除两处已从原文验证的截断注释。",
+        "样例": [
+          [
+            87168,
+            "後唐"
+          ],
+          [
+            114886,
+            "新興"
+          ]
+        ]
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "「炉」「煽」などの「??」の部分。",
+        "物理记录数": 2,
+        "处理": "「炉」「煽」などの「火」の部分。",
+        "样例": [
+          {
+            "ordinal": 185342,
+            "head": "ひへん",
+            "field": "body",
+            "context": "漢字の偏の一。「炉」「煽」などの「??」の部分。"
+          },
+          {
+            "ordinal": 185344,
+            "head": "火偏",
+            "field": "body",
+            "context": "漢字の偏の一。「炉」「煽」などの「??」の部分。"
+          }
+        ],
+        "依据": "同条中译明确给出这两个字及其部首。对照「火偏」「日偏」和「ひへん」#185342–185344。",
+        "字段": {
+          "body": {
+            "rows": 2,
+            "hits": 2
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "「明」「昨」などの「鲉」の部分。",
+        "物理记录数": 2,
+        "处理": "「明」「昨」などの「日」の部分。",
+        "样例": [
+          {
+            "ordinal": 185342,
+            "head": "ひへん",
+            "field": "body",
+            "context": "漢字の偏の一。「明」「昨」などの「鲉」の部分。"
+          },
+          {
+            "ordinal": 185343,
+            "head": "日偏",
+            "field": "body",
+            "context": "漢字の偏の一。「明」「昨」などの「鲉」の部分。"
+          }
+        ],
+        "依据": "同条中译明确给出这两个字及其部首。对照「火偏」「日偏」和「ひへん」#185342–185344。",
+        "字段": {
+          "body": {
+            "rows": 2,
+            "hits": 2
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "院",
+        "物理记录数": 2,
+        "处理": "「院」",
+        "样例": [
+          {
+            "ordinal": 37389,
+            "head": "いんでん",
+            "field": "body",
+            "context": "。在日本社会地位高的人的戒名，在院之下再加上殿的称呼。古时，用"
+          },
+          {
+            "ordinal": 37391,
+            "head": "院殿",
+            "field": "gloss",
+            "context": "。在日本社会地位高的人的戒名，在院之下再加上殿的称呼。古时，用"
+          },
+          {
+            "ordinal": 37391,
+            "head": "院殿",
+            "field": "body",
+            "context": "。在日本社会地位高的人的戒名，在院之下再加上殿的称呼。古时，用"
+          }
+        ],
+        "依据": "每个词在受影响记录的原文中都有可逐字核对的「院」。以完整括注为单位。",
+        "字段": {
+          "body": {
+            "rows": 2,
+            "hits": 2
+          },
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "殿",
+        "物理记录数": 2,
+        "处理": "「殿」",
+        "样例": [
+          {
+            "ordinal": 37389,
+            "head": "いんでん",
+            "field": "body",
+            "context": "高的人的戒名，在「院」之下再加上殿的称呼。古时，用于将军、大名等人"
+          },
+          {
+            "ordinal": 37391,
+            "head": "院殿",
+            "field": "gloss",
+            "context": "高的人的戒名，在「院」之下再加上殿的称呼。古时，用于将军、大名等人"
+          },
+          {
+            "ordinal": 37391,
+            "head": "院殿",
+            "field": "body",
+            "context": "高的人的戒名，在「院」之下再加上殿的称呼。古时，用于将军、大名等人"
+          }
+        ],
+        "依据": "每个词在受影响记录的原文中都有可逐字核对的「殿」。以完整括注为单位。",
+        "字段": {
+          "body": {
+            "rows": 2,
+            "hits": 2
+          },
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "とがりょう",
+        "物理记录数": 2,
+        "处理": "「とがりょう」",
+        "样例": [
+          {
+            "ordinal": 60225,
+            "head": "かりょう",
+            "field": "body",
+            "context": "〔法律界为了与过料区别也读作とがりょう〕"
+          },
+          {
+            "ordinal": 60229,
+            "head": "科料",
+            "field": "body",
+            "context": "〔法律界为了与过料区别也读作とがりょう〕"
+          }
+        ],
+        "依据": "每个词在受影响记录的原文中都有可逐字核对的「とがりょう」。以完整括注为单位。",
+        "字段": {
+          "body": {
+            "rows": 2,
+            "hits": 2
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "科料",
+        "物理记录数": 2,
+        "处理": "「科料」",
+        "样例": [
+          {
+            "ordinal": 60225,
+            "head": "かりょう",
+            "field": "body",
+            "context": "刑法、刑事诉讼法。〔法律界为了与科料区别也读作あやまちりょう〕"
+          },
+          {
+            "ordinal": 60230,
+            "head": "過料",
+            "field": "gloss",
+            "context": "刑法、刑事诉讼法。〔法律界为了与科料区别…"
+          },
+          {
+            "ordinal": 60230,
+            "head": "過料",
+            "field": "body",
+            "context": "刑法、刑事诉讼法。〔法律界为了与科料区别也读作あやまちりょう〕"
+          }
+        ],
+        "依据": "每个词在受影响记录的原文中都有可逐字核对的「科料」。以完整括注为单位。",
+        "字段": {
+          "body": {
+            "rows": 2,
+            "hits": 2
+          },
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "あやまちりょう",
+        "物理记录数": 2,
+        "处理": "「あやまちりょう」",
+        "样例": [
+          {
+            "ordinal": 60225,
+            "head": "かりょう",
+            "field": "body",
+            "context": "〔法律界为了与「科料」区别也读作あやまちりょう〕"
+          },
+          {
+            "ordinal": 60230,
+            "head": "過料",
+            "field": "body",
+            "context": "〔法律界为了与「科料」区别也读作あやまちりょう〕"
+          }
+        ],
+        "依据": "每个词在受影响记录的原文中都有可逐字核对的「あやまちりょう」。以完整括注为单位。",
+        "字段": {
+          "body": {
+            "rows": 2,
+            "hits": 2
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "けんこつ",
+        "物理记录数": 2,
+        "处理": "「けんこつ」",
+        "样例": [
+          {
+            "ordinal": 61645,
+            "head": "かんこつ",
+            "field": "body",
+            "context": "〔けんこつ的习惯读法〕颧骨。眼睛斜下方的骨"
+          },
+          {
+            "ordinal": 61647,
+            "head": "顴骨",
+            "field": "gloss",
+            "context": "〔けんこつ的习惯读法〕颧骨。眼睛斜下方的骨"
+          },
+          {
+            "ordinal": 61647,
+            "head": "顴骨",
+            "field": "body",
+            "context": "〔けんこつ的习惯读法〕颧骨。眼睛斜下方的骨"
+          }
+        ],
+        "依据": "每个词在受影响记录的原文中都有可逐字核对的「けんこつ」。以完整括注为单位。",
+        "字段": {
+          "body": {
+            "rows": 2,
+            "hits": 2
+          },
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "Queirs",
+        "物理记录数": 2,
+        "处理": "Queirós",
+        "样例": [
+          {
+            "ordinal": 11683,
+            "head": "José Maria Eade Queirs",
+            "field": "head",
+            "context": "osé Maria Eçade Queirs"
+          },
+          {
+            "ordinal": 235678,
+            "head": "エッサデケイロース[José Maria Eade Queirs]",
+            "field": "head",
+            "context": "osé Maria Eçade Queirs]"
+          },
+          {
+            "ordinal": 235678,
+            "head": "エッサデケイロース[José Maria Eade Queirs]",
+            "field": "body",
+            "context": "osé Maria Eçade Queirs"
+          }
+        ],
+        "依据": "本书 #244790 ケイロース的正文清楚写作 Queirós，对应其他记录中的同一人。",
+        "字段": {
+          "head": {
+            "rows": 2,
+            "hits": 2
+          },
+          "body": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "",
+        "物理记录数": 2,
+        "处理": "∀",
+        "样例": [
+          {
+            "ordinal": 226350,
+            "head": "論理記号",
+            "field": "gloss",
+            "context": "连言)、∨(选言)、(包含)、(全称)、(存在)等。"
+          },
+          {
+            "ordinal": 226350,
+            "head": "論理記号",
+            "field": "body",
+            "context": "連言)，∨(選言)，(含意)，(全称記号)，(存在記号)など"
+          },
+          {
+            "ordinal": 245255,
+            "head": "ゲンツェン[Gerhard Gentzen]",
+            "field": "gloss",
+            "context": "无矛盾性，并且首创使用任意符号“”。"
+          }
+        ],
+        "依据": "本书词头、日文或中文释义直接指出符号「全称記号 / 全称」，核对 UnicodeData 正式字符名称。",
+        "字段": {
+          "gloss": {
+            "rows": 2,
+            "hits": 2
+          },
+          "body": {
+            "rows": 2,
+            "hits": 4
+          }
+        }
+      },
+      {
+        "词书": "shogakukan",
+        "模式": "B",
+        "物理记录数": 2,
+        "处理": "B₂",
+        "样例": [
+          {
+            "ordinal": 12634,
+            "head": "強化",
+            "field": "body",
+            "context": "加入维生素B、B、钙gài等的大米"
+          },
+          {
+            "ordinal": 69710,
+            "head": "リボフラビン",
+            "field": "body",
+            "context": "ù,维生素wéishēngsù B"
+          }
+        ],
+        "依据": "#69710 リボフラビン 同时列「核黄素」与「维生素 B」加外字，即维生素 B₂。取得摘要时 B 被分词丢弃，故另限整段恢复。",
+        "字段": {
+          "body": {
+            "rows": 2,
+            "hits": 2
+          }
+        }
+      },
+      {
+        "词书": "sanseido",
+        "模式": "物理词头 <br>",
+        "物理记录数": 1,
+        "处理": "候选使用还原后的词头，查询和跳转仍使用原键。",
+        "样例": [
+          [
+            365232,
+            "取(り)澄ます】<br></font></font>"
+          ]
+        ]
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "黄土色",
+        "物理记录数": 1,
+        "处理": "「黄土色」",
+        "样例": [
+          {
+            "ordinal": 232301,
+            "head": "イエローオーカ",
+            "field": "gloss",
+            "context": "土黄色。同黄土色。"
+          },
+          {
+            "ordinal": 232301,
+            "head": "イエローオーカ",
+            "field": "body",
+            "context": "土黄色。同黄土色。"
+          }
+        ],
+        "依据": "每个词在受影响记录的原文中都有可逐字核对的「黄土色」。以完整括注为单位。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          },
+          "body": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "J/",
+        "物理记录数": 1,
+        "处理": "J/ψ",
+        "样例": [
+          {
+            "ordinal": 259025,
+            "head": "ティン[Samuel Chao Chung Ting]",
+            "field": "gloss",
+            "context": "文国立实验室的质子同步加速器发现J/粒子，并证明了C夸克的存在。里克"
+          },
+          {
+            "ordinal": 259025,
+            "head": "ティン[Samuel Chao Chung Ting]",
+            "field": "body",
+            "context": "立研究所の陽子シンクロトロンで J/ (ジェー-プサイ)粒子を発見，"
+          }
+        ],
+        "依据": "本书同条日文标读「ジェー-プサイ」。别处的 phi 外字不套用。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          },
+          "body": {
+            "rows": 1,
+            "hits": 2
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "",
+        "物理记录数": 1,
+        "处理": "∃",
+        "样例": [
+          {
+            "ordinal": 226350,
+            "head": "論理記号",
+            "field": "gloss",
+            "context": "选言)、(包含)、∀(全称)、(存在)等。"
+          },
+          {
+            "ordinal": 226350,
+            "head": "論理記号",
+            "field": "body",
+            "context": ")，(含意)，∀(全称記号)，(存在記号)など。"
+          }
+        ],
+        "依据": "本书词头、日文或中文释义直接指出符号「存在記号 / 存在」，核对 UnicodeData 正式字符名称。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          },
+          "body": {
+            "rows": 1,
+            "hits": 2
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "",
+        "物理记录数": 1,
+        "处理": "©",
+        "样例": [
+          {
+            "ordinal": 203478,
+            "head": "丸シー",
+            "field": "gloss",
+            "context": "权标记。表示享有著作权的符号，用表示，由世界著作权公约设定。"
+          },
+          {
+            "ordinal": 203478,
+            "head": "丸シー",
+            "field": "body",
+            "context": "字〕著作権の保持を表示する記号。で示す。万国著作権条約により設定"
+          }
+        ],
+        "依据": "本书词头、日文或中文释义直接指出符号「丸シー / copyright」，核对 UnicodeData 正式字符名称。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          },
+          "body": {
+            "rows": 1,
+            "hits": 2
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "",
+        "物理记录数": 1,
+        "处理": "𝄋",
+        "样例": [
+          {
+            "ordinal": 257677,
+            "head": "イ　dal segno",
+            "field": "gloss",
+            "context": "开始”之意〕从记号处反复，请回到记号处演奏。指示回到标有记号的"
+          },
+          {
+            "ordinal": 257677,
+            "head": "イ　dal segno",
+            "field": "body",
+            "context": "〔「記号のところから」の意〕記号のつけられた箇所に戾り，そこから"
+          }
+        ],
+        "依据": "本书词头、日文或中文释义直接指出符号「dal segno / 回到记号处」，核对 UnicodeData 正式字符名称。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 2
+          },
+          "body": {
+            "rows": 1,
+            "hits": 3
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "",
+        "物理记录数": 1,
+        "处理": "♠",
+        "样例": [
+          {
+            "ordinal": 254104,
+            "head": "スペード",
+            "field": "gloss",
+            "context": "色的一种，把剑图案化的、印有黑色状图案的牌。"
+          },
+          {
+            "ordinal": 254104,
+            "head": "スペード",
+            "field": "body",
+            "context": "の種類の一。剣を図案化した，黒い形の絵柄のもの。"
+          }
+        ],
+        "依据": "本书词头、日文或中文释义直接指出符号「スペード / 黑桃的牌面图案」，核对 UnicodeData 正式字符名称。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          },
+          "body": {
+            "rows": 1,
+            "hits": 2
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "",
+        "物理记录数": 1,
+        "处理": "$",
+        "样例": [
+          {
+            "ordinal": 263113,
+            "head": "ドル",
+            "field": "gloss",
+            "context": "地区的货币单位，一般指美元。符号。"
+          },
+          {
+            "ordinal": 263113,
+            "head": "ドル",
+            "field": "body",
+            "context": "カドルのことをいう。ダラー。記号"
+          }
+        ],
+        "依据": "本书词头、日文或中文释义直接指出符号「ドル / 美元符号」，核对 UnicodeData 正式字符名称。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          },
+          "body": {
+            "rows": 1,
+            "hits": 2
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "",
+        "物理记录数": 1,
+        "处理": "℉",
+        "样例": [
+          {
+            "ordinal": 55466,
+            "head": "華氏温度",
+            "field": "gloss",
+            "context": "准大气压下，将水的结冰点定为32，沸点定为212的温度刻度。符"
+          },
+          {
+            "ordinal": 55466,
+            "head": "華氏温度",
+            "field": "body",
+            "context": "212度とする温度目盛り。記号 摂氏温度との関係は F=9/5C"
+          }
+        ],
+        "依据": "本书词头、日文或中文释义直接指出符号「華氏温度 / 32 和 212 的标度与单位符号」，核对 UnicodeData 正式字符名称。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 3
+          },
+          "body": {
+            "rows": 1,
+            "hits": 4
+          }
+        }
+      },
+      {
+        "词书": "shinseiki",
+        "模式": "",
+        "物理记录数": 1,
+        "处理": "∅",
+        "样例": [
+          {
+            "ordinal": 75033,
+            "head": "空集合",
+            "field": "gloss",
+            "context": "集合，将其视为一个集合，并用符号表示。"
+          },
+          {
+            "ordinal": 75033,
+            "head": "空集合",
+            "field": "body",
+            "context": "。それを一つの集合とみなし，記号で表す。"
+          }
+        ],
+        "依据": "本书词头、日文或中文释义直接指出符号「空集合 / 空集的符号」，核对 UnicodeData 正式字符名称。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          },
+          "body": {
+            "rows": 1,
+            "hits": 2
+          }
+        }
+      },
+      {
+        "词书": "shogakukan",
+        "模式": "裆",
+        "物理记录数": 1,
+        "处理": "𮖁裆",
+        "样例": [
+          {
+            "ordinal": 4073,
+            "head": "打ち掛け",
+            "field": "gloss",
+            "context": "裆长罩衫"
+          },
+          {
+            "ordinal": 4073,
+            "head": "打ち掛け",
+            "field": "body",
+            "context": "裆长罩衫liǎngdāng chá"
+          }
+        ],
+        "依据": "日汉卷各处译义和拼音核对中日卷，再核对 Unihan 17 双向简繁及读音。中日卷 [79381, '\\ue185（裲）liǎng']。E1A7、E237 两卷音义不同，未套用。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          },
+          "body": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "shogakukan",
+        "模式": "",
+        "物理记录数": 1,
+        "处理": "𮩛𫗩",
+        "样例": [
+          {
+            "ordinal": 67330,
+            "head": "ピラフ",
+            "field": "gloss",
+            "context": "〈料理〉肉饭,杂烩饭;（饭）bìluó（fàn）;［チ"
+          },
+          {
+            "ordinal": 67330,
+            "head": "ピラフ",
+            "field": "body",
+            "context": "fàn,杂烩饭záhuìfàn;（饭）bìluó（fàn）;［チ"
+          }
+        ],
+        "依据": "日汉卷各处译义和拼音核对中日卷，再核对 Unihan 17 双向简繁及读音。中日卷 [79483, '\\ue217（饆）bì'], [79485, '\\ue218（饠）luó']。E1A7、E237 两卷音义不同，未套用。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          },
+          "body": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "shogakukan",
+        "模式": "核黄素,维生素",
+        "物理记录数": 1,
+        "处理": "核黄素,维生素B₂",
+        "样例": [
+          {
+            "ordinal": 69710,
+            "head": "リボフラビン",
+            "field": "gloss",
+            "context": "〈薬〉核黄素,维生素"
+          }
+        ],
+        "依据": "#69710 リボフラビン 同时列「核黄素」与「维生素 B」加外字，即维生素 B₂。取得摘要时 B 被分词丢弃，故另限整段恢复。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "shogakukan-zhja",
+        "模式": "",
+        "物理记录数": 1,
+        "处理": "⺮",
+        "样例": [
+          {
+            "ordinal": 55301,
+            "head": "竹字头",
+            "field": "gloss",
+            "context": "～儿）（漢字の偏旁）竹かんむり“”"
+          },
+          {
+            "ordinal": 55301,
+            "head": "竹字头",
+            "field": "body",
+            "context": "竹かんむり“”"
+          }
+        ],
+        "依据": "中文词头与日文解释直接指认 竹字头，竹かんむり #55301，对照 UnicodeData 正式字符名称。",
+        "字段": {
+          "gloss": {
+            "rows": 1,
+            "hits": 1
+          },
+          "body": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "sango",
+        "模式": "D?bel",
+        "物理记录数": 1,
+        "处理": "Dübel",
+        "样例": [
+          {
+            "ordinal": 13759,
+            "head": "ばね輪形ジベル",
+            "field": "body",
+            "context": "発条わがた(德) D?bel\r\n"
+          }
+        ],
+        "依据": "本书 #13759 木材结合用栓与 #39919 ジベル 的原文均指德语 Dübel，后者完整拼写。",
+        "字段": {
+          "body": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "sango",
+        "模式": "Independ?ncia",
+        "物理记录数": 1,
+        "处理": "Independência",
+        "样例": [
+          {
+            "ordinal": 5808,
+            "head": "PAIGC",
+            "field": "body",
+            "context": "ido Africano da Independ?ncia da Guineee Cabo"
+          }
+        ],
+        "依据": "本书 #5808 PAIGC 的葡语「独立」与 #7570 UNITA 的 Independência 指同一词。",
+        "字段": {
+          "body": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "sango",
+        "模式": "l?art pour l?art",
+        "物理记录数": 1,
+        "处理": "l'art pour l'art",
+        "样例": [
+          {
+            "ordinal": 80476,
+            "head": "ラールプールラール",
+            "field": "body",
+            "context": "(法) l?art pour l?art\r\n"
+          }
+        ],
+        "依据": "本书 #80475 与 #80476 均释为艺术至上主义，前者有两处完整撇号。",
+        "字段": {
+          "body": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "sango",
+        "模式": "ballon d?essai",
+        "物理记录数": 1,
+        "处理": "ballon d'essai",
+        "样例": [
+          {
+            "ordinal": 59214,
+            "head": "バロンデッセ",
+            "field": "body",
+            "context": "(法) ballon d?essai\r\n"
+          }
+        ],
+        "依据": "本书 #59213 与 #59214 均释为观测气球，前者撇号完好。",
+        "字段": {
+          "body": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "sango",
+        "模式": "trompe－l?oeil",
+        "物理记录数": 1,
+        "处理": "trompe－l'oeil",
+        "样例": [
+          {
+            "ordinal": 54198,
+            "head": "トロンプルイユ",
+            "field": "body",
+            "context": "(法) trompe－l?oeil\r\n"
+          }
+        ],
+        "依据": "本书 #54197 与 #54198 同指错觉画，前者保留 l'oeil 的撇号。",
+        "字段": {
+          "body": {
+            "rows": 1,
+            "hits": 1
+          }
+        }
+      },
+      {
+        "词书": "shogakukan",
+        "模式": "鉄格子 的编辑原注末尾孤立的引号和右尖括号",
+        "物理记录数": 1,
+        "处理": "保留编辑说明和原来的日文闭引号。",
+        "样例": [
+          [
+            38389,
+            "鉄格子"
+          ]
+        ]
+      }
+    ],
+    "核验": {
+      "牛津旧卷实际WebView2": {
+        "headwordPages": 48,
+        "helperPages": 22,
+        "beforeAndAfterPagesEach": 70,
+        "allHyperlinksRetained": 111,
+        "allAnchorsRetained": 70,
+        "formulaOccurrencesBefore": 97,
+        "remainingLeakedNamesAfter": 0,
+        "doubleEntitiesRepaired": 4
+      },
+      "三合一及词头": {
+        "sanseido": 95,
+        "shinseiki": 18,
+        "sangoPhysical": 5343,
+        "sangoMergedPages": 2010,
+        "sangoMergedNumbers": 5343
+      },
+      "四书字形运行时": {
+        "failed": [],
+        "counts": {
+          "shinseiki": {
+            "bodyRows": 87,
+            "storedFields": 16,
+            "ruleFieldRows": 112
+          },
+          "shogakukan": {
+            "bodyRows": 16,
+            "storedFields": 9,
+            "ruleFieldRows": 25
+          },
+          "shogakukan-zhja": {
+            "bodyRows": 7,
+            "storedFields": 2,
+            "ruleFieldRows": 9
+          },
+          "sango": {
+            "bodyRows": 8,
+            "storedFields": 3,
+            "ruleFieldRows": 11
+          }
+        }
+      },
+      "新世纪及小学馆旧卷HTML5小节数": 302,
+      "版面及原注真实WebView2": [
+        {
+          "book": "sango",
+          "ordinal": 242,
+          "head": "ADB",
+          "anchors": 1,
+          "links": 0
+        },
+        {
+          "book": "sango",
+          "ordinal": 243,
+          "head": "ADC",
+          "anchors": 1,
+          "links": 0
+        },
+        {
+          "book": "hanying",
+          "ordinal": 108105,
+          "head": "安全",
+          "anchors": 331,
+          "links": 0
+        },
+        {
+          "book": "hanying",
+          "ordinal": 288,
+          "head": "○",
+          "anchors": 1,
+          "links": 0
+        },
+        {
+          "book": "hanying",
+          "ordinal": 299,
+          "head": "䁖",
+          "anchors": 1,
+          "links": 0
+        },
+        {
+          "book": "shinseiki",
+          "ordinal": 38285,
+          "head": "後ろ",
+          "anchors": 1,
+          "links": 0
+        },
+        {
+          "book": "shinseiki",
+          "ordinal": 24331,
+          "head": "あ·く",
+          "anchors": 1,
+          "links": 0
+        },
+        {
+          "book": "shinseiki",
+          "ordinal": 1,
+          "head": "?",
+          "anchors": 1,
+          "links": 0
+        },
+        {
+          "book": "shogakukan",
+          "ordinal": 38389,
+          "head": "鉄格子",
+          "anchors": 1,
+          "links": 0
+        }
+      ],
+      "联想按钮实际点击": [
+        {
+          "prefix": "at&",
+          "label": "AT&T",
+          "aria": "AT&T",
+          "clicked": "at&amp;t",
+          "physical": "AT&amp;T",
+          "ordinal": 4162,
+          "gloss": "〖American　Telephone　and　Telegraph　Company〗"
+        },
+        {
+          "prefix": "dial q",
+          "label": "Dial Q²",
+          "aria": "Dial Q²",
+          "clicked": "dial q<sup>2</sup>",
+          "physical": "ダイヤルキューツー[Dial Q<sup>2</sup>]",
+          "ordinal": 257278,
+          "gloss": "拨号收费。信息费征收代办服务的通称，NTT(日本电报电话股份公司)代替信息提供者征收使用电话的信息服务费。"
+        }
+      ],
+      "现代汉英全部CK正文逐字校验": {
+        "方法": "逐条用修复前后真实 FormatDetail 展开，去除空白后分别计算每条正文 SHA-256，再连同物理序号按顺序计算总哈希。",
+        "修前": {
+          "rows": 144844,
+          "visibleLines": 144844,
+          "nonWhitespaceHash": "CDDC32B0791AE466AAFB1D573B4218A732AF3D171460EBE9840EA738BDB50E96"
+        },
+        "修后": {
+          "rows": 144844,
+          "visibleLines": 870996,
+          "nonWhitespaceHash": "CDDC32B0791AE466AAFB1D573B4218A732AF3D171460EBE9840EA738BDB50E96"
+        }
+      },
+      "新世纪十条损坏公式": {
+        "实库反查与摘要": [
+          {
+            "reverseHighlight": "造血药。专门使血液中的红细胞增多的药剂，用于治疗贫血，如铁剂、肝脏制剂、叶酸、维生素B₁₂等。",
+            "ordinal": 136699,
+            "head": "造血薬",
+            "formula": "B₁₂",
+            "storedGloss": "造血药。专门使血液中的红细胞增多的药剂，用于治疗贫血，如铁剂、肝脏制剂、叶酸、维生素B₁₂等。",
+            "importGloss": "造血药。专门使血液中的红细胞增多的药剂，用于治疗贫血，如铁剂、肝脏制剂、叶酸、维生素B₁₂等。",
+            "detailOccurrences": 2,
+            "richOccurrences": 2
+          },
+          {
+            "reverseHighlight": "单糖类，单糖。糖类中不能加水分解成更低分子的糖，一般用CₙH₂ₙOₙ表示，例如葡萄糖、果糖等。",
+            "ordinal": 142897,
+            "head": "単糖类",
+            "formula": "CₙH₂ₙOₙ",
+            "storedGloss": "单糖类，单糖。糖类中不能加水分解成更低分子的糖，一般用CₙH₂ₙOₙ表示，例如葡萄糖、果糖等。",
+            "importGloss": "单糖类，单糖。糖类中不能加水分解成更低分子的糖，一般用CₙH₂ₙOₙ表示，例如葡萄糖、果糖等。",
+            "detailOccurrences": 2,
+            "richOccurrences": 2
+          },
+          {
+            "reverseHighlight": "幂级数。把a₀+a₁x+a₂x²+a₃x³+…+aₙxⁿ+…形式的级数称为x的幂级数。",
+            "ordinal": 195338,
+            "head": "幂級数",
+            "formula": "a₀+a₁x+a₂x²+a₃x³+…+aₙxⁿ+…",
+            "storedGloss": "幂级数。把a₀+a₁x+a₂x²+a₃x³+…+aₙxⁿ+…形式的级数称为x的幂级数。",
+            "importGloss": "幂级数。把a₀+a₁x+a₂x²+a₃x³+…+aₙxⁿ+…形式的级数称为x的幂级数。",
+            "detailOccurrences": 2,
+            "richOccurrences": 2
+          },
+          {
+            "reverseHighlight": "幂指数，幂数。乘方的次数，对于aⁿ而言的n。",
+            "ordinal": 195342,
+            "head": "幂指数",
+            "formula": "aⁿ",
+            "storedGloss": "幂指数，幂数。乘方的次数，对于aⁿ而言的n。",
+            "importGloss": "幂指数，幂数。乘方的次数，对于aⁿ而言的n。",
+            "detailOccurrences": 2,
+            "richOccurrences": 2
+          },
+          {
+            "reverseHighlight": "幂集(合)。集合M中的所有子集的集合称为M的幂集，用2ᴹ表示。",
+            "ordinal": 195344,
+            "head": "幂集合",
+            "formula": "2ᴹ",
+            "storedGloss": "幂集(合)。集合M中的所有子集的集合称为M的幂集，用2ᴹ表示。",
+            "importGloss": "幂集(合)。集合M中的所有子集的集合称为M的幂集，用2ᴹ表示。",
+            "detailOccurrences": 2,
+            "richOccurrences": 2
+          },
+          {
+            "reverseHighlight": "山梨醇。葡萄糖经还原成为6氢醇，化学式C₆H₁₄O₆。含于苹果、桃、花楸等水果的汁液中，味甘。可作食品添加剂、合成维生素的原料，亦用于糖尿病患者的甜味剂以及利尿剂等。",
+            "ordinal": 256072,
+            "head": "ソルビット",
+            "formula": "C₆H₁₄O₆",
+            "storedGloss": "山梨醇。葡萄糖经还原成为6氢醇，化学式C₆H₁₄O₆。含于苹果、桃、花楸等水果的汁液中，味甘。可作食品添加剂、合成维…",
+            "importGloss": "山梨醇。葡萄糖经还原成为6氢醇，化学式C₆H₁₄O₆。含于苹果、桃、花楸等水果的汁液中，味甘。可作食品添加剂、合成维生素的原料，亦用于糖尿病…",
+            "detailOccurrences": 2,
+            "richOccurrences": 2
+          },
+          {
+            "reverseHighlight": "山梨酸，2，4-己二烯酸。含两个双键的1价羧酸。化学式C₅H₇COOH，大体为无味无臭的白色针状晶体。天然存在于花楸的果实中。作为保鲜剂、防腐剂添加于食品。",
+            "ordinal": 256074,
+            "head": "ソルビン酸",
+            "formula": "C₅H₇COOH",
+            "storedGloss": "山梨酸，2，4-己二烯酸。含两个双键的1价羧酸。化学式C₅H₇COOH，大体为无味无臭的白色针状晶体。天然存在于花楸的果实中…",
+            "importGloss": "山梨酸，2，4-己二烯酸。含两个双键的1价羧酸。化学式C₅H₇COOH，大体为无味无臭的白色针状晶体。天然存在于花楸的果实中。作为保鲜剂、防…",
+            "detailOccurrences": 2,
+            "richOccurrences": 2
+          },
+          {
+            "reverseHighlight": "(正)十六(碳)烷。碳氢化合物的一种，化学式C₁₆H₃₄。为柴油机燃料十六烷值的标准燃料。",
+            "ordinal": 276029,
+            "head": "ヘキサデカン",
+            "formula": "C₁₆H₃₄",
+            "storedGloss": "(正)十六(碳)烷。碳氢化合物的一种，化学式C₁₆H₃₄。为柴油机燃料十六烷值的标准燃料。",
+            "importGloss": "(正)十六(碳)烷。碳氢化合物的一种，化学式C₁₆H₃₄。为柴油机燃料十六烷值的标准燃料。",
+            "detailOccurrences": 2,
+            "richOccurrences": 2
+          },
+          {
+            "reverseHighlight": "(正)己烷。碳数为6的链烷(甲烷系烃)，分子式C₆H₁₄。有5种异构体，但均为无色透明的可燃性液体。作为有机化合物，尤其是作为非极性物质的溶剂而广泛应用。",
+            "ordinal": 276031,
+            "head": "ヘキサン",
+            "formula": "C₆H₁₄",
+            "storedGloss": "(正)己烷。碳数为6的链烷(甲烷系烃)，分子式C₆H₁₄。有5种异构体，但均为无色透明的可燃性液体。作为有机化合物，尤其是作…",
+            "importGloss": "(正)己烷。碳数为6的链烷(甲烷系烃)，分子式C₆H₁₄。有5种异构体，但均为无色透明的可燃性液体。作为有机化合物，尤其是作为非极性物质的溶…",
+            "detailOccurrences": 2,
+            "richOccurrences": 2
+          },
+          {
+            "reverseHighlight": "己糖。碳原子数为6个单糖类的总称。分子式C₆H₁₂O₆，如葡萄糖、果糖、甘露糖、半乳糖等。",
+            "ordinal": 276033,
+            "head": "ヘキソース",
+            "formula": "C₆H₁₂O₆",
+            "storedGloss": "己糖。碳原子数为6个单糖类的总称。分子式C₆H₁₂O₆，如葡萄糖、果糖、甘露糖、半乳糖等。",
+            "importGloss": "己糖。碳原子数为6个单糖类的总称。分子式C₆H₁₂O₆，如葡萄糖、果糖、甘露糖、半乳糖等。",
+            "detailOccurrences": 2,
+            "richOccurrences": 2
+          }
+        ],
+        "旧卷浏览器": [
+          {
+            "ordinal": 136699,
+            "version": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0",
+            "count": 2,
+            "formula": "B₁₂",
+            "strayMarkup": false,
+            "superscriptProse": false
+          },
+          {
+            "ordinal": 142897,
+            "version": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0",
+            "count": 2,
+            "formula": "CₙH₂ₙOₙ",
+            "strayMarkup": false,
+            "superscriptProse": false
+          },
+          {
+            "ordinal": 195338,
+            "version": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0",
+            "count": 2,
+            "formula": "a₀+a₁x+a₂x²+a₃x³+…+aₙxⁿ+…",
+            "strayMarkup": false,
+            "superscriptProse": false
+          },
+          {
+            "ordinal": 195342,
+            "version": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0",
+            "count": 2,
+            "formula": "aⁿ",
+            "strayMarkup": false,
+            "superscriptProse": false
+          },
+          {
+            "ordinal": 195344,
+            "version": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0",
+            "count": 2,
+            "formula": "2ᴹ",
+            "strayMarkup": false,
+            "superscriptProse": false
+          },
+          {
+            "ordinal": 256072,
+            "version": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0",
+            "count": 2,
+            "formula": "C₆H₁₄O₆",
+            "strayMarkup": false,
+            "superscriptProse": false
+          },
+          {
+            "ordinal": 256074,
+            "version": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0",
+            "count": 2,
+            "formula": "C₅H₇COOH",
+            "strayMarkup": false,
+            "superscriptProse": false
+          },
+          {
+            "ordinal": 276029,
+            "version": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0",
+            "count": 2,
+            "formula": "C₁₆H₃₄",
+            "strayMarkup": false,
+            "superscriptProse": false
+          },
+          {
+            "ordinal": 276031,
+            "version": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0",
+            "count": 2,
+            "formula": "C₆H₁₄",
+            "strayMarkup": false,
+            "superscriptProse": false
+          },
+          {
+            "ordinal": 276033,
+            "version": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36 Edg/158.0.0.0",
+            "count": 2,
+            "formula": "C₆H₁₂O₆",
+            "strayMarkup": false,
+            "superscriptProse": false
+          }
+        ]
+      },
+      "牛津COLLOC": {
+        "物理条数": 6,
+        "来源": "实际六条普通正文及旧合并页全文比较，并用 Edge 对照六页和 angle bracket 控制页。"
+      },
+      "含原生上下标的词条与旧索引回读": {
+        "baseline_source_tree": "git archive 7b73ffc",
+        "comparison_baseline_assembly_sha256": "5E852FFD297016297FB2ADC1C4D86C718FA58AD1A44423E74715AAE6770C7256",
+        "comparison_candidate_assembly_sha256": "29FE97A6630006AA30474151711B48D15FFB172BCA22CE92ABF233F837638ED8",
+        "description": "只读逐条比较 7b73ffc 与本次构建，限含 sub/sup 起始标记的非重定向原文。正文及摘要差异统计包含两轮构建间作用于同一条目的其他展示修复。合并索引与原始 SQLite 均通过只读 Search 实际查词。",
+        "per_book": {
+          "oxford": {
+            "physical_rows_with_script_tag_start": 9,
+            "plain_changed": 9,
+            "imported_summary_changed": 2
+          },
+          "sanseido": {
+            "physical_rows_with_script_tag_start": 3888,
+            "plain_changed": 3456,
+            "imported_summary_changed": 357
+          },
+          "shinseiki": {
+            "physical_rows_with_script_tag_start": 1235,
+            "plain_changed": 1178,
+            "imported_summary_changed": 650
+          }
+        },
+        "display_comparison_examples": [
+          {
+            "source": "oxford",
+            "ordinal": 15994,
+            "head": "google",
+            "old_text": "(font size=-2>TM",
+            "new_text": "Google™"
+          },
+          {
+            "source": "oxford",
+            "ordinal": 23628,
+            "head": "mixed number",
+            "old_text": "31/4",
+            "new_text": "3¼"
+          },
+          {
+            "source": "oxford",
+            "ordinal": 27863,
+            "head": "pint",
+            "old_text": "1/8加仑",
+            "new_text": "⅛加仑"
+          },
+          {
+            "source": "sanseido",
+            "ordinal": 13,
+            "head": "a",
+            "old_text": "10-¹8",
+            "new_text": "10⁻¹⁸"
+          },
+          {
+            "source": "sanseido",
+            "ordinal": 461,
+            "head": "acetylene",
+            "old_text": "C2H2",
+            "new_text": "C₂H₂"
+          },
+          {
+            "source": "sanseido",
+            "ordinal": 540,
+            "head": "acre",
+            "old_text": "4046.8m2",
+            "new_text": "4046.8m²"
+          },
+          {
+            "source": "shinseiki",
+            "ordinal": 8246,
+            "head": "ガル",
+            "old_text": "cm/s2",
+            "new_text": "cm/s²"
+          },
+          {
+            "source": "shinseiki",
+            "ordinal": 62476,
+            "head": "完全平方",
+            "old_text": "x２+4x+4",
+            "new_text": "x²+4x+4"
+          },
+          {
+            "source": "shinseiki",
+            "ordinal": 105716,
+            "head": "しひょう",
+            "old_text": "log1021",
+            "new_text": "log₁₀21"
+          },
+          {
+            "source": "shinseiki",
+            "ordinal": 237056,
+            "head": "オイラーの多面体の定理",
+            "old_text": "a１+a２",
+            "new_text": "a₁+a₂"
+          }
+        ],
+        "changed_head_reading_or_alias_list": 0,
+        "legacy_shinseiki_stored_preview_confirmed": 640,
+        "legacy_shinseiki_confirmed_matches_new_import": 640,
+        "real_lookup_samples": [
+          {
+            "database": ".data/dictionaries.db",
+            "book": "shinseiki",
+            "head": "ガル",
+            "ordinal": 8246,
+            "displayed": "伽。〔源自伽利略之名〕加速度CGS单位，1伽表示1cm/s²的速度变化。符号Gal。"
+          },
+          {
+            "database": ".data/dictionaries.db",
+            "book": "shinseiki",
+            "head": "重力加速度",
+            "ordinal": 119764,
+            "displayed": "重力加速度。作用于物体的重力除以该物体的质量所得的值。因地球上的位置和高度不同而稍有差异，概略值约为9 . 81m/s²。"
+          },
+          {
+            "database": ".data/dictionaries.db",
+            "book": "shinseiki",
+            "head": "CNG自動車",
+            "ordinal": 4245,
+            "displayed": "压缩天然气汽车。将压缩天然气装入高压储气瓶行驶的汽车，几乎不排出NOₓ、SOₓ、CO。"
+          },
+          {
+            "database": ".data/dictionaries.db",
+            "book": "sanseido",
+            "head": "atto",
+            "ordinal": 4315,
+            "displayed": "単位に冠して，10⁻¹⁸　すなわち一〇〇京(ケイ)分の一の意を表す語。"
+          },
+          {
+            "database": ".data/dictionaries.db",
+            "book": "sanseido",
+            "head": "alumina",
+            "ordinal": 2032,
+            "displayed": "酸化アルミニウム　Al₂O₃　の通称。"
+          },
+          {
+            "database": ".data/dictionaries.db",
+            "book": "oxford",
+            "head": "ounce",
+            "ordinal": 26036,
+            "displayed": "n. 盎司(重量单位, ¹⁄₁₆磅,等于 28.35 克) / 少许；少量；一点点；丝毫"
+          },
+          {
+            "database": ".data/词书合并交付-20261123/index/dictionaries.db",
+            "book": "shinseiki",
+            "head": "ガル",
+            "ordinal": 8246,
+            "displayed": "伽。〔源自伽利略之名〕加速度CGS单位，1伽表示1cm/s²的速度变化。符号Gal。"
+          },
+          {
+            "database": ".data/词书合并交付-20261123/index/dictionaries.db",
+            "book": "shinseiki",
+            "head": "重力加速度",
+            "ordinal": 119764,
+            "displayed": "重力加速度。作用于物体的重力除以该物体的质量所得的值。因地球上的位置和高度不同而稍有差异，概略值约为9 . 81m/s²。"
+          },
+          {
+            "database": ".data/词书合并交付-20261123/index/dictionaries.db",
+            "book": "shinseiki",
+            "head": "CNG自動車",
+            "ordinal": 4245,
+            "displayed": "压缩天然气汽车。将压缩天然气装入高压储气瓶行驶的汽车，几乎不排出NOₓ、SOₓ、CO。"
+          },
+          {
+            "database": ".data/词书合并交付-20261123/index/dictionaries.db",
+            "book": "sanseido",
+            "head": "atto",
+            "ordinal": 4315,
+            "displayed": "単位に冠して，10⁻¹⁸　すなわち一〇〇京(ケイ)分の一の意を表す語。"
+          },
+          {
+            "database": ".data/词书合并交付-20261123/index/dictionaries.db",
+            "book": "sanseido",
+            "head": "alumina",
+            "ordinal": 2032,
+            "displayed": "酸化アルミニウム　Al₂O₃　の通称。"
+          },
+          {
+            "database": ".data/词书合并交付-20261123/index/dictionaries.db",
+            "book": "oxford",
+            "head": "ounce",
+            "ordinal": 26036,
+            "displayed": "n. 盎司(重量单位, ¹⁄₁₆磅,等于 28.35 克) / 少许；少量；一点点；丝毫"
+          }
+        ]
+      }
+    },
+    "保留项": [
+      "新世纪的 ⇒?、??目??科 及不能唯一复原的私用码保留。图片截断可确认时显示占位。完整原图仍归属原词书。",
+      "原始正文为空的 13 条仍保留。新世纪 #15406 None 只有截断的空标签，清理后展示空词条提示。",
+      "英辞郎的问号串、长网址，三省堂的排版分隔符、词性或句式中的尖括号，以及现代汉英 #117455「尖括号」的 <> 均按原词保留。",
+      "三省堂「下駄」以 〓 解释缺字铅字的形状，是定义中的必要示例。英辞郎部分问号串的原字不可唯一确定。"
+    ],
+    "全库计数": {
+      "rows": 3271081,
+      "aliases": 249190,
+      "body": 3021891,
+      "summary": 3021877,
+      "rawEmpty": 13,
+      "empty": 14,
+      "displayEmptyWithRaw": 1
+    },
+    "计数说明": "rows 为物理条目，aliases 是重定向，body 是调用展开正文的次数，summary 是非空已存摘要，rawEmpty 与 empty 分别是空原文和显示为空的正文。按字段匹配的残余信号只用于排查。例如三省堂的 781 条旧摘要仍以原字节保存，实际速览由上一轮的规则按原文重新解析。"
+  },
   "校勘结果": {
     "适用范围": "E_Search 速览、候选及展开详情。旧索引在读取时修正显示，原 MDX、词头、索引键、正文定位和链接目标保留。完整正文逐条扫描；界面实测覆盖代表词条。",
     "各书处理": {

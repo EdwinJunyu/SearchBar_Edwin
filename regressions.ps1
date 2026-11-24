@@ -437,6 +437,40 @@ INSERT INTO terms SELECT dict,ordinal,0,head FROM entries WHERE dict='hanying';
         Assert-Equal ($english -join '|') 'app|apple|apply|app alias|application' '全角规范化、等长稳定排序、可用别名以及停用来源先于截断'
         Assert-Equal $store.PrefixSuggestions('car','oxford',$none)[0] 'cart' '密集长词组之后的短英文补全仍能进入首位'
         Assert-Equal $store.PrefixSuggestions('cow','oxford',$none)[0] 'cowx' '多条旧物理键折叠为同一规范词时仍按原始窗口判断是否补查'
+        # 三种来源有同形键。窗口须以物理词头验证来源，并用原索引键响应点击。
+        $sql.CommandText=@'
+INSERT INTO dictionaries VALUES ('sanseido','ja',1,'[3三省堂超级大辞林第二版.mdx','4',1),
+    ('4af99c36f21e48ff89d98f145477d01e','ja',2,'user-copy.mdx','5',1),('custom','en',3,'custom.tsv','6',2);
+INSERT INTO dictionary_metadata(id,enabled,parser_id) VALUES ('4af99c36f21e48ff89d98f145477d01e',1,'shinseiki');
+INSERT INTO entries VALUES ('sanseido',1,'AT&amp;T',NULL,NULL,'公司','',NULL),
+    ('4af99c36f21e48ff89d98f145477d01e',1,'Dial Q<sup>2</sup>',NULL,NULL,'服务','',NULL),
+    ('custom',1,'AT&amp;T',NULL,NULL,'字面实体','',NULL),('custom',2,'Dial Q<sup>2</sup>',NULL,NULL,'字面标签','',NULL);
+INSERT INTO terms SELECT dict,ordinal,0,lower(head) FROM entries WHERE dict IN ('sanseido','4af99c36f21e48ff89d98f145477d01e','custom');
+INSERT INTO terms VALUES ('sanseido',1,0,'alias&amp;t');
+'@
+        [void]$sql.ExecuteNonQuery()
+        foreach ($case in @(@('at&','sanseido','at&amp;t','AT&T'),@('dial q','4af99c36f21e48ff89d98f145477d01e','dial q<sup>2</sup>','Dial Q²'),
+                            @('at&','custom','at&amp;t','at&amp;t'),@('dial q','custom','dial q<sup>2</sup>','dial q<sup>2</sup>'),
+                            @('alias&','sanseido','alias&amp;t','alias&amp;t'),
+                            @('at&',$all,'at&amp;t','at&amp;t'))) {
+            $key=$store.PrefixSuggestions($case[0],$case[1],$none)[0]
+            Assert-Equal $key $case[2] '命令行前缀保留检索键'
+            $button=$store.PrefixChoices($case[0],$case[1],$none)[0]
+            Assert-Equal $button.Key $key '联想按钮保留可点击的检索键'
+            Assert-Equal $button.ToString() $case[3] '联想按钮按物理词头、解析器和同键来源显示'
+        }
+        $window = [ESearch.SearchWindow]::new($path,'sanseido')
+        try {
+            $item = $store.PrefixChoices('at&','sanseido',$none)[0]
+            $window.FindName('PrefixChoices').ItemsSource = @($item)
+            $action = [Windows.Controls.Button]::new()
+            $action.DataContext = $item
+            $window.GetType().GetMethod('UsePrefixSuggestion',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($window,@($action,$null))
+            Assert-Equal $window.FindName('QueryBox').Text 'at&amp;t' '采纳显示为 AT&T 的联想时仍写回原键'
+        } finally {
+            $window.GetType().GetField('exiting',[Reflection.BindingFlags]'Instance,NonPublic').SetValue($window,$true)
+            $window.Close()
+        }
         $cn=$store.GetType().GetField('db',[Reflection.BindingFlags]'Instance,NonPublic').GetValue($store)
         $queries=[Collections.Generic.List[string]]::new()
         $trace=[SQLitePCL.strdelegate_trace]{param($state,$statement) $state.Add($statement)}
@@ -3038,7 +3072,7 @@ function Test-SanseidoSummary([string]$Scratch, [Reflection.Assembly]$Assembly) 
             'そつ－なく' = '<font face="Arial">(連語)<br>ぬかりなく。要領よく。<br><a href="entry://そつ<font color="#008000">(1)</font>">そつ<font color="#008000">(1)</font></a></font>'
         }
         $expected = @('a.(車が)道路走行に適した.', '乗馬用の洋式の鞍。', '機能を備えたさま。', 'imbalance', '原文の一行目',
-            '帰ることの尊敬語。', 'そのものに似ていることを表す。', '(名)description', 'アクセル(1)', 'ビタミン　B1', 'ぬかりなく。')
+            '帰ることの尊敬語。', 'そのものに似ていることを表す。', '(名)description', 'アクセル(1)', 'ビタミン　B₁', 'ぬかりなく。')
         Write-Mdx $mdx $words
         Invoke-Search @('import','sanseido',$mdx) | Out-Null
         $connection = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$env:E_SEARCH_DB")
@@ -3082,9 +3116,13 @@ function Test-SanseidoSummary([string]$Scratch, [Reflection.Assembly]$Assembly) 
             $cmd = $oldIndex.CreateCommand()
             $cmd.CommandText = "UPDATE entries SET gloss='(連語)' WHERE head='そつ－なく'; UPDATE dictionary_metadata SET summary_stamp='ja-preview/1:'||revision WHERE id='sanseido'"
             [void]$cmd.ExecuteNonQuery()
+            $oldPreview = Invoke-Search @('query','そつ－なく','sanseido')
+            Assert-Equal (($oldPreview -join '').Contains('ぬかりなく。')) $true '按需索引旧戳下的词性摘要也能刷新'
+            $cmd.CommandText = "UPDATE entries SET gloss='ビタミン　B1' WHERE head='aneurin'; UPDATE dictionary_metadata SET summary_stamp='sanseido/2:'||revision WHERE id='sanseido'"
+            [void]$cmd.ExecuteNonQuery()
         } finally { $oldIndex.Dispose() }
-        $oldPreview = Invoke-Search @('query','そつ－なく','sanseido')
-        Assert-Equal (($oldPreview -join '').Contains('ぬかりなく。')) $true '按需索引旧戳下的词性摘要也能刷新'
+        $oldPreview = Invoke-Search @('query','aneurin','sanseido')
+        Assert-Equal (($oldPreview -join '').Contains('ビタミン　B₁')) $true '第二版三省堂按需索引从原书恢复摘要下标'
         Write-Output 'PASS 三省堂音标、声调、词性、重复链接标记与已有只读索引的释义'
     } finally { $env:E_SEARCH_DB = $previous }
 }
@@ -3098,7 +3136,7 @@ function Test-ShinseikiReverseSenses([Reflection.Assembly]$Assembly) {
     $nested='<p class="phrase-wrap"><span>慣用句</span>' + $divider + '<span>不属于主词头</span></p>'
     $body='<ul class="ncdata-sense-wrap"><li>'+$first+$example+'</li><li><span>のみ</span>'+$example+'</li><li><span>二</span>'+$divider+'<span>第二个词义。</span></li></ul>'+$nested
     $senses=@($parse.Invoke($null,@($body,'用具')) | ForEach-Object { $_ })
-    Assert-Equal (($senses | ForEach-Object Item1) -join '|') '量測 H2O & 水。|第二个词义。' '中文反查只抽本义，支持繁体、实体、下标和同段多个义项'
+    Assert-Equal (($senses | ForEach-Object Item1) -join '|') '量測 H₂O & 水。|第二个词义。' '中文反查只抽本义，支持繁体、实体、下标和同段多个义项'
     Assert-Equal $body.Substring($senses[0].Item2.Start.Value,$senses[0].Item2.End.Value-$senses[0].Item2.Start.Value) '量測 H<sub>2</sub>O &amp; 水。' '原始锚点保留嵌套标签和实体的实际长度'
     $pair=foreach ($row in @(@('合う','互相符合。'),@('会う·逢う','相见。'),@('遭う','遭遇。'))) {
         '<div class="wrap-switch"><div class="ncdata-header"><h1><span class="word">あ·う</span><span>【<span>'+$row[0]+'</span>】</span></h1></div><ul class="ncdata-sense-wrap"><li><span>日本語</span>'+$divider+'<span>'+$row[1]+'</span></li></ul></div>'
@@ -3431,6 +3469,9 @@ function Test-OxfordSummary([string]$Scratch, [Reflection.Assembly]$Assembly) {
             [void]$cmd.ExecuteNonQuery()
             $hit = Invoke-Search @('query','light','oxford')
             Assert-Equal ($hit -split "`t")[-1] 'n. 光 / adj. 明亮' '当前格式查询直接使用已存摘要'
+            $cmd.CommandText = "UPDATE dictionary_metadata SET summary_stamp='oxford/1:'||revision WHERE id='oxford'"
+            [void]$cmd.ExecuteNonQuery()
+            Assert-Equal ((Invoke-Search @('query','light','oxford')) -split "`t")[-1] '另一版释义' '已有牛津第一版摘要按修正后的公式模板重新读取正文'
             $cmd.CommandText = 'UPDATE entries SET raw=$body WHERE head=''light'''
             $cmd.Parameters.AddWithValue('$body',$light) | Out-Null
             [void]$cmd.ExecuteNonQuery()
@@ -3698,6 +3739,151 @@ function Test-HanyingReferences([string]$Scratch,[Reflection.Assembly]$Assembly)
     } finally {$env:E_SEARCH_DB=$previous}
 }
 
+function Test-SecondPassDisplay([Reflection.Assembly]$Assembly) {
+    $window = $Assembly.GetType('ESearch.SearchWindow')
+    $static = [Reflection.BindingFlags]'Static,NonPublic'
+    $detail = $window.GetMethod('FormatDetail',$static)
+    $shownHead = [LookupEntry].GetProperty('DisplayHeadword',[Reflection.BindingFlags]'Instance,NonPublic')
+    # 这些完整标签直接来自三部原书；读音、脚注及 HTML 字面示例仍按原文显示。
+    foreach ($row in @(
+        @('sanseido','10<sup>-</sup>¹<sup>8</sup>倍；C<sub>2</sub>H<sub>2</sub>','10⁻¹⁸倍；C₂H₂'),
+        @('sanseido','<a href="entry://ビタミン　B<sub>1</sub>">ビタミン　B<sub>1</sub></a>','ビタミン　B₁'),
+        @('shinseiki','1 cm/s<sup>2</sup>；NO<sub>x</sub>；10<sup>－10</sup>','1 cm/s²；NOₓ；10⁻¹⁰'),
+        @('shinseiki','亚硫酸离子SO<sup>2</sup>-<sub>3</sub>','亚硫酸离子SO₃²⁻'),
+        @('shinseiki','a<sub>0</sub>-a<sub>１+</sub>a<sub>２</sub>=2；log<sub>1021</sub>＝1.3222','a₀-a₁+a₂=2；log₁₀21＝1.3222'),
+        @('shinseiki','log<sub>1021</sub>＝1.8','log₁₀₂₁＝1.8'),
+        @('shinseiki','x<sup>２+4</sup>x+4(=(x+2)<sup>２</sup>)；x<sup>n+</sup>y<sup>n</sup>=z<sup>n</sup>','x²+4x+4(=(x+2)²)；xⁿ+yⁿ=zⁿ'),
+        @('shinseiki','お<sub>つ</sub>し<sub>や</sub>る・〔<sup>*1998</sup>年〕・&lt;sup&gt;2&lt;/sup&gt;','おつしやる・〔*1998年〕・<sup>2</sup>'),
+        @('oxford','for example 3<sup>1</sup>/4, <Sup>1</sup>/16磅','for example 3¼, ¹⁄₁₆磅'),
+        @('oxford','<sup>1</sup>/40','¹/40'),
+        @('oxford','Google(font size=-2><sup>TM</sup></font> search','Google™ search'),
+        @('oxford','品脱(容量单位,为 <Sup>1</up>/8加仑','品脱(容量单位,为 ⅛加仑'),
+        @('other','C<sub>2</sub>・Google(font size=-2><sup>TM</sup></font>','C2・Google(font size=-2>TM')
+    )) {
+        Assert-Equal ($detail.Invoke($null,@($row[1],$null,$row[0]))).Text $row[2] "原书上下标 $($row[0]) $($row[1])"
+    }
+    $legacy = 'Google(font size=-2><sup>TM</sup></font>・为 <Sup>1</up>/8加仑'
+    $ox = '<div class="es-source es-oxford"><a name="es-oxford-15994"></a><a href="#origin">' + $legacy + '</a></div>'
+    $foreign = '<div class="es-source es-hanying">' + $legacy + '</div>'
+    $encoded = $window.GetMethod('EncodeMergedDocument',$static).Invoke($null,@(($ox + $foreign),'/test'))
+    $merged = [Text.Encoding]::UTF8.GetString($encoded)
+    Assert-Equal ($merged.Contains($ox.Replace($legacy,'Google™・为 ⅛加仑') + $foreign)) $true '牛津合并页保留链接、锚点与其他书同形片段'
+    $parser = $Assembly.GetType('EntryParser')
+    $refresh = $parser.GetMethod('RefreshShinseikiScriptGloss',$static)
+    $marked = '<ul class="ncdata-sense-wrap"><li><span>日文</span><span class="divide-imgs"><img/></span><span>1cm/s<sup>２</sup>。</span></li></ul>'
+    Assert-Equal ($parser.GetMethod('Parse').Invoke($null,@('shinseiki','ガル',$marked,'ja'))).Gloss '1cm/s²。' '新导入摘要从真实单位标签取指数'
+    Assert-Equal ($refresh.Invoke($null,@('ガル','1cm/s２。',$marked))) '1cm/s²。' '旧摘要与原书词义一致时恢复指数'
+    Assert-Equal ($refresh.Invoke($null,@('ガル','1cm/s２。',$marked.Replace('<sup>２</sup>','２')))) '1cm/s２。' '无标记的普通数字不作指数解释'
+    Assert-Equal ($refresh.Invoke($null,@('ガル','另一个词义 1cm/s２。',$marked))) '另一个词义 1cm/s２。' '同书不同摘要不套用已知公式'
+    foreach ($row in @(
+        @('sanseido','A&amp;R','A&R'), @('sanseido','LD<sub>5</sub><sub>0</sub>','LD₅₀'),
+        @('sanseido','NO<sub>x</sub>','NOₓ'), @('sanseido','d<i>l</i>','dl'),
+        @('sanseido','うねり<font color="#008000">(2)</font>','うねり(2)'),
+        @('sanseido','取(り)澄ます】<br></font></font>','取(り)澄ます'),
+        @('shinseiki','C<sub>3</sub>植物','C₃植物'), @('shinseiki','Dial Q<sup>2</sup>','Dial Q²'),
+        @('shinseiki','ビタミンビーB<sub>12</sub>','ビタミンビーB₁₂'), @('shinseiki','牧<sub>ノ</sub>原','牧ノ原'),
+        @('other','A&amp;R','A&amp;R'), @('sanseido','例<A>・未閉<i>x','例<A>・未閉<i>x')
+    )) {
+        $e = [LookupEntry]::new($row[0],1,'ja',1,$row[1],$null,'例')
+        Assert-Equal ($shownHead.GetValue($e)) $row[2] "词头显示 $($row[1])"
+        Assert-Equal $e.Headword $row[1] '物理词头继续用作原查词键'
+    }
+    # 取自三合一 ADB 的两个物理条目，后文的字面标记不得当成条目序号。
+    $serial = "<br><font color=black>ADB&+{2}`r`n<br><font color=blue>ADB`r`n<br><font color=red>【African Development Bank】例 A&+{2}"
+    $plain = $detail.Invoke($null,@($serial,$null,'sango')).Text
+    Assert-Equal (($plain -split '\r?\n')[0]) 'ADB〔2〕' '同形词编号可阅读'
+    Assert-Equal ($plain.Contains('例 A&+{2}')) $true '正文内普通符号保留'
+    Assert-Equal ($detail.Invoke($null,@($serial,$null,'other')).Text.Contains('ADB&+{2}')) $true '别书不套用三合一格式'
+    # 现代汉英“安全”的词头、义项和双语例句分别由不同的 span 标注。
+    $body='<span class="CK"><span class="DC">安全</span><span class="JS"><span class="YX">安全</span><span class="JX">safe</span><span class="LJ"><span class="LY">安全转移</span><span class="LS">move to places of safety;</span></span></span></span>'
+    $plain = $detail.Invoke($null,@($body,$null,'hanying')).Text
+    Assert-Equal (($plain -split '\r?\n') -join '|') '安全|安全|safe|安全转移|move to places of safety;' '缺少原样式表时还原双语例句的边界'
+    Assert-Equal ($detail.Invoke($null,@($body,$null,'other')).Text.Contains('安全转移move')) $true '普通自定义词书沿用自己的格式'
+    $section = '<div class="es-source es-sango"><a name="es-sango-242"></a><div class="es-label"><b>三合一日语辞典 #242</b></div>'
+    $render = $window.GetMethod('EncodeMergedDocument',$static)
+    $rendered = [Text.Encoding]::UTF8.GetString($render.Invoke($null,@(($section+$serial+'</div>'),'/v/test')))
+    Assert-Equal ($rendered.Contains($section+'<br><font color=black>ADB〔2〕')) $true '旧合并页面的来源锚点和编号'
+    Assert-Equal ($rendered.Contains('例 A&+{2}')) $true '旧合并页面的正文符号'
+    # 新世纪 #24331 用图片隔开日中释义，用 example-source 标出日文例句。
+    $shin = '<span>すき間ができる。</span><span class="divide-imgs"><img alt="" src="sep.png"/></span><span>开，漏。</span><div class="unit-example"><strong class="dot">⇒</strong><p><span class="example-source">穴が—·く</span><span>漏了个洞。</span></p></div>'
+    $jaLines = $detail.Invoke($null,@($shin,$null,'shinseiki')).Text -split '\r?\n'
+    Assert-Equal ($jaLines -join '|') 'すき間ができる。|开，漏。|⇒穴が—·く|漏了个洞。' '日中释义和例句逐行可读'
+    Assert-Equal ($detail.Invoke($null,@($shin,$null,'other')).Text.Contains('穴が—·く漏了个洞。')) $true '别书相同标记保留其格式'
+    $ox = '<font color=blue size=+2><b><font color=red size=5>♠ </font>credit</b></font><hr color=blue noshade><font color=blue size=+1><b>credit </b></font> /'
+    Assert-Equal (($detail.Invoke($null,@($ox,$null,'oxford')).Text -split '\r?\n') -join '|') '♠ credit|credit  /' '牛津词头与下方读音栏之间的水平线'
+    $note = '<p>」が異体字になっていたので修正した。">'
+    Assert-Equal ($detail.Invoke($null,@($note,$null,'shogakukan')).Text) '」が異体字になっていたので修正した。' '鉄格子保留编辑原注并去除末尾引号尖括号残片'
+    Assert-Equal ($detail.Invoke($null,@($note,$null,'other')).Text) $note.Substring(3) '别书的字面引号和尖括号'
+}
+
+function Test-ShogakukanJoinedDetail([Reflection.Assembly]$Assembly) {
+    $window = $Assembly.GetType('ESearch.SearchWindow')
+    $flags = [Reflection.BindingFlags]'Static,NonPublic'
+    $detail = $window.GetMethod('FormatDetail',$flags)
+    $encode = $window.GetMethod('EncodeMergedDocument',$flags)
+    # 原书把“噪音”整篇接在“噪声污染”后面，两篇只有一个物理序号；第二篇里的真正例句须保留。
+    $body = "<br>zàoshēng wūrǎn<font color=red>【噪声污染】</font>`r`n<br>騒音公害．`r`n<p><font color=green>例：</font></>`r`n噪音  `r`n<br>zàoyīn<font color=red>【噪音】</font>`r`n<br>雑音．`r`n<p><font color=green>例：</font><br>白～"
+    $clean = $body.Replace('<p><font color=green>例：</font></>','<p>')
+    Assert-Equal ($detail.Invoke($null,@($body,$null,'shogakukan-zhja')).Text) ($detail.Invoke($null,@($clean,$null,'shogakukan-zhja')).Text) '两篇正文及真正的例句完整显示'
+    foreach ($different in '【其它】','zàoyǐn','【别字】') {
+        $old = switch ($different) {'【其它】' {'【噪声污染】'} 'zàoyǐn' {'zàoyīn'} '【别字】' {'【噪音】'}}
+        $other = $body.Replace($old,$different)
+        Assert-Equal ($detail.Invoke($null,@($other,$null,'shogakukan-zhja')).Text.Contains('例：</>')) $true '父词头、拼音和第二标题须相符'
+    }
+    $section = '<div class="es-source es-shogakukan-zhja"><a name="es-shogakukan-zhja-17139"></a>'
+    $foreign = '<div class="es-source es-sango">' + $body + '</div>'
+    $page = [Text.Encoding]::UTF8.GetString($encode.Invoke($null,@(($section + $body + '</div>' + $foreign),'/local/1')))
+    Assert-Equal ($page.Contains($section + $clean + '</div>' + $foreign)) $true '已保存合并页只改该书分区的分隔'
+}
+
+function Test-ShinseikiTruncatedDetail([Reflection.Assembly]$Assembly) {
+    $detail = $Assembly.GetType('ESearch.SearchWindow').GetMethod('FormatDetail',[Reflection.BindingFlags]'Static,NonPublic')
+    # “口”和“迦葉”的原书在标签中间截断，后面仍可能另起义项。保留前后正文及转义后的字面示例。
+    foreach ($row in @(
+        @('<p>へらず口をきく。</span><span class="divide-imgs</p></div></div>', 'へらず口をきく。'),
+        @('<span>拈華微笑</span><!--</li></ul></div><h1>次義</h1>', "拈華微笑`r`n次義"),
+        @('<p>対義は&lt;--&gt;。字面：&lt;span class="divide-imgs&lt;/p&gt;</p>', '対義は<-->。字面：<span class="divide-imgs</p>'),
+        @('<span>前文。</span><img alt="" src="data:image/png;base64,iVBORw0KGg</span><span>后文。</span>', '前文。[原书图片标签截断]后文。')
+    )) {
+        Assert-Equal ($detail.Invoke($null,@($row[0],$null,'shinseiki')).Text) $row[1] '新世纪原书截断点保持正文边界'
+    }
+    Assert-Equal ($detail.Invoke($null,@('释义<span class="divide-imgs</p>',$null,'other')).Text) '释义<span class="divide-imgs' '其它来源沿用原格式'
+    $shown = [LookupEntry].GetProperty('DisplayGloss',[Reflection.BindingFlags]'NonPublic,Instance')
+    $header = '<h1><span class="word">ヘキサン</span></h1>'
+    $formula = 'C<sub><</sub>sup>6H<sub><</sub>sup>14'
+    $body = $header + '<span>分子式' + $formula + '5種の异性体</span>'
+    $before = $detail.Invoke($null,@($body,$null,'shinseiki')).Text
+    Assert-Equal ($before.Contains('C₆H₁₄5種の异性体')) $true '紧邻分子式的异构体个数 5 仍是正文'
+    $stored = [LookupEntry]::new('shinseiki',1,'ja',1,'ヘキサン',$null,'分子式Csup>6Hsup>14。有5种异构体')
+    Assert-Equal ($shown.GetValue($stored)) '分子式C₆H₁₄。有5种异构体' '旧库存摘要的公式与物理原文一致'
+    $powerTitle = '<h1><span class="word">べきしすう</span><span>【<span>幂指数</span>】</span></h1>'
+    $power = $powerTitle + '<span>对于a<sup><sub><</sub>/sup>n而言的n。</sup></span>'
+    $section = '<div class="es-source es-shinseiki"><a name="es-shinseiki-195342"></a>'
+    $foreign = '<div class="es-source es-sango">' + $power + '</div>'
+    $encoder = $Assembly.GetType('ESearch.SearchWindow').GetMethod('EncodeMergedDocument',[Reflection.BindingFlags]'Static,NonPublic')
+    $page = [Text.Encoding]::UTF8.GetString($encoder.Invoke($null,@(($section + $power + '</div>' + $foreign),'/local/1')))
+    Assert-Equal ($page.Contains($section + $powerTitle + '<span>对于aⁿ而言的n。</span></div>' + $foreign)) $true '复原幂指数后普通句子脱离上标'
+    # 反查时标题不在选中的正文片段内。使用生产反查返回的原始物理坐标，再核对最终高亮范围。
+    $reverseBody = '<div class="wrap-switch"><h1><span class="word">べきしすう</span><span>【<span>幂指数</span>】</span></h1><ul class="ncdata-sense-wrap"><li><span>次数。</span><span class="divide-imgs"></span><span>对于a<sup><sub><</sub>/sup>n而言的n。</sup></span></li></ul></div>'
+    $reverse = $Assembly.GetType('EntryParser').GetMethod('ShinseikiReverseSenses',[Reflection.BindingFlags]'NonPublic,Static')
+    $sense = @($reverse.Invoke($null,@($reverseBody,'幂指数')))[0].Item2
+    $anchor = [Activator]::CreateInstance($Assembly.GetType('EntryAnchor'),@([Range]::new($sense.Start,$sense.Start),$sense))
+    $highlight = $detail.Invoke($null,@($reverseBody,$anchor,'shinseiki'))
+    $range = $highlight.Anchor.Sense
+    Assert-Equal ($highlight.Text.Substring($range.Start.Value,$range.End.Value-$range.Start.Value)) '对于aⁿ而言的n。' '中文义项的公式复原后仍高亮同一原文'
+    Assert-Equal ($detail.Invoke($null,@($body.Replace('ヘキサン','例文'),$null,'shinseiki')).Text.Contains('C₆H₁₄')) $false '缺少对应词头时不把正文示例改为公式'
+    Assert-Equal ($detail.Invoke($null,@($body.Replace($header,'<h1><span class="word">例文</span></h1><span>ヘキサン</span>'),$null,'shinseiki')).Text.Contains('C₆H₁₄')) $false '只在正文提到书内词头不构成公式校勘依据'
+    foreach ($row in @(
+        @('shinseiki','後唐','后唐。中国五代之一，沙陀部人李存推翻后梁后建立的王朝(923—936)。定都洛阳。后被其重臣石敬塘所灭。<!--', $true),
+        @('shinseiki','新興','新しく勢いが盛んになること。新たに興ること。<!--', $true),
+        @('shinseiki','新興','字面例：<!--', $false), @('other','新興','新しく勢いが盛んになること。新たに興ること。<!--', $false)
+    )) {
+        $entry = [LookupEntry]::new($row[0],1,'ja',1,$row[1],$null,$row[2])
+        $expected = if ($row[3]) { $row[2].Substring(0,$row[2].Length-4) } else { $row[2] }
+        Assert-Equal ($shown.GetValue($entry)) $expected '仅修复两处在旧摘要结尾的截断注释'
+    }
+}
+
 function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
     $flags = [Reflection.BindingFlags]'Static,NonPublic'
     $format = [Lookup].GetMethod('Format',$flags)
@@ -3711,11 +3897,23 @@ function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
         @('shinseiki',"Ju`u{E7AF}rez・Sudhan`u{E7AF}","Juárez・Sudhan`u{E7AF}"),
         @('shinseiki',"未知語`u{E567}・未確認`u{E564}・未確認`u{E7AF}","未知語`u{E567}・未確認`u{E564}・未確認`u{E7AF}"),
         @('shinseiki','市 ? 郡 ? 町 ? 村名','市 ∙ 郡 ∙ 町 ∙ 村名'),
+        @('shinseiki',"アンドラ。ISOの国·地域コードの一。`u{E5E7}・フ`u{E5E7}Société","アンドラ。ISOの国·地域コードの一。・フ`u{E5E7}Société"),
+        @('shinseiki',"`u{E526}院`u{E527}・J/`u{E788}・`u{E788}", "「院」・J/ψ・`u{E788}"),
+        @('shinseiki',"`u{E02F}(全称)、`u{E055}(存在)、`u{E59E}",'∀(全称)、∃(存在)、©'),
+        @('shinseiki',"Queir`u{E7B2}s・sch`u{E7B2}lia","Queirós・sch`u{E7B2}lia"),
+        @('shinseiki','「炉」「煽」などの「??」の部分。','「炉」「煽」などの「火」の部分。'),
+        @('shinseiki','「明」「昨」などの「鲉」の部分。鲉鱼・⇒?。??目??科','「明」「昨」などの「日」の部分。鲉鱼・⇒?。??目??科'),
         @('shogakukan-zhja',"C`u{E117}I系统",'C³I系统'),
         @('shogakukan-zhja',"`u{E11F}本,册",'『量』本,册'),
         @('shogakukan-zhja',"欠qia`u{E7C8}合理",'欠qiàn合理'),
         @('shogakukan-zhja',"碰壁pe`u{E7C8}gbì",'碰壁pèngbì'),
         @('shogakukan-zhja',"嗯 `u{E7C8}gに同じ",'嗯 ǹgに同じ'),
+        @('shogakukan-zhja',"陰爻「`u{E11E}」；竹かんむり`u{E123}",'陰爻「⚋」；竹かんむり⺮'),
+        @('shogakukan',"`u{E184}鱼；眍`u{E18C}；维生素B`u{E119}",'𫚕鱼；眍䁖；维生素B₂'),
+        @('shogakukan',"鼓、`u{E1A7}bó、手鼓","鼓、`u{E1A7}bó、手鼓"),
+        @('sango',"请回到`u{E0C8}记号处；D?bel；Independ?ncia?",'请回到𝄋记号处；Dübel；Independência?'),
+        @('sango','l?art pour l?art；ballon d?essai；trompe－l?oeil',"l'art pour l'art；ballon d'essai；trompe－l'oeil"),
+        @('shogakukan','D?bel','D?bel'),
         @('sango','【瑞典 ?ngstr?m】','【瑞典 ångström】'),
         @('oxford',"具有防`u{E40C}性质",'具有防卫性质'),
         @('hanying',"1达因/厘米`u{2072}",'1达因/厘米²'),
@@ -3738,6 +3936,8 @@ function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
     Assert-Equal ($detail.Invoke($null,@("5Apl / $ipa /",$null,'oxford'))).Text '5Apl / ˈæpl /' '仅在牛津音标标签内转写'
     Assert-Equal ($detail.Invoke($null,@($ipa,$null,'other'))).Text '5Apl' '其它来源保留同一拼写'
     Assert-Equal ($detail.Invoke($null,@($ipa.Replace('5Apl','C++'),$null,'oxford'))).Text 'C++' '未识别的字体片段整体保留'
+    $entities = 'BUY NOW&amp;NDASH;PAY LATER；56&amp;half; inches in Britain；&amp;half;'
+    Assert-Equal ($detail.Invoke($null,@($entities,$null,'oxford'))).Text 'BUY NOW–PAY LATER；56½ inches in Britain；&half;' '牛津两处双重转义只在已核实的原句内恢复'
     $label = 'Adam<FONT style="font-weight:normal">''</FONT>s apple'
     $rawLink = '<a href="entry://' + $label + '">' + $label + '</a>'
     Assert-Equal ($detail.Invoke($null,@($rawLink,$null,'oxford'))).Text "Adam's apple" '牛津误嵌进原 href 的撇号标记只显示一次'
@@ -3746,9 +3946,35 @@ function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
     $section = '<div class="es-source es-oxford">'
     $rewrite = $Assembly.GetType('ESearch.SearchWindow').GetMethod('RewriteMergedLinks',$flags)
     $path = '/page-1'
+    # 六条牛津例句都在译文闭标签后留下同一属性尾。COLLOC 与普通词条中举例的尖括号仍属可见正文。
+    $colloc = '<font>皮革护理油 </font>(</SPAN>COLLOC)"&gt;</SPAN eid="21" n-g n="3"></SPAN>'
+    Assert-Equal ($detail.Invoke($null,@($colloc,$null,'oxford'))).Text '皮革护理油 (COLLOC)' '牛津搭配注保留文字并清除误印的属性尾'
+    $bigColloc = $colloc.Replace('</font>(', '</font></SPAN>(')
+    $literal = ' marks, &lt; &gt;, (COLLOC)"&gt;'
+    Assert-Equal ($detail.Invoke($null,@(($bigColloc + $literal),$null,'oxford'))).Text '皮革护理油 (COLLOC) marks, < >, (COLLOC)">' '牛津双闭标签的例句可修，正文举例原样显示'
+    $otherSection = '<div class="es-source es-other">' + $colloc + '</div>'
+    $sections = $section + $colloc + '</div>' + $otherSection
+    Assert-Equal ($rewrite.Invoke($null,@($sections,$path))) ($section + $colloc.Replace('COLLOC)"&gt;', 'COLLOC)') + '</div>' + $otherSection) '旧合并页只清理牛津来源区的同一属性尾'
     Assert-Equal ($rewrite.Invoke($null,@(($section + $brokenLink + '</div>'),$path))) ($section + '<a href="/page-1/lookup/' + $hashed + '">' + $label + '</a></div>') '旧合并页保留原跳转目标和可见撇号格式'
     $mismatched = $section + $brokenLink.Replace('>Adam','>Eve') + '</div>'
     Assert-Equal ($rewrite.Invoke($null,@($mismatched,$path))) ($mismatched.Replace('entry://','/page-1/lookup/')) '标签与原卷内目标哈希不符时不猜原链接'
+    # 牛津把字体名的四个引号各包进 FONT 标签；有些中文释义还把两个闭标签颠倒。
+    $quote = '<FONT style="font-weight:normal">''</FONT>'
+    $sub = '<SPAN style="FONT-WEIGHT: normal; FONT-SIZE: 7pt; VERTICAL-ALIGN: sub; FONT-STYLE: normal; FONT-FAMILY: ' + $quote + 'Arial' + $quote + ', ' + $quote + '细明体' + $quote + '">'
+    $super = $sub.Replace('ALIGN: sub','ALIGN: super')
+    $formula = 'C' + $sub + '2</SPAN>H' + $sub + '2</SPAN>'
+    Assert-Equal ($detail.Invoke($null,@($formula,$null,'oxford'))).Text 'C₂H₂' '牛津乙炔原文保留化学下标'
+    $source = '<font color=#FF5000>• 埃(等于 10' + $super + '-10</font> 米)</SPAN>'
+    $senses = $Assembly.GetType('EntryParser').GetMethod('OxfordSenses',$flags).Invoke($null,@($source))
+    $sense = @($senses)[0]
+    Assert-Equal $sense.Item2 '埃(等于 10⁻¹⁰ 米)' '牛津摘要保留负指数及旧模板中错位闭标签后的单位'
+    $range = $sense.Item3.GetOffsetAndLength($source.Length)
+    Assert-Equal $source.Substring($range.Item1,$range.Item2) ($source.Substring($source.IndexOf('•')) -creplace '</SPAN>$','') '牛津义项范围仍是原书中的完整译义'
+    $foreignSection = '<div class="es-source es-hanying">' + $formula + '</div>'
+    $oxfordSection = $section + '<a name="es-oxford-261"></a>' + $formula + '</div>'
+    $merged = $rewrite.Invoke($null,@(($foreignSection + $oxfordSection),$path))
+    Assert-Equal $merged.StartsWith($foreignSection + $section + '<a name="es-oxford-261"></a>') $true '仅修改牛津小节，原卷锚点仍在原位置'
+    Assert-Equal ($merged.Substring($foreignSection.Length) -match '细明体') $false '旧牛津合并页不再含损坏的 CSS 属性'
 }
 
 function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly) {
@@ -6507,6 +6733,9 @@ if ($BackendTestDirectory -or $IndexedMdxTestDirectory) {
     Test-EnglishReferencePreview $BackendTestDirectory $assembly
     Test-SentencePhrases $BackendTestDirectory
     Test-DictionaryDisplayText $assembly
+    Test-ShogakukanJoinedDetail $assembly
+    Test-ShinseikiTruncatedDetail $assembly
+    Test-SecondPassDisplay $assembly
     Test-PhraseDetailAnchor $BackendTestDirectory $assembly
     Test-HanyingReferences $BackendTestDirectory $assembly
     Test-LatinPunctuation $BackendTestDirectory

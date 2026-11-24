@@ -12,6 +12,10 @@ internal sealed record MergedArticle(string Group, string Key, string Html, stri
 {
     public string Revision { get; init; } = "";
 }
+internal sealed record PrefixChoice(string Key, string Display)
+{
+    public override string ToString() => Display;
+}
 internal sealed record TableMapping(int Headword, int Gloss, int? Reading, bool HasHeader)
 {
     public IReadOnlyList<string[]>? PreviewRows { get; init; }
@@ -37,9 +41,10 @@ internal sealed class DictionaryStore : IDisposable
     private readonly bool writable;
     private readonly MetadataSchema openedSchema;
     // 摘要标记同时绑定提取格式和导入批次。
-    private const string OxfordSummaryFormat = "oxford/1:";
+    private const string OxfordSummaryFormat = "oxford/2:";
     private const string JapaneseSummaryFormat = "ja-preview/1:";
-    private const string SanseidoSummaryFormat = "sanseido/2:";
+    private const string SanseidoSummaryFormat = "sanseido/3:";
+    private const string ShinseikiSummaryFormat = "shinseiki/1:";
 
     public DictionaryStore(string path, bool readOnly = false) : this(path, readOnly, pooling: true) { }
 
@@ -54,6 +59,12 @@ internal sealed class DictionaryStore : IDisposable
         db.CreateFunction("latin_bound", (string? key, int variant, bool upper) => Lookup.LegacyLatinBound(key, variant, upper), isDeterministic: true);
         db.CreateFunction("term_key", (string key) => Lookup.Normalize(key), isDeterministic: true);
         db.CreateFunction("is_lookup_kana", (string key) => Lookup.IsKana(key), isDeterministic: true);
+        db.CreateFunction("prefix_label", (string key, string head, string id, string filename, string? parser) =>
+        {
+            // 读音和另建的别名不代表原书拼写。只有确为当前物理词头才套用该来源的显示规则。
+            string display = EntryParser.DisplayHeadword(parser ?? SourceForFilename(filename)?.Id ?? id, head);
+            return display != head && Lookup.Normalize(head) == Lookup.Normalize(key) ? display : "";
+        }, isDeterministic: true);
         if (readOnly)
         {
             // 只读查词不修改旧库；用实际列信息选择该版本能执行的查询。
@@ -330,6 +341,7 @@ internal sealed class DictionaryStore : IDisposable
         {
             "oxford" => OxfordSummaryFormat + revision,
             "sanseido" when indexed => SanseidoSummaryFormat + revision,
+            "shinseiki" => ShinseikiSummaryFormat + revision,
             "shogakukan" when indexed => JapaneseSummaryFormat + revision,
             _ => (object)DBNull.Value
         });
@@ -748,6 +760,7 @@ internal sealed class DictionaryStore : IDisposable
         {
             "oxford" => OxfordSummaryFormat + revision,
             "sanseido" => SanseidoSummaryFormat + revision,
+            "shinseiki" => ShinseikiSummaryFormat + revision,
             "shogakukan" => JapaneseSummaryFormat + revision,
             _ => (object)DBNull.Value
         });
@@ -1239,7 +1252,13 @@ internal sealed class DictionaryStore : IDisposable
                     {JapanesePrefix(SanseidoSummaryFormat)} THEN substr(e.raw,1,2048) END
                 ,CASE WHEN {hanyingParser} AND (instr(e.head,' ')>0 OR instr(e.head,'　')>0 OR instr(e.head,char(123))>0)
                     THEN e.raw END, f.legacyChinese, {currentSummary}, d.sha256, {schema.RecordRange},
-                CASE WHEN d.filename LIKE '%.mdx' THEN {(schema.HasRevision ? "m.parser_id" : "NULL")} ELSE '' END
+                CASE WHEN d.filename LIKE '%.mdx' THEN {(schema.HasRevision ? "m.parser_id" : "NULL")} ELSE '' END,
+                CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasRevision ? "m.parser_id" : "NULL")},
+                    CASE WHEN d.id='shinseiki' OR d.filename=$shinseikiName THEN 'shinseiki' END)='shinseiki'
+                    AND {(schema.IsCurrent ? $"NOT COALESCE(m.summary_stamp=('{ShinseikiSummaryFormat}' || m.revision),0)" : "1")}
+                    AND e.gloss GLOB '*[A-Za-z0-9０-９]*'
+                    AND ({schema.RangeColumn("record_start")} IS NOT NULL OR instr(e.raw,'<su')>0)
+                    THEN e.raw END
             FROM (SELECT dict,ordinal,aliasReading,0 AS legacyChinese FROM found
                 {(legacyChinese ? legacyCandidates : "")}) f
             -- 先取得少量命中，再按词典和序号读取正文，避免优化器反过来扫描全部 entries。
@@ -1260,6 +1279,7 @@ internal sealed class DictionaryStore : IDisposable
         if (schema.IsCurrent) cmd.Parameters.AddWithValue("$summaryFormat", OxfordSummaryFormat);
         cmd.Parameters.AddWithValue("$oxfordName", Path.GetFileName(Source.All.First(s => s.Id == "oxford").RelativePath));
         cmd.Parameters.AddWithValue("$sanseidoName", Path.GetFileName(Source.All.First(s => s.Id == "sanseido").RelativePath));
+        cmd.Parameters.AddWithValue("$shinseikiName", Path.GetFileName(Source.All.First(s => s.Id == "shinseiki").RelativePath));
         cmd.Parameters.AddWithValue("$kind",reading ? 1 : 0);
         cmd.Parameters.AddWithValue("$only",(object?)only ?? DBNull.Value);
         if (reading && kana) cmd.Parameters.AddWithValue("$katakana", Lookup.ToKatakana(key));
@@ -1316,6 +1336,8 @@ internal sealed class DictionaryStore : IDisposable
             }
             if (MatchedBody(9, 4096) is { } japanesePrefix) gloss = EntryParser.RefreshShogakukanGloss(gloss, japanesePrefix);
             if (MatchedBody(11, 2048) is { } sanseidoPrefix) gloss = EntryParser.RefreshSanseidoGloss(gloss, sanseidoPrefix);
+            // 旧新世纪索引只为本次命中的可疑摘要取正文。原模板和原摘要同时验证成功才恢复上下标。
+            if (MatchedBody(20) is { } shinBody) gloss = EntryParser.RefreshShinseikiScriptGloss(entry.Headword, gloss, shinBody);
             // 无版本或旧格式索引需要重算。新索引的普通释义直接来自 gloss 列。
             (string Headword, string? Form)? reference = null;
             if (MatchedBody(10) is { } body)
@@ -1382,7 +1404,10 @@ internal sealed class DictionaryStore : IDisposable
         }
     }
 
-    public IReadOnlyList<string> PrefixSuggestions(string input, string? only = null, CancellationToken token = default)
+    public IReadOnlyList<string> PrefixSuggestions(string input, string? only = null, CancellationToken token = default) =>
+        PrefixChoices(input, only, token, false).Select(choice => choice.Key).ToArray();
+
+    public IReadOnlyList<PrefixChoice> PrefixChoices(string input, string? only = null, CancellationToken token = default, bool display = true)
     {
         token.ThrowIfCancellationRequested();
         string prefix = Lookup.Normalize(input);
@@ -1394,7 +1419,7 @@ internal sealed class DictionaryStore : IDisposable
         {
             using var snapshot = db.BeginTransaction(deferred: true);
             var schema = SchemaIn(snapshot);
-            var found = new Dictionary<string,(int Extra, int Tier, int Priority)>(StringComparer.Ordinal);
+            var found = new Dictionary<string,((int Extra, int Tier, int Priority) Rank, string Label)>(StringComparer.Ordinal);
             using var available = Command($"""
                 SELECT COUNT(*),COALESCE(MAX(d.language='ja'),0) FROM dictionaries d {schema.Join}
                 WHERE {ScopeSql(only,"d.id")} {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
@@ -1428,7 +1453,8 @@ internal sealed class DictionaryStore : IDisposable
             }
             token.ThrowIfCancellationRequested();
             snapshot.Commit();
-            return found.OrderBy(p => p.Value).ThenBy(p => p.Key, StringComparer.Ordinal).Take(8).Select(p => p.Key).ToArray();
+            return found.OrderBy(p => p.Value.Rank).ThenBy(p => p.Key, StringComparer.Ordinal).Take(8)
+                .Select(p => new PrefixChoice(p.Key, p.Value.Label)).ToArray();
 
             void ReadKana(string kana, int tier)
             {
@@ -1452,9 +1478,12 @@ internal sealed class DictionaryStore : IDisposable
                 string predicate = shortEnglish ? shortKeys : "t.term >= $lower" + (upper == null ? "" : " AND t.term < $upper");
                 int typed = wanted.EnumerateRunes().Count();
                 int limit = typed == 1 ? 8 : 32;
+                // GROUP BY 已经按原键去重。不同来源给出不同显示文字时，使用共同的检索键。
+                string label = $"prefix_label(t.term,e.head,d.id,d.filename,{(schema.HasRevision ? "m.parser_id" : "NULL")})";
+                string columns = display && !reading ? $", MIN({label}), MAX({label})" : "";
                 using var cmd = Command($"""
                     {(shortEnglish ? letters : "")}
-                    SELECT t.term, MIN(d.priority)
+                    SELECT t.term, MIN(d.priority){columns}
                     FROM terms t INDEXED BY terms_lookup
                     CROSS JOIN dictionaries d ON d.id=t.dict {schema.Join}
                     CROSS JOIN entries e ON e.dict=t.dict AND e.ordinal=t.ordinal
@@ -1483,7 +1512,12 @@ internal sealed class DictionaryStore : IDisposable
                     string raw = rows.GetString(0);
                     string term = reading ? Lookup.NormalizeReading(raw) : Lookup.Normalize(raw);
                     var score = (term.EnumerateRunes().Count() - typed, tier, rows.GetInt32(1));
-                    if (!found.TryGetValue(term, out var old) || score.CompareTo(old) < 0) found[term] = score;
+                    string shown = term;
+                    if (columns.Length != 0 && rows.GetString(2) is { Length: > 0 } first && first == rows.GetString(3))
+                        shown = first;
+                    if (!found.TryGetValue(term, out var old) || score.CompareTo(old.Rank) < 0)
+                        found[term] = (score, shown);
+                    else if (score == old.Rank && old.Label != shown) found[term] = (score, term);
                 }
                 // 不足上限表示字面区间已读尽。不同旧键可能归一为同一显示项，不能用 found.Count 判断是否补查。
                 return rawKeys == limit;
@@ -1934,7 +1968,7 @@ internal sealed class DictionaryStore : IDisposable
     private static string VectorPath(string directory, ReverseBook book, ReverseEncoder? encoder = null)
     {
         // 格式版本还标识词义抽取、编码输入和量化语义。来源换版或模型替换产生独立的缓存文件。
-        string format = book.Language == "ja" ? "shinseiki-chinese-sense/int8/v1" : "oxford-main-gloss/int8/v1";
+        string format = book.Language == "ja" ? "shinseiki-chinese-sense/int8/v2" : "oxford-main-gloss/int8/v2";
         var identity = JsonSerializer.SerializeToUtf8Bytes(new[] { format,book.Id,book.Revision,book.Hash,encoder?.Fingerprint ?? ReverseEncoder.ModelFingerprint });
         return Path.Combine(Path.GetFullPath(directory),"reverse-v1-"+Convert.ToHexString(SHA256.HashData(identity))+".vec");
     }
