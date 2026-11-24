@@ -170,6 +170,85 @@ _VOID = frozenset('area base br col embed hr img input link meta param source tr
 _INVISIBLE = frozenset('script style template noscript title iframe textarea xmp'.split())
 
 
+_HOMOPHONE_HEADING = re.compile(r'\A(<br><font color=black>[^<>\r\n]+?)&\+\{([1-9][0-9]?)\}(?=\r?\n<br><font color=)')
+_HIDDEN_MARKUP = re.compile(r'<(?:script|template|textarea|noscript|iframe)\b|<[^<>]+\shidden\b|'
+                            r'\b(?:display\s*:\s*none|visibility\s*:\s*hidden)\b', re.I)
+_PRESERVE_BLOCK = re.compile(r'<!--.*?-->|<style\b[^>]*>.*?</style>', re.I | re.S)
+_PRINTED_BLUE = '<font color=“#0000FF”>'
+_TRAILING_BREAKS = re.compile(r'(?:<br>){4,}(?=</font>\s*\Z)')
+
+
+def _sanseido_typography(fragment):
+    # 印刷引号会成为颜色属性值本身；原书在这里确切写出了六位 RGB 色值。
+    edits = [(m.start(), m.end(), '<font color="#0000FF">')
+             for m in re.finditer(re.escape(_PRINTED_BLUE), fragment)]
+    if '<br><br><br><br>' in fragment:
+        tail = _TRAILING_BREAKS.search(fragment)
+        if tail:
+            # 仅收起本词条末尾的空白。词义之间的换行及最后一个换行都保留。
+            edits.append((tail.start(), tail.end(), '<br>'))
+    if edits:
+        allowed = _VisibleLocations(fragment, {a: "tag" for a, _, _ in edits}).allowed
+        for a, b, replacement in reversed(sorted(edits)):
+            if a in allowed:
+                fragment = fragment[:a] + replacement + fragment[b:]
+    return fragment
+
+
+def repair_merged_layout(payload):
+    """只在本合并器生成的单一来源分区内修复已核对的排版。隐藏原文直接按字节复制。"""
+    if not payload.startswith((b"<!--ESMERGE1:", b"<!--ESHELP1-->")):
+        return payload
+    boundary = payload.find(b"-->")
+    if boundary < 0:
+        return payload
+    start = boundary + 3
+    hints = (b"&+{", _PRINTED_BLUE.encode(), b"<br><br><br><br>") + ENGLISH_LAYOUT_HINTS + JAPANESE_LAYOUT_HINTS
+    if not any(payload.find(hint, start) >= 0 for hint in hints):
+        return payload
+    page = payload[start:].decode("utf-8")
+    sections = list(_SECTION.finditer(page))
+    if not sections or page.count('<div class="es-source ') != len(sections):
+        return payload
+    if not re.fullmatch(r'(?:<style>.*?</style>)*', page[:sections[0].start()], re.S):
+        return payload
+    edits = []
+    for i, section in enumerate(sections):
+        source = section[1]
+        anchors = re.fullmatch(r'<a name="es-([a-z-]+)-([0-9]+)"></a>', section[2])
+        if not anchors or anchors[1] != source or source not in NAMES:
+            continue
+        if not section[0].endswith(f'<div class="es-label"><b>{NAMES[source]} #{anchors[2]}</b></div>'):
+            continue
+        end = sections[i + 1].start() if i + 1 < len(sections) else len(page)
+        if not page.endswith("</div>", section.end(), end):
+            return payload
+        end -= len("</div>")
+        fragment = page[section.end():end]
+        if _HIDDEN_MARKUP.search(fragment):
+            continue
+        if source == "sango":
+            fixed = _HOMOPHONE_HEADING.sub(r'\1〔\2〕', fragment)
+        elif source in ("hanying", "oxford"):
+            fixed = repair_english_display(fragment, source)
+        else:
+            fixed = repair_japanese_display(source, fragment)
+            if source == "sanseido" and (_PRINTED_BLUE in fixed or '<br><br><br><br>' in fixed):
+                fixed = _sanseido_typography(fixed)
+        if fixed == fragment:
+            continue
+        # 原注释和原样式可能举例写出标签。已有的块须逐字保留，避免将示例误当成排版。
+        old = Counter(_PRESERVE_BLOCK.findall(fragment))
+        if old and not old <= Counter(_PRESERVE_BLOCK.findall(fixed)):
+            continue
+        edits.append((section.end(), end, fixed))
+    if not edits:
+        return payload
+    for left, right, replacement in reversed(edits):
+        page = page[:left] + replacement + page[right:]
+    return payload[:start] + page.encode("utf-8")
+
+
 def _visible_entity(match):
     token = match[0]
     if token.startswith("&#"):
@@ -707,3 +786,238 @@ class Renderer:
 
     def report(self):
         return dict(self.stats, helper_entries=len(self.helpers_by_key), missing_resource_paths=sorted(self.missing_resources))
+
+
+# 散列末位必须是十六进制数字，正常的 color="#008000" 不会触发合并页的链接修复。
+_JA_COPIED_LINK = re.compile(
+    r'(?P<link><a href="entry://es(?:missing|ref)-sanseido-(?P<digest>[a-f0-9]{64})")#008000">'
+    r'(?P<tail>[^"<>]*</font>(?:[^"<>]|<font color="#008000">[^"<>]*</font>)*)">'
+    r'(?P<label>(?:[^"<>]|<font color="#008000">[^"<>]*</font>)+)</a>')
+_JA_EMPTY_EXAMPLE = '<p><font color=green>例：</font></>'
+_JA_JOINED = re.compile(re.escape(_JA_EMPTY_EXAMPLE) +
+    r'(?=\r?\n(?P<second>中指|噪音|承印|软脂)  \r?\n<br>(?P<reading>[^<>\s]+)<font color=red>【(?P=second)】</font>)')
+_JA_FIRST_HEADING = {('中指','zhōngzhǐ'):'中止', ('噪音','zàoyīn'):'噪声污染',
+                     ('承印','chéngyìn'):'承修', ('软脂','ruǎnzhī'):'软炸'}
+_JA_ANGSTROM = ('<h1><span class="word">⇒</span><!-- --><!-- --><!-- --></h1></div>'
+                '<div class="ncdata-body">[<span class="unabbrev">angstrom</span>]')
+_JA_GREBE = re.compile(r'(<span>カイツブリの古名。</span>(?:<!-- -->)*<span class="divide-imgs">'
+                       r'<img alt="" src="[^"<>]+"\s*/?></span><span>)⇒\?的古名。(</span>)')
+_JA_TITLE = re.compile(r'<div class="wrap-switch"><div class="ncdata-header"><h1>\s*'
+                       r'<span class="word">([^<>]+)</span>(?:\s*<span>【<span>([^<>]+)</span>】)?')
+_JA_BAD_INDEX = '<sub><</sub>sup>'
+_JA_BAD_POWER = '<sup><sub><</sub>/sup>'
+
+# 十个词的日文说明和中文译文给出同一个公式。标签吃进整句的三项还必须找到 span 末尾的误闭合。
+_JA_FORMULA = {
+    '造血薬': ('B@12','B₁₂'), '単糖类': ('CnH@2nOn','CₙH₂ₙOₙ'),
+    'ソルビット': ('C@6H@14O@6','C₆H₁₄O₆'), 'ソルビン酸': ('C@5H@7COOH','C₅H₇COOH'),
+    'ヘキサデカン': ('C@16H@34','C₁₆H₃₄'), 'ヘキサン': ('C@6H@14','C₆H₁₄'),
+    'ヘキソース': ('C@6H@12O@6','C₆H₁₂O₆'),
+    '幂級数': ('a@0+a@1x+a@2x<sup><sub>2</sub>+</sup>a@3x<sup><sub>3</sub>+</sup>…+a@nx^n+…',
+               'a₀+a₁x+a₂x²+a₃x³+…+aₙxⁿ+…'), '幂指数': ('a^n','aⁿ'), '幂集合': ('2^M','2ᴹ'),
+}
+_JA_SCRIPT_EDGES = {
+    '完全平方': [('x<sup>２+4</sup>x+4(=(x+2)', 'x<sup>２</sup>+4x+4(=(x+2)')],
+    'オイラーの多面体の定理': [('a<sub>１+</sub>a<sub>２</sub>=2','a<sub>１</sub>+a<sub>２</sub>=2')],
+    'フェルマ予想': [('x<sup>n+</sup>y<sup>n</sup>=z<sup>n</sup>', 'x<sup>n</sup>+y<sup>n</sup>=z<sup>n</sup>')],
+    '指标': [('log<sub>1021</sub>＝1.3222','log<sub>10</sub>21＝1.3222'),
+             ('log<sub>1021</sub>＝1 . 3222','log<sub>10</sub>21＝1 . 3222')],
+    '亜硫酸塩': [('SO<sup>2</sup>-<sub>3</sub>','SO<sub>3</sub><sup>2-</sup>')],
+    '複塩': [('CO<sup>2</sup>-<sub>3</sub>','CO<sub>3</sub><sup>2-</sup>'),
+             ('CO<sub>3</sub><sup>2</sup>-','CO<sub>3</sub><sup>2-</sup>'),
+             ('Mg<sup>2</sup>+','Mg<sup>2+</sup>'), ('Ca<sup>2</sup>+','Ca<sup>2+</sup>')],
+}
+JAPANESE_LAYOUT_HINTS = (
+    b'<sub><</sub>', _JA_EMPTY_EXAMPLE.encode(), _JA_ANGSTROM.encode(), '⇒?的古名。'.encode(),
+    *(before.encode() for pairs in _JA_SCRIPT_EDGES.values() for before, _ in pairs),
+    *(f'{digit}"#008000">'.encode() for digit in '0123456789abcdef'),
+)
+
+
+def repair_japanese_display(source, fragment):
+    """只改指定来源段的展示副本；保留 MDX 词头、真实链接目标和所有未举证的占位符。"""
+    edits = []
+    if source == 'sanseido' and '"#008000">' in fragment:
+        for match in _JA_COPIED_LINK.finditer(fragment):
+            label = match['label']
+            suffix = '<font color="#008000">' + match['tail']
+            if label.endswith(suffix):
+                # 旧生成器已经将被截断的 href 变为散列。用可见前缀重算它，同时核对重复的整段尾文。
+                prefix = label[:-len(suffix)] + '<font color='
+                if sha256(prefix.encode()).hexdigest() == match['digest']:
+                    edits.append((match.start(), match.end(), match['link'] + '>' + label + '</a>', 'tag', ()))
+    elif source == 'shogakukan-zhja' and _JA_EMPTY_EXAMPLE in fragment:
+        for match in _JA_JOINED.finditer(fragment):
+            first = _JA_FIRST_HEADING.get((match['second'], match['reading']))
+            if first:
+                boundary = max(0, fragment.rfind('<div class="es-target">', 0, match.start()))
+                heading = fragment.rfind(f'<font color=red>【{first}】</font>', boundary, match.start())
+                if heading >= 0:
+                    edits.append((match.start(), match.end(), '<p>', 'tag', (heading,)))
+    elif source == 'shinseiki':
+        for match in re.finditer(re.escape(_JA_ANGSTROM), fragment):
+            edits.append((match.start(), match.end(), _JA_ANGSTROM.replace('⇒','Å'), 'tag', ()))
+        if '⇒?的古名。' in fragment:
+            for match in _JA_GREBE.finditer(fragment):
+                edits.append((match.start(), match.end(), match.expand(r'\1䴙䴘的古名。\2'), 'tag', ()))
+        if '<su' in fragment:
+            _japanese_formula_edits(fragment, edits)
+    if not edits:
+        return fragment
+
+    # 同时检查被改位置和用作依据的题头。注释、隐藏段、href 或 title 中的同模字串原样保留。
+    positions = {a: kind for a, _, _, kind, _ in edits}
+    positions.update((pos, 'tag') for *_, required in edits for pos in required)
+    allowed = _VisibleLocations(fragment, positions).allowed
+    for a, b, value, _, required in sorted(edits, reverse=True):
+        if a in allowed and all(pos in allowed for pos in required):
+            fragment = fragment[:a] + value + fragment[b:]
+    return fragment
+
+
+def _japanese_formula_edits(fragment, edits):
+    # 同页可有数个同音词或别名落点。公式必须出现在相应题头之后、本篇释义之内。
+    starts = [m.start() for m in re.finditer('<div class="wrap-switch">', fragment)] + [len(fragment)]
+    for start, end in zip(starts, starts[1:]):
+        title = _JA_TITLE.match(fragment, start, end)
+        sense = fragment.find('<div class="ncdata-sense">', start, end)
+        if title is None or sense < title.end():
+            continue
+        head = title[2] if title[2] in _JA_FORMULA or title[2] in _JA_SCRIPT_EDGES else title[1]
+        if head in _JA_FORMULA and fragment.find('<sub><</sub>', sense, end) >= 0:
+            original, corrected = _JA_FORMULA[head]
+            damaged = re.escape(original.replace('@',_JA_BAD_INDEX).replace('^',_JA_BAD_POWER))
+            if '^' in original:
+                pattern = re.compile(damaged + r'([^<>]*)</sup>(?=</span>)')
+                replacement = corrected + r'\1'
+            else:
+                # 己烷的日文把 H14 与“5種の异性体”紧排，不能将后者的 5 算入下标。
+                following = r'(?=5種の异性体|[^0-9０-９]|$)' if head == 'ヘキサン' else r'(?![0-9０-９])'
+                pattern, replacement = re.compile(damaged + following), corrected
+            for match in pattern.finditer(fragment, sense, end):
+                edits.append((match.start(), match.end(), match.expand(replacement), 'text', (start, sense)))
+        for old, new in _JA_SCRIPT_EDGES.get(head, ()):
+            for match in re.compile(re.escape(old)).finditer(fragment, sense, end):
+                edits.append((match.start(), match.end(), new, 'text', (start, sense)))
+
+
+# 大小写取自中英卷已复核的物理排版。完整规则只匹配这些拼写，门槛与匹配器保持一致。
+_CK_LINK = '<link rel="stylesheet" type="text/css" href="es/hanying/sf_cb.css"/>'
+ENGLISH_LAYOUT_HINTS = (b"FONT-FAMILY: <FONT", b"entry://esmissing-oxford-", b'(font size=-2>',
+                        b'<Sup>1</up>/8', b'COLLOC)"&gt;', b'<span class="CK">')
+_CK_TEMPLATE = re.compile(re.escape(_CK_LINK) + r'(?=\r?\n<span class="CK">)')
+_CK_LAYOUT = "<style>" + ",".join(".es-hanying .CK span." + name for name in
+                                  ("JS", "JX", "LY", "LS", "section_title", "DX")) + "{display:block}</style>"
+_OX_QUOTE = """<FONT style="font-weight:normal">'</FONT>"""
+_OX_FAMILY = re.escape(_OX_QUOTE + "Arial" + _OX_QUOTE + ", " + _OX_QUOTE + "细明体" + _OX_QUOTE)
+_OX_OPEN = (r'<SPAN style="FONT-WEIGHT: normal; FONT-SIZE: 7pt; VERTICAL-ALIGN: (sub|super); '
+            r'FONT-STYLE: normal; FONT-FAMILY: ' + _OX_FAMILY + r'">(-?[0-9]+)')
+_OX_NUMBER = re.compile(_OX_OPEN)
+_OX_SWAPPED = re.compile(r'(?P<first>' + _OX_OPEN + r')</font>(?P<tail>[^<>]*(?:' + _OX_OPEN + r'</SPAN>[^<>]*)?)</SPAN>')
+_OX_SINGLE = re.compile(_OX_OPEN + r'(?=</SPAN>)')
+_OX_COLLOC = re.compile(r'(?P<keep></font>(?:</SPAN>)?\(</SPAN>COLLOC\))"&gt;(?=</SPAN(?: |>))')
+_OX_FONT = r"""(?:<FONT style="font-weight:normal">'</FONT>|<font style="font-weight:lighter">∙</font>)"""
+_OX_REST = r'(?:[^"<>\r\n]|' + _OX_FONT + ')*'
+_OX_LINK = re.compile(r'(?P<start><a href="entry://esmissing-oxford-(?P<digest>[a-f0-9]{64})")'
+                      r'''(?P<tail>(?:font-weight:normal">'</FONT>|font-weight:lighter">∙</font>)''' + _OX_REST +
+                      r')">(?P<label>[^"<>\r\n]+' + _OX_FONT + _OX_REST + r')</a>')
+_OX_TM = re.compile(re.escape('(font size=-2><sup>TM</sup></font>'))
+_OX_EIGHTH = re.compile(re.escape('<Sup>1</up>/8加仑'))
+
+
+class _VisibleLocations(HTMLParser):
+    """仅允许在可见文本或实际标签起点修正，字面示例、属性和隐藏片段保持原样。"""
+
+    def __init__(self, page, candidates):
+        super().__init__(convert_charrefs=False)
+        self.lines = [0] + [m.end() for m in re.finditer("\n", page)]
+        self.candidates = candidates
+        self.allowed = set()
+        self.stack = []
+        self.feed(page)
+        self.close()
+
+    def position(self):
+        line, col = self.getpos()
+        return self.lines[line - 1] + col
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        protected = (bool(self.stack and self.stack[-1][1]) or tag in _INVISIBLE or "hidden" in attributes
+                     or "es-label" in (attributes.get("class") or "").split())
+        pos = self.position()
+        if not protected and self.candidates.get(pos) == "tag":
+            self.allowed.add(pos)
+        if tag not in _VOID:
+            self.stack.append((tag, protected))
+
+    def handle_endtag(self, tag):
+        pos = self.position()
+        if self.candidates.get(pos) == "end" and not (self.stack and self.stack[-1][1]):
+            self.allowed.add(pos)
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i][0] == tag:
+                del self.stack[i:]
+                break
+
+    def handle_data(self, data):
+        if self.stack and self.stack[-1][1]:
+            return
+        start = self.position()
+        for pos, kind in self.candidates.items():
+            if kind == "text" and start <= pos < start + len(data):
+                self.allowed.add(pos)
+
+
+def _oxford_number(match):
+    digits = "₀₁₂₃₄₅₆₇₈₉₋" if match[1] == "sub" else "⁰¹²³⁴⁵⁶⁷⁸⁹⁻"
+    return "<SPAN>" + match[2].translate(str.maketrans("0123456789-", digits))
+
+
+def repair_english_display(page: str, source: str = "oxford") -> str:
+    """处理一个已定位的中英来源词身，源词头、元数据及既有链接目标不参与修改。"""
+    if source == "hanying":
+        # CK 模板丢失了外部样式。用兼容旧 WebKit 的来源选择器恢复本书的分行；保留原引用。
+        if '<span class="CK">' not in page or _CK_LAYOUT in page:
+            return page
+        matches = list(_CK_TEMPLATE.finditer(page))
+        if not matches:
+            return page
+        # 原生物理词身以 link 起始；带合并外壳的公开页从标准来源署名后起始。
+        section = _SECTION.match(page)
+        usual = section.end() if section and section[1] == source else 0
+        if len(matches) == 1 and matches[0].start() == usual:
+            return page[:matches[0].end()] + _CK_LAYOUT + page[matches[0].end():]
+        allowed = _VisibleLocations(page, {m.start(): "tag" for m in matches}).allowed
+        return _CK_TEMPLATE.sub(lambda m: m[0] + (_CK_LAYOUT if m.start() in allowed else ""), page)
+    if source != "oxford":
+        return page
+
+    edits = []
+    if "FONT-FAMILY: <FONT" in page:
+        for m in _OX_SWAPPED.finditer(page):
+            # 数字后误关 font，单位后误关 SPAN；维生素译义的同一行还有第二个下标。
+            fixed = m["first"] + "</SPAN>" + m["tail"] + "</font>"
+            edits.append((m.start(), m.end(), _OX_NUMBER.sub(_oxford_number, fixed), "tag"))
+        for m in _OX_SINGLE.finditer(page):
+            if not any(a <= m.start() < b for a,b,_,_ in edits):
+                edits.append((m.start(), m.end(), _oxford_number(m), "tag"))
+    if "entry://esmissing-oxford-" in page:
+        for m in _OX_LINK.finditer(page):
+            label = m["label"]
+            prefix, sep, tail = label.partition('"font-weight:')
+            # href 中截断前的字节已用 SHA-256 替换。可见标签必须同时吻合此前缀和完整属性尾。
+            if sep and "font-weight:" + tail == m["tail"] and sha256(prefix.encode()).hexdigest() == m["digest"]:
+                edits.append((m.start(), m.end(), m["start"] + ">" + label + "</a>", "tag"))
+    for needle, pattern, replacement, kind in (
+            ("(font size=-2>", _OX_TM, "™", "text"), ("<Sup>1</up>/8", _OX_EIGHTH, "⅛加仑", "tag"),
+            ('COLLOC)"&gt;', _OX_COLLOC, r'\g<keep>', "end")):
+        if needle in page:
+            edits.extend((m.start(), m.end(), m.expand(replacement), kind) for m in pattern.finditer(page))
+    if not edits:
+        return page
+    allowed = _VisibleLocations(page, {a: kind for a,_,_,kind in edits}).allowed
+    for a, b, after, _ in sorted(edits, reverse=True):
+        if a in allowed:
+            page = page[:a] + after + page[b:]
+    return page

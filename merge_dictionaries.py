@@ -870,9 +870,48 @@ def self_test():
     print("PASS 合并顺序、重复版本、资源归属、MDX 回读、原文篡改及构建差异检测")
 
 
-def clean_books(books, output, rules_path):
-    """从已验收的合卷生成展示修订版。输入卷只读，最后才发布新清单。"""
+def write_display_volume(original, revised, expected_hash, cleaner, repair_layout=False):
+    """生成单卷并验证全部有序记录；两卷都完成校验后由调用者发布清单。"""
     from mdict_io import read_entries, read_header, write_mdict
+    from merge_render import repair_merged_layout
+    name = original.name
+    header = read_header(original)
+    expected_rows = hashlib.sha256()
+    counts = Counter()
+
+    def rows():
+        for _, key, payload in read_entries(original):
+            if not payload.startswith((PREFIX, HELPER)):
+                raise ValueError(f"缺少合卷来源标记：{key!r}")
+            cleaned = cleaner.clean(payload)
+            if repair_layout:
+                cleaned = repair_merged_layout(cleaned)
+            if cleaned != payload:
+                # 来源清单内存有原始词头和完整原文，单独核实未被显示规则修改。
+                boundary = payload.index(b"-->") + 3
+                if not cleaned.startswith(payload[:boundary]):
+                    raise ValueError(f"原文元数据被改写：{key!r}")
+                counts["changed_helpers" if payload.startswith(HELPER) else "changed_public"] += 1
+            counts["rows"] += 1
+            update_hash(expected_rows, key, cleaned)
+            yield key, cleaned
+
+    log(f"生成展示修订卷 {name}")
+    write_mdict(revised, rows(), header["Title"], header["Description"])
+    actual_rows = hashlib.sha256()
+    for _, key, payload in read_entries(revised):
+        update_hash(actual_rows, key, payload)
+    if actual_rows.digest() != expected_rows.digest() or read_header(revised) != header:
+        raise ValueError(f"逐条回读或卷头校验失败：{name}")
+    if file_hash(original) != expected_hash:
+        raise ValueError(f"生成期间输入卷发生变化：{name}")
+    digest = file_hash(revised)
+    log(f"{name} {dict(counts)} SHA-256 {digest}")
+    return digest
+
+
+def clean_books(books, output, rules_path, *, repair_layout=False):
+    """从已验收的合卷生成展示修订版。输入卷只读，最后才发布新清单。"""
     from merge_render import MergedDisplayCleaner
 
     if output.exists():
@@ -893,37 +932,8 @@ def clean_books(books, output, rules_path):
     if file_hash(output / resource) != manifest["files"][resource]:
         raise ValueError("资源复制校验失败")
     for name in filenames:
-        original, revised = books / name, output / name
-        header = read_header(original)
-        expected_rows = hashlib.sha256()
-        counts = Counter()
-
-        def rows():
-            for _, key, payload in read_entries(original):
-                if not payload.startswith((PREFIX, HELPER)):
-                    raise ValueError(f"缺少合卷来源标记：{key!r}")
-                cleaned = cleaner.clean(payload)
-                if cleaned != payload:
-                    # 来源清单内存有原始词头和完整原文，单独核实未被显示规则修改。
-                    boundary = payload.index(b"-->") + 3
-                    if not cleaned.startswith(payload[:boundary]):
-                        raise ValueError(f"原文元数据被改写：{key!r}")
-                    counts["changed_helpers" if payload.startswith(HELPER) else "changed_public"] += 1
-                counts["rows"] += 1
-                update_hash(expected_rows, key, cleaned)
-                yield key, cleaned
-
-        log(f"生成展示修订卷 {name}")
-        write_mdict(revised, rows(), header["Title"], header["Description"])
-        actual_rows = hashlib.sha256()
-        for _, key, payload in read_entries(revised):
-            update_hash(actual_rows, key, payload)
-        if actual_rows.digest() != expected_rows.digest() or read_header(revised) != header:
-            raise ValueError(f"逐条回读或卷头校验失败：{name}")
-        if file_hash(original) != manifest["files"][name]:
-            raise ValueError(f"生成期间输入卷发生变化：{name}")
-        manifest["files"][name] = file_hash(revised)
-        log(f"{name} {dict(counts)} SHA-256 {manifest['files'][name]}")
+        manifest["files"][name] = write_display_volume(
+            books / name, output / name, manifest["files"][name], cleaner, repair_layout)
     write_report(output / manifest_name, manifest)
 
 
@@ -934,6 +944,7 @@ def main():
     clean.add_argument("--books", type=Path, required=True)
     clean.add_argument("--output", type=Path, required=True)
     clean.add_argument("--rules", type=Path, required=True, help="E_Search export-display-rules 导出的 JSON")
+    clean.add_argument("--repair-layout", action="store_true", help="同时校勘来源段内的公式、词头模板及例句排版")
     make_stage = commands.add_parser("stage")
     make_stage.add_argument("--source-root", type=Path, default=DEFAULT_INPUT)
     make_stage.add_argument("--stage", type=Path, required=True)
@@ -965,7 +976,7 @@ def main():
     commands.add_parser("self-test")
     args = parser.parse_args()
     if args.command == "clean-display":
-        clean_books(args.books, args.output, args.rules)
+        clean_books(args.books, args.output, args.rules, repair_layout=args.repair_layout)
     elif args.command == "stage":
         stage_inputs(args.source_root, args.stage)
     elif args.command == "build":

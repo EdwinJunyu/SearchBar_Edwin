@@ -78,6 +78,64 @@ class MergedDisplayTests(unittest.TestCase):
             self.assertEqual(clean(page), page)
 
 
+class JapaneseMergedLayoutTests(unittest.TestCase):
+    @staticmethod
+    def definition(head, excerpt):
+        return '<div class="wrap-switch"><div class="ncdata-header"><h1><span class="word">' + head + '</span></h1></div><div class="ncdata-body"><div class="ncdata-sense"><span>' + excerpt + '</span></div></div></div>'
+
+    def test_formula_belongs_to_printed_entry_and_preserves_following_sentence(self):
+        repair = merge_render.repair_japanese_display
+        bad = 'C<sub><</sub>sup>6H<sub><</sub>sup>14'
+        hexane = self.definition('ヘキサン', bad + '5種の异性体')
+        other = self.definition('引用', bad)
+        self.assertEqual(repair('shinseiki', hexane + other),
+                         hexane.replace(bad, 'C₆H₁₄') + other)
+        power = self.definition('幂指数', 'a<sup><sub><</sub>/sup>nを満たす。</sup>')
+        self.assertIn('aⁿを満たす。</span>', repair('shinseiki', power))
+        self.assertEqual(repair('sango', power), power)
+        alien = self.definition('造血薬', 'B<sub><</sub>sup>123')
+        self.assertEqual(repair('shinseiki', alien), alien)
+
+    def test_script_boundary_changes_only_inside_the_confirmed_entry(self):
+        original = 'log<sub>1021</sub>＝1.3222'
+        valid = self.definition('指标', original)
+        unrelated = self.definition('引用', original)
+        expected = valid.replace(original, 'log<sub>10</sub>21＝1.3222') + unrelated
+        self.assertEqual(merge_render.repair_japanese_display('shinseiki', valid + unrelated), expected)
+        self.assertEqual(merge_render.repair_japanese_display('shinseiki', expected), expected)
+
+    def test_japanese_layout_preserves_attributes_comments_and_hidden_examples(self):
+        old = 'log<sub>1021</sub>＝1.3222'
+        keep = (f'<span title="{old}">注</span><a href="{old}">参见</a><!-- {old} -->'
+                f'<span hidden>{old}</span><template>{old}</template>')
+        mixed = self.definition('指标', keep + old)
+        self.assertEqual(merge_render.repair_japanese_display('shinseiki', mixed),
+                         self.definition('指标', keep + 'log<sub>10</sub>21＝1.3222'))
+        mark = '<p><font color=green>例：</font></>\n中指  \n<br>zhōngzhǐ<font color=red>【中指】</font>'
+        fake_first = '<span title="<font color=red>【中止】</font>">注</span>' + mark
+        self.assertEqual(merge_render.repair_japanese_display('shogakukan-zhja', fake_first), fake_first)
+        fake_title = "<a title='" + self.definition('指标', old) + "'>表示</a>"
+        self.assertEqual(merge_render.repair_japanese_display('shinseiki', fake_title), fake_title)
+
+    def test_sanseido_copied_tail_needs_the_original_target_hash_and_label(self):
+        prefix = 'バザール<font color='
+        target = hashlib.sha256(prefix.encode()).hexdigest()
+        href = '"entry://esmissing-sanseido-' + target + '"'
+        label = prefix + '"#008000">(1)</font>'
+        link = '<a href=' + href + '#008000">(1)</font>">' + label + '</a>'
+        clean = '<a href=' + href + '>' + label + '</a>'
+        self.assertEqual(merge_render.repair_japanese_display('sanseido', link), clean)
+        for near in [link.replace('(1)', '(2)', 1), link.replace(target, '0' * 64)]:
+            self.assertEqual(merge_render.repair_japanese_display('sanseido', near), near)
+
+    def test_shogakukan_joined_heading_retains_second_article_and_real_example(self):
+        mark = '<p><font color=green>例：</font></>'
+        part = '<font color=red>【中止】</font>' + mark + '\r\n中指  \r\n<br>zhōngzhǐ<font color=red>【中指】</font><p>例：保留</p>'
+        self.assertEqual(merge_render.repair_japanese_display('shogakukan-zhja', part), part.replace(mark, '<p>'))
+        for near in [part.replace('zhōngzhǐ', 'other'), part.replace('【中止】', '【引用】')]:
+            self.assertEqual(merge_render.repair_japanese_display('shogakukan-zhja', near), near)
+
+
 class RenderTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(":memory:")
@@ -345,6 +403,34 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(list(path.glob("*.tmp")), [])
 
 
+class LayoutBoundaryTests(unittest.TestCase):
+    def test_sanseido_color_and_terminal_spacing_do_not_change_examples_or_internal_gaps(self):
+        frame = '<div class="es-source es-sanseido"><a name="es-sanseido-14"></a><div class="es-label"><b>三省堂超级大辞林（日日・日英等） #14</b></div>'
+        marker = '<font color=“#0000FF”>'
+        aside = '<!--' + marker + '--><i title=\'' + marker + '\'>例</i>'
+        gaps = '<br>' * 5
+        old = '<font>' + aside + gaps + marker + '――を貼る</font>' + gaps + '</font>\r\n'
+        fixed = '<font>' + aside + gaps + '<font color="#0000FF">――を貼る</font><br></font>\r\n'
+        def pack(body):
+            return ('<!--ESHELP1-->' + frame + body + '</div>').encode()
+        self.assertEqual(merge_render.repair_merged_layout(pack(old)), pack(fixed))
+        self.assertEqual(merge_render.repair_merged_layout(pack(fixed)), pack(fixed))
+
+    def test_homophone_number_only_in_single_sango_heading(self):
+        prefix = b'<!--ESHELP1-->'
+        start = ('<div class="es-source es-sango"><a name="es-sango-10"></a>'
+                 '<div class="es-label"><b>三合一日语辞典 #10</b></div>')
+        header = '<br><font color=black>あい&+{2}\r\n<br><font color=blue>'
+        page = start + header + '释义 &+{3}</font></font></div>'
+        repair = merge_render.repair_merged_layout
+        self.assertEqual(repair(prefix + page.encode()), prefix + page.replace('&+{2}', '〔2〕').encode())
+        for changed in (page.replace('es-sango-10', 'es-sango-11'),
+                        page.replace('</a>', '</a><a name="es-oxford-2"></a>'),
+                        page.replace(header, '<!--' + header + '-->'),
+                        page.replace(header, '<span hidden>' + header + '</span>')):
+            self.assertEqual(repair(prefix + changed.encode()), prefix + changed.encode())
+
+
 class CleanMergedBooksTests(unittest.TestCase):
     def test_clean_copy_roundtrip_and_reject_stale_manifest(self):
         from mdict_io import read_entries, write_mdict
@@ -360,7 +446,8 @@ class CleanMergedBooksTests(unittest.TestCase):
                 source = VOLUMES[volume][1][0]
                 body = metadata([[source, 1, "word ", "防\ue40c"]]) + (
                     f'<div class="es-source es-{source}"><a name="es-{source}-1"></a>'
-                    f'<div class="es-label"><b>{source} #1</b></div>防\ue40c</div>').encode()
+                    f'<div class="es-label"><b>{merge_render.NAMES[source]} #1</b></div>'
+                    '防\ue40c (font size=-2><sup>TM</sup></font></div>').encode()
                 write_mdict(path, [("word ", body)], volume, "")
                 manifest["files"][path.name] = file_hash(path)
                 source_bodies[volume] = body
@@ -377,10 +464,63 @@ class CleanMergedBooksTests(unittest.TestCase):
                 expected = original.replace("防\ue40c".encode(), "防卫".encode()) if volume == "zh-en" else original
                 self.assertEqual(list(read_entries(path)), [(1, "word ", expected)])
             self.assertEqual((output / resource.name).read_bytes(), resource.read_bytes())
+            layout = root / "layout"
+            clean_books(books, layout, rules, repair_layout=True)
+            literal = b"(font size=-2><sup>TM</sup></font>"
+            for volume in VOLUMES:
+                name = f"E_search-{volume}.mdx"
+                [(ordinal, key, previous)] = read_entries(output / name)
+                revised = previous.replace(literal, "™".encode()) if volume == "zh-en" else previous
+                self.assertEqual(list(read_entries(layout / name)), [(ordinal, key, revised)])
             self.assertRaises(ValueError, clean_books, books, books, rules)
             resource.write_bytes(b"stale")
             self.assertRaises(ValueError, clean_books, books, root / "failed", rules)
             self.assertFalse((root / "failed" / "E_search-merge.json").exists())
+
+
+class EnglishLayoutTests(unittest.TestCase):
+    def test_oxford_formula_reconnects_units_to_the_same_translation(self):
+        quote = """<FONT style="font-weight:normal">'</FONT>"""
+        family = quote + "Arial" + quote + ", " + quote + "细明体" + quote
+        span = ('<SPAN style="FONT-WEIGHT: normal; FONT-SIZE: 7pt; VERTICAL-ALIGN: sub; '
+                'FONT-STYLE: normal; FONT-FAMILY: ' + family + '">')
+        body = '<font color=blue>B' + span + '2</font> ；维他命 B' + span + '2</SPAN></SPAN>'
+        self.assertEqual(merge_render.repair_english_display(body, "oxford"),
+                         '<font color=blue>B<SPAN>₂</SPAN> ；维他命 B<SPAN>₂</SPAN></font>')
+        good = 'H<sub>2</sub>O'
+        for unchanged in (good, '<!--' + body + '-->', '<div hidden>' + body + '</div>',
+                          '<style>' + body + '</style>', body.replace('细明体', '宋体')):
+            self.assertEqual(merge_render.repair_english_display(unchanged, "oxford"), unchanged)
+
+    def test_oxford_source_damage_requires_exact_source_target_and_context(self):
+        prefix = 'Down<FONT style='
+        label = prefix + """"font-weight:normal">'</FONT>s syndrome"""
+        digest = hashlib.sha256(prefix.encode()).hexdigest()
+        start = '<a href="entry://esmissing-oxford-' + digest + '"'
+        tail = """font-weight:normal">'</FONT>s syndrome"""
+        broken = start + tail + '">' + label + '</a>'
+        html = (broken + ''' · (font size=-2><sup>TM</sup></font> · <Sup>1</up>/8加仑'''
+                + '''<font>x</font>(</SPAN>COLLOC)"&gt;</SPAN>''')
+        expected = start + '>' + label + '</a> · ™ · ⅛加仑<font>x</font>(</SPAN>COLLOC)</SPAN>'
+        self.assertEqual(merge_render.repair_english_display(html, "oxford"), expected)
+        for unchanged in (broken.replace(digest, 'f'*64), broken.replace('syndrome">', 'x">'),
+                          '<img title="(font size=-2><sup>TM</sup></font>">',
+                          '<sup>1</sup>/8加仑', 'COLLOC)"&gt;</SPAN>', '<code>&lt;sup&gt;1&lt;/sup&gt;</code>'):
+            self.assertEqual(merge_render.repair_english_display(unchanged, "oxford"), unchanged)
+        self.assertEqual(merge_render.repair_english_display(html, "hanying"), html)
+
+    def test_hanying_only_supplies_missing_layout_for_the_confirmed_native_template(self):
+        import re
+        stylesheet = '<link rel="stylesheet" type="text/css" href="es/hanying/sf_cb.css"/>'
+        body = stylesheet + '\r\n<span class="CK"><span class="JS">安全</span><span class="LY">安全转移</span></span>'
+        rich = merge_render.repair_english_display(body, "hanying")
+        self.assertIn(stylesheet, rich)
+        self.assertIn('.es-hanying .CK span.LY', rich)
+        self.assertEqual(re.sub(r'<style>[^<>]+</style>', '', rich), body)
+        self.assertEqual(merge_render.repair_english_display(rich, "hanying"), rich)
+        for original in (body.replace("sf_cb.css", "another.css"), body.replace('class="CK"', 'class="else"'),
+                         '<template>' + body + '</template>', '<!--' + body + '-->'):
+            self.assertEqual(merge_render.repair_english_display(original, "hanying"), original)
 
 
 if __name__ == "__main__":
