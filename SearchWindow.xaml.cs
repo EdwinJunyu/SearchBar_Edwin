@@ -64,7 +64,6 @@ public partial class SearchWindow : Window
     private CancellationTokenSource? catalogPending;
     private CancellationTokenSource? preparingReverse;
     private string? selectedReverseDirectory;
-    private string? rejectedModelDirectory;
     private string? reverseTargetLanguage;
     private bool reverseModelReady, useReverseModel = true;
     private string CurrentModelDirectory => selectedReverseDirectory ?? ReverseEncoder.ModelDirectory;
@@ -127,7 +126,7 @@ public partial class SearchWindow : Window
         QueryBox.PreviewMouseDown += (_, _) => navigatingFiles = false;
         QueryBox.GotKeyboardFocus += (_, _) => navigatingFiles = false;
         SettingsButton.Click += (_, _) => OpenSettings();
-        ClearButton.Click += (_, _) => { QueryBox.Clear(); QueryBox.Focus(); };
+        ClearButton.Click += (_, _) => { ClearSearchInput(); QueryBox.Focus(); };
         DetailsButton.Click += (_, _) => ToggleDetails();
         InstallEverythingButton.Click += (_, _) => OpenWithShell("https://www.voidtools.com/downloads/");
         SetReadingPreferenceButton.Click += async (_, _) => await ChangeReadingPreferenceAsync(clear: false);
@@ -164,7 +163,7 @@ public partial class SearchWindow : Window
         try
         {
             // 已有库只读加载配置；首次启动才创建空库，以便随后从设置页导入。
-            using var store = new DictionaryStore(databasePath, readOnly: File.Exists(databasePath));
+            using var store = DictionaryStore.OpenCatalog(databasePath);
             hotkey = store.ReadHotkey();
         }
         catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException)
@@ -389,8 +388,9 @@ public partial class SearchWindow : Window
     internal void ActivateFromLaunch(string? requestedDictionary)
     {
         if (dictionaryId != requestedDictionary) reverseModelReady = false;
-        if (IsVisible && dictionaryId != requestedDictionary) QueryBox.Clear();
+        bool switching = IsVisible && dictionaryId != requestedDictionary;
         dictionaryId = requestedDictionary;
+        if (switching && (!Topmost || settings is { IsVisible: true })) ClearSearchInput();
         Summon();
     }
 
@@ -407,8 +407,7 @@ public partial class SearchWindow : Window
         if (!IsVisible || Topmost)
         {
             composing = false;
-            QueryBox.Clear();
-            RefreshInput();
+            ClearSearchInput();
             if (!IsVisible) Show();
             PositionSearchWindow();
         }
@@ -465,8 +464,7 @@ public partial class SearchWindow : Window
         // 从别的应用按热键收起浮窗时，让当前前台应用继续接收输入。
         var target = GetForegroundWindow() == hwnd ? previousWindow : 0;
         composing = false;
-        QueryBox.Clear();
-        RefreshInput();
+        ClearSearchInput();
         // 在仍拥有前台资格时归还窗口，再隐藏浮窗，避免操作系统另选其他应用。
         if (target != 0 && IsWindowVisible(target)) SetForegroundWindow(target);
         Hide();
@@ -508,13 +506,10 @@ public partial class SearchWindow : Window
         return true;
     }
 
-    private static bool HasModelFiles(string folder) =>
-        File.Exists(Path.Combine(folder, "model.onnx")) && File.Exists(Path.Combine(folder, "vocab.txt"));
-
     private void UpdateReverseModelButton()
     {
         (ReverseModelButton.Content, ReverseModelButton.ToolTip) =
-            (CurrentModelDirectory == rejectedModelDirectory || !HasModelFiles(CurrentModelDirectory), reverseModelReady, useReverseModel) switch
+            (!ReverseEncoder.CanOpen(CurrentModelDirectory), reverseModelReady, useReverseModel) switch
             {
                 (true, _, _) => ("选择本地模型", "选择包含模型和词表的本地文件夹。"),
                 (_, false, _) => ("准备语义索引", "在本机为当前词典编码义项，可取消后继续。"),
@@ -528,19 +523,20 @@ public partial class SearchWindow : Window
         if (preparingReverse != null) { preparingReverse.Cancel(); return; }
         if (!TryReverseInput(QueryBox.Text, out _, out string? targetLanguage)) return;
         // 两种检索对同一描述可能选出不同的义项，准备索引后可以直接切换，不必重建。
-        if (reverseModelReady)
+        string folder = CurrentModelDirectory;
+        bool available = ReverseEncoder.CanOpen(folder);
+        if (reverseModelReady && available)
         {
             useReverseModel = !useReverseModel;
             RefreshInput();
             return;
         }
-        string folder = CurrentModelDirectory;
-        if (folder == rejectedModelDirectory || !HasModelFiles(folder))
+        if (!available)
         {
             var dialog = new Microsoft.Win32.OpenFolderDialog { Title = "选择包含 BGE 模型 model.onnx 和 vocab.txt 的文件夹" };
             if (dialog.ShowDialog(this) != true) return;
             selectedReverseDirectory = folder = dialog.FolderName;
-            rejectedModelDirectory = null;
+            ReverseEncoder.Retry(folder);
         }
         string? only = dictionaryId;
         using var cancel = new CancellationTokenSource();
@@ -576,7 +572,6 @@ public partial class SearchWindow : Window
         {
             if (preparingReverse == cancel && !cancel.IsCancellationRequested)
             {
-                if (ex is InvalidDataException) rejectedModelDirectory = folder;
                 if (IsVisible && IsReverseInput(QueryBox.Text)) SetStatus("语义索引准备失败：" + ex.GetBaseException().Message);
             }
         }
@@ -882,6 +877,13 @@ public partial class SearchWindow : Window
         composing = false;
         // 不吞掉选字回车；等当前输入事件的默认编辑完成之后再读取文本。
         Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(RefreshInput));
+    }
+
+    private void ClearSearchInput()
+    {
+        // 清空非空输入会同步触发 TextChanged。原本为空时仍需取消上一次请求并清除选择。
+        if (QueryBox.Text.Length == 0) RefreshInput();
+        else QueryBox.Clear();
     }
 
     private void RefreshInput()
@@ -1199,9 +1201,7 @@ public partial class SearchWindow : Window
             if (request == revision && catalog == catalogRevision && IsVisible && !composing)
             {
                 string typed = Lookup.Normalize(text);
-                // 普通候选沿用原来的字符串；排版词头单独保存按钮文字与点击时使用的原键。
-                PrefixChoices.ItemsSource = choices.Where(choice => Lookup.Normalize(choice.Key) != typed)
-                    .Select(choice => choice.Display == choice.Key ? (object)choice.Key : choice).ToArray();
+                PrefixChoices.ItemsSource = choices.Where(choice => Lookup.Normalize(choice.Key) != typed).ToArray();
             }
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
@@ -1219,7 +1219,6 @@ public partial class SearchWindow : Window
         bool semanticRequested = useReverseModel;
         bool modelReady = false;
         string? modelError = null;
-        bool invalidModel = false;
         try
         {
             // 所有候选共享一次读取快照；导入或调整优先级时不会把两版词库混入一个结果。
@@ -1227,7 +1226,7 @@ public partial class SearchWindow : Window
             {
                 using var store = new DictionaryStore(databasePath, readOnly: true);
                 if (!reverse) return store.Search(text, only, token);
-                if (HasModelFiles(folder))
+                if (ReverseEncoder.CanOpen(folder))
                 {
                     try
                     {
@@ -1264,7 +1263,6 @@ public partial class SearchWindow : Window
                     {
                         modelReady = false;
                         modelError = ex.GetBaseException().Message;
-                        invalidModel = ex is InvalidDataException;
                     }
                 }
                 return store.ReverseByLanguage(description, only, targetLanguage, token);
@@ -1278,11 +1276,6 @@ public partial class SearchWindow : Window
                 AutomaticReverseLabel.Text = "按意思联想";
                 AutomaticReverseLabel.Visibility = suggestions.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
                 return;
-            }
-            if (invalidModel)
-            {
-                rejectedModelDirectory = folder;
-                UpdateReverseModelButton();
             }
             if (reverse && preparingReverse == null)
             {
@@ -1343,9 +1336,8 @@ public partial class SearchWindow : Window
 
     private void UsePrefixSuggestion(object sender, RoutedEventArgs args)
     {
-        if (sender is not FrameworkElement { DataContext: { } item } || !PrefixChoices.Items.Contains(item)) return;
-        if (item is PrefixChoice choice) AcceptDictionaryText(choice.Key);
-        else if (item is string key) AcceptDictionaryText(key);
+        if (sender is FrameworkElement { DataContext: PrefixChoice choice } && PrefixChoices.Items.Contains(choice))
+            AcceptDictionaryText(choice.Key);
     }
 
     private void AcceptDictionaryText(string key)
@@ -1422,8 +1414,7 @@ public partial class SearchWindow : Window
             _ = RankRememberedFilesAsync();
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception
-            or InvalidOperationException or DllNotFoundException or BadImageFormatException or EntryPointNotFoundException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception or InvalidOperationException)
         {
             if (token.IsCancellationRequested || request != revision || !IsVisible) return;
             SetFileStatus(ex.Message);
@@ -1839,6 +1830,15 @@ public partial class SearchWindow : Window
                     !document.body?.hasChildNodes() || !performance.getEntriesByName('first-contentful-paint').length) return false;
                 const alphabet = {{JsonSerializer.Serialize(EntryParser.KingsoftAlphabet)}};
                 const unicode = {{JsonSerializer.Serialize(EntryParser.KingsoftUnicode)}};
+                function editable(owner, section) {
+                    if (owner.closest('.es-source') !== section ||
+                        owner.closest('style,script,template,noscript,iframe,textarea,[hidden],.es-label,.es-client-target')) return false;
+                    // 使用浏览器已经计算好的样式，包含 !important 及由祖先继承的可见性。
+                    if (getComputedStyle(owner).visibility !== 'visible') return false;
+                    for (let node = owner; node; node = node.parentElement)
+                        if (getComputedStyle(node).display === 'none') return false;
+                    return true;
+                }
                 for (const [source, pairs] of Object.entries({{MergedDisplayRulesJson.Value}})) {
                     const sections = document.querySelectorAll('.es-source.es-' + source);
                     if (!sections.length) continue;
@@ -1857,7 +1857,7 @@ public partial class SearchWindow : Window
                             // 老字体用英文字母代画音标。整段均在已核对的码表内时才解码，混排和未知段保留。
                             for (const font of section.querySelectorAll('font[face]')) {
                                 if (font.face.trim().toLowerCase() !== 'kingsoft phonetic plain, tahoma' ||
-                                    font.closest('.es-source') !== section || font.closest('[hidden],.es-label') ||
+                                    !editable(font, section) ||
                                     font.childNodes.length !== 1 || font.firstChild.nodeType !== Node.TEXT_NODE) continue;
                                 const node = font.firstChild;
                                 const letters = Array.from(node.data, ch => unicode[alphabet.indexOf(ch)]);
@@ -1874,8 +1874,7 @@ public partial class SearchWindow : Window
                             if (node.data === text) continue;
                             // 只改所属词书的正文文字节点；保留标签、链接目标、锚点、样式和合并器生成的来源标签。
                             const owner = node.parentElement;
-                            if (owner.closest('.es-source') === section && !owner.closest('style,script,template,noscript,[hidden],.es-label'))
-                                node.data = text;
+                            if (editable(owner, section)) node.data = text;
                         }
                     }
                 }
@@ -1919,24 +1918,41 @@ public partial class SearchWindow : Window
     private static partial Regex ShinseikiExampleSource();
 
     private const string ShogakukanEmptyExample = "<p><font color=green>例：</font></>";
-    [GeneratedRegex(ShogakukanEmptyExample + """(?=\r?\n(?<second>中指|噪音|承印|软脂)  \r?\n<br>(?<reading>[^<>\s]+)<font color=red>【\k<second>】</font>)""")]
+    [GeneratedRegex(ShogakukanEmptyExample + """(?=\r?\n(?<second>[^<>\s]+)  \r?\n<br>(?<reading>[^<>\s]+)<font color=red>【\k<second>】</font>)""")]
     private static partial Regex ShogakukanJoinedHeading();
 
-    private static string SeparateShogakukanArticles(string html) => ShogakukanJoinedHeading().Replace(html, match =>
+    private static string SeparateShogakukanArticles(string html, string? original = null, int offset = 0)
     {
-        // 四个第二词头都没有独立记录。仅当双写的第二词头、拼音与第一篇红色标题都对得上时，
-        // 将误挂的空“例：”还原为段落分隔，第二篇的完整释义、真正例句和索引位置仍然可用。
-        var first = (match.Groups["second"].Value, match.Groups["reading"].Value) switch
+        if (!html.Contains(ShogakukanEmptyExample, StringComparison.Ordinal)) return html;
+        original ??= html;
+        var visible = EntryParser.VisibleMarkupPositions(original);
+        int PreviousVisible(string prefix, int before)
         {
-            ("中指", "zhōngzhǐ") => "中止",
-            ("噪音", "zàoyīn") => "噪声污染",
-            ("承印", "chéngyìn") => "承修",
-            ("软脂", "ruǎnzhī") => "软炸",
-            _ => null
-        };
-        return first != null && html.AsSpan(0, match.Index).Contains($"<font color=red>【{first}】</font>", StringComparison.Ordinal)
-            ? "<p>" : match.Value;
-    });
+            while (before > 0)
+            {
+                int pos = original.AsSpan(0, before).LastIndexOf(prefix, StringComparison.Ordinal);
+                if (pos < 0 || visible[pos]) return pos;
+                before = pos;
+            }
+            return -1;
+        }
+        // 以真正相邻的可见红色词头为准；同形的隐藏例句、属性或注释不能开启或切断词条。
+        return ShogakukanJoinedHeading().Replace(html, match =>
+        {
+            int pos = offset + match.Index;
+            if (!visible[pos] || !EntryParser.ShogakukanJoinedHeads.TryGetValue(match.Groups["second"].Value, out var previous)
+                || match.Groups["reading"].Value != previous.Reading) return match.Value;
+            int heading = PreviousVisible("<font color=red>【", pos);
+            int target = PreviousVisible("<div class=\"es-target\">", pos);
+            // 承修、软炸两页在词头间以这个完整段落标注补充说明。带读音的同名词头仍是篇界。
+            const string supplement = "<p><font color=red>【補足】</font>";
+            while (heading >= 3 && heading >= target && visible[heading - 3] &&
+                   original.AsSpan(heading - 3).StartsWith(supplement, StringComparison.Ordinal))
+                heading = PreviousVisible("<font color=red>【", heading);
+            return heading >= 0 && heading >= target && original.AsSpan(heading).StartsWith(
+                $"<font color=red>【{previous.First}】</font>", StringComparison.Ordinal) ? "<p>" : match.Value;
+        });
+    }
 
     private static string RewriteMergedLinks(string html, string documentPath)
     {
@@ -1950,19 +1966,34 @@ public partial class SearchWindow : Window
             || html.Contains("\"font-weight:", StringComparison.Ordinal) && html.Contains("entry://esmissing-oxford-", StringComparison.Ordinal))
         {
             const string boundary = "<div class=\"es-source ";
-            var sections = html.Split(boundary, StringSplitOptions.None);
-            for (int i = 1; i < sections.Length; i++)
+            // 同页原书可能在注释或属性中引用另一来源的包装标签，只有真实可见的开标签才切换来源。
+            var visible = EntryParser.VisibleMarkupPositions(html);
+            var sections = new List<string>();
+            int from = 0;
+            for (int pos = html.IndexOf(boundary, StringComparison.Ordinal); pos >= 0;
+                 pos = html.IndexOf(boundary, pos + boundary.Length, StringComparison.Ordinal))
+            {
+                if (!visible[pos]) continue;
+                sections.Add(html[from..pos]);
+                from = pos + boundary.Length;
+            }
+            sections.Add(html[from..]);
+            for (int i = 1; i < sections.Count; i++)
                 if (sections[i].StartsWith("es-shogakukan-zhja\"><a name=\"es-shogakukan-zhja-", StringComparison.Ordinal))
                     sections[i] = SeparateShogakukanArticles(sections[i]);
                 else if (sections[i].StartsWith("es-shinseiki\"><a name=\"es-shinseiki-", StringComparison.Ordinal))
                 {
                     sections[i] = EntryParser.RestoreShinseikiQuestionMarkup(sections[i]);
-                    sections[i] = EntryParser.RepairShinseikiScriptBoundaries(EntryParser.NormalizeShinseikiFormulas(sections[i]));
+                    sections[i] = EntryParser.NormalizeShinseikiFormulas(sections[i]);
                 }
                 else if (sections[i].StartsWith("es-sanseido\">", StringComparison.Ordinal))
                     sections[i] = SanseidoMergedLink().Replace(sections[i], m =>
-                        m.Groups["label"].Value.EndsWith("<font color=\"#008000\">" + m.Groups["tail"].Value, StringComparison.Ordinal)
-                            ? m.Groups["link"].Value + ">" + m.Groups["label"].Value + "</a>" : m.Value);
+                    {
+                        string label = m.Groups["label"].Value;
+                        string tail = "<font color=\"#008000\">" + m.Groups["tail"].Value;
+                        if (!label.EndsWith(tail, StringComparison.Ordinal)) return m.Value;
+                        return RestoreHashedLink(m, label[..(label.Length - tail.Length)] + "<font color=");
+                    });
                 else if (sections[i].StartsWith("es-oxford\">", StringComparison.Ordinal))
                 {
                     sections[i] = NormalizeOxfordDisplayMarkup(sections[i]);
@@ -1972,9 +2003,7 @@ public partial class SearchWindow : Window
                         string label = m.Groups["label"].Value;
                         int quote = label.IndexOf("\"font-weight:", StringComparison.Ordinal);
                         if (!label.AsSpan(quote + 1).SequenceEqual(m.Groups["tail"].ValueSpan)) return m.Value;
-                        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(label[..quote]));
-                        return Convert.ToHexStringLower(hash) == m.Groups["hash"].Value
-                            ? m.Groups["link"].Value + ">" + label + "</a>" : m.Value;
+                        return RestoreHashedLink(m, label[..quote]);
                     });
                 }
             html = string.Join(boundary, sections);
@@ -1986,7 +2015,15 @@ public partial class SearchWindow : Window
         return Regex.Replace(body, @"(?i)(\bhref\s*=\s*[""'])entry://#", "$1#");
     }
 
-    [GeneratedRegex("""(?<link><a href="entry://es(?:missing|ref)-sanseido-[a-f0-9]{64}")#008000">(?<tail>[^"<>]*</font>(?:[^"<>]|<font color="#008000">[^"<>]*</font>)*)">(?<label>(?:[^"<>]|<font color="#008000">[^"<>]*</font>)+)</a>""")]
+    private static string RestoreHashedLink(Match link, string originalPrefix)
+    {
+        // 旧卷目标保存的是损坏 href 截断前的 UTF-8 摘要，必须与可见标签重建的前缀一致。
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(originalPrefix));
+        return Convert.ToHexStringLower(hash) == link.Groups["hash"].Value
+            ? link.Groups["link"].Value + ">" + link.Groups["label"].Value + "</a>" : link.Value;
+    }
+
+    [GeneratedRegex("""(?<link><a href="entry://es(?:missing|ref)-sanseido-(?<hash>[a-f0-9]{64})")#008000">(?<tail>[^"<>]*</font>(?:[^"<>]|<font color="#008000">[^"<>]*</font>)*)">(?<label>(?:[^"<>]|<font color="#008000">[^"<>]*</font>)+)</a>""")]
     private static partial Regex SanseidoMergedLink();
 
     // 原书只在这两种字体标记上把排版后的可见词头完整复制进 href。
@@ -2034,8 +2071,8 @@ public partial class SearchWindow : Window
         var to = EntryParser.OxfordPhrasalSenses(sectionBody, parent)
             .Where(p => p.Headword == hit.Headword).ToArray();
         int index = Array.FindIndex(from, p => p.Anchor == hit.Anchor);
-        if (index < 0 || !from.Select(p => (raw[p.Anchor.Title], p.Gloss))
-                .SequenceEqual(to.Select(p => (sectionBody[p.Anchor.Title], p.Gloss)))) return null;
+        if (index < 0 || !from.Select(p => (EntryParser.OxfordPrintedPhraseTitle(raw[p.Anchor.Title]), p.Gloss))
+                .SequenceEqual(to.Select(p => (EntryParser.OxfordPrintedPhraseTitle(sectionBody[p.Anchor.Title]), p.Gloss)))) return null;
         var anchor = to[index].Anchor;
         int title = start + anchor.Title.Start.Value, titleEnd = start + anchor.Title.End.Value;
         int sense = start + anchor.Sense.Start.Value, senseEnd = start + anchor.Sense.End.Value;
@@ -2060,18 +2097,18 @@ public partial class SearchWindow : Window
         if (sourceId == "shinseiki") raw = EntryParser.RestoreShinseikiQuestionMarkup(raw);
         bool hanyingCk = sourceId == "hanying" && raw.Contains("<span class=\"CK\">", StringComparison.Ordinal);
         // 坐标分界均在完整标签之间，先分段解码再映射。实体、嵌套标签和重复文字都不靠文本搜索定位。
-        string Decode(string html)
+        string Decode(string html, int rawOffset = 0)
         {
             if (hanyingCk) html = HanyingBlockStart().Replace(html, "\n");
             if (sourceId == "sango" && html.Contains("&+{", StringComparison.Ordinal))
                 html = SangoHeader().Replace(html, "${line}〔${number}〕");
             if (sourceId == "sanseido") html = EntryParser.SanseidoLinkText(EntryParser.DecodePrintedScripts(html, sourceId));
             if (sourceId == "shogakukan-zhja" && html.Contains(ShogakukanEmptyExample, StringComparison.Ordinal))
-                html = SeparateShogakukanArticles(html);
+                html = SeparateShogakukanArticles(html, raw, rawOffset);
             // 新世纪以空 HTML 注释隔开标题等字段。先去掉模板标记，实体转义的字面示例仍会保留。
             if (sourceId == "shinseiki")
             {
-                html = EntryParser.DecodePrintedScripts(EntryParser.RepairShinseikiScriptBoundaries(EntryParser.NormalizeShinseikiFormulas(html, raw)), sourceId);
+                html = EntryParser.DecodePrintedScripts(EntryParser.NormalizeShinseikiFormulas(html, raw, rawOffset), sourceId);
                 html = ShinseikiTruncatedToken().Replace(html, match =>
                     match.Groups["image"].Success ? "[原书图片标签截断]" : "");
                 html = html.Replace("<!-- -->", "", StringComparison.Ordinal);
@@ -2106,11 +2143,11 @@ public partial class SearchWindow : Window
         int previous = 0;
         for (int i = 0; i < offsets.Length; i++)
         {
-            decoded.Append(Decode(raw[previous..rawOffsets[i]]));
+            decoded.Append(Decode(raw[previous..rawOffsets[i]], previous));
             offsets[i] = decoded.Length;
             previous = rawOffsets[i];
         }
-        decoded.Append(Decode(raw[previous..]));
+        decoded.Append(Decode(raw[previous..], previous));
 
         // 与普通正文同样逐行裁切并省略空行，同时将四个解码后的边界换算为最终文本的位置。
         var text = new StringBuilder();
@@ -2410,10 +2447,10 @@ internal sealed class FileRefindHistory(string databasePath)
 
     internal static bool IsStorageFailure(Exception ex) => ex is SqliteException or IOException or UnauthorizedAccessException;
 
-    private SqliteConnection Open(bool create = false)
+    private SqliteConnection Open(bool create = false, bool readOnly = false)
     {
         var db = new SqliteConnection(new SqliteConnectionStringBuilder {
-            DataSource = path, Mode = create ? SqliteOpenMode.ReadWriteCreate : SqliteOpenMode.ReadWrite,
+            DataSource = path, Mode = readOnly ? SqliteOpenMode.ReadOnly : create ? SqliteOpenMode.ReadWriteCreate : SqliteOpenMode.ReadWrite,
             Pooling = false, DefaultTimeout = 1
         }.ToString());
         try { db.Open(); return db; }
@@ -2434,10 +2471,12 @@ internal sealed class FileRefindHistory(string databasePath)
         prune.ExecuteNonQuery();
     }
 
-    public (int Mode, long Epoch) GetPreferences()
+    public (int Mode, long Epoch) GetPreferences() => ReadPreferences(readOnly: false);
+
+    internal (int Mode, long Epoch) ReadPreferences(bool readOnly)
     {
         if (!File.Exists(path)) return default;
-        using var db = Open();
+        using var db = Open(readOnly: readOnly);
         using var cmd = db.CreateCommand();
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         cmd.CommandText = "SELECT mode,epoch,EXISTS(SELECT 1 FROM opens WHERE opened < $cutoff) FROM settings WHERE id=1";
@@ -2447,7 +2486,7 @@ internal sealed class FileRefindHistory(string databasePath)
         var result = (row.GetInt32(0), row.GetInt64(1));
         bool expired = row.GetBoolean(2);
         row.Close();
-        if (expired)
+        if (expired && !readOnly)
         {
             using var tx = db.BeginTransaction();
             Prune(db, tx, now);

@@ -252,14 +252,26 @@ internal static partial class EntryParser
     [GeneratedRegex("""<i>(?<text>[A-Za-z])</i>|<font color="#008000">(?<text>\([0-9]+\)|\[[^\[\]<>]+\])</font>""")]
     private static partial Regex SanseidoHeadMarkup();
 
-    public static ParsedEntry Parse(string sourceId, string key, string raw, string? language = null)
+    internal static string SqliteTextPrefix(string body, int characters)
+    {
+        // SQLite substr(TEXT) 按 Unicode 码点计数，遇到 NUL 就结束；正文索引与原库使用相同前缀。
+        int end = 0;
+        while (end < body.Length && characters-- > 0 && body[end] != '\0')
+            end += char.IsSurrogatePair(body, end) ? 2 : 1;
+        return end == body.Length ? body : body[..end];
+    }
+
+    public static ParsedEntry Parse(string sourceId, string key, string raw, string? language = null) =>
+        ParseMdx(sourceId, key, raw, language, false);
+
+    internal static ParsedEntry ParseMdx(string sourceId, string key, string raw, string? language, bool indexed)
     {
         key = key.Trim();
         var body = raw.Trim('\0', ' ', '\r', '\n', '\t');
         if (body.StartsWith("@@@LINK=", IgnoreCase))
         {
             // 日语词典显式给出的假名重定向键也是读音依据，保留在别名记录上。
-            var aliasReading = language == "ja" ? Kana(Lookup.Normalize(key)) : null;
+            var aliasReading = language == "ja" ? Kana(key) : null;
             var target = body[8..].Trim();
             // 新世纪部分跳转目标用了 HTML 实体，而 MDX 目标键保存实际字符。
             if (sourceId == "shinseiki") target = WebUtility.HtmlDecode(target);
@@ -279,7 +291,7 @@ internal static partial class EntryParser
             return new(head, null, null, ShogakukanChineseGloss(lines), null, []);
         }
         if (sourceId == "sanseido")
-            return Sanseido(key, body);
+            return Sanseido(key, body, indexed ? SqliteTextPrefix(raw, 2048) : null);
         if (sourceId == "shinseiki")
             return Shinseiki(key, body);
         if (sourceId == "sango")
@@ -394,9 +406,11 @@ internal static partial class EntryParser
     [GeneratedRegex(@"(?:^|>)\s*(?:\)\s*)?(?:=|(?:--›\s*)?see\b|(?<form>pt\s*(?:,|and|/)\s*pp|pt|pp|pl\.?|plural|past tense|past participle)\s+of\b)\s*(?:<b\s*>\s*)?<a\s+href\s*=\s*[""']entry://(?<word>[a-z]+(?:[ '\-][a-z]+)*)[""']", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex OxfordReference();
 
-    internal static IEnumerable<(string Part, string Gloss, Range RawSpan)> OxfordSenses(string body)
+    internal static IEnumerable<(string Part, string Gloss, Range RawSpan)> OxfordSenses(string body) =>
+        OxfordNormalizedSenses(NormalizeOxfordFormulas(body));
+
+    private static IEnumerable<(string Part, string Gloss, Range RawSpan)> OxfordNormalizedSenses(string body)
     {
-        body = NormalizeOxfordFormulas(body);
         int divDepth = 0, noteDepth = 0, fontDepth = 0, start = 0, formsEnd = 0;
         string part = "";
         bool inPhrases = false;
@@ -443,7 +457,7 @@ internal static partial class EntryParser
     {
         body = NormalizeOxfordFormulas(body);
         // 例句的中文译文只支持它紧随的主词义；进入习语、短语、用法说明后停止采样。
-        var senses = OxfordSenses(body).ToArray();
+        var senses = OxfordNormalizedSenses(body).ToArray();
         for (int i = 0; i < senses.Length; i++)
         {
             var (_, gloss, span) = senses[i];
@@ -530,7 +544,8 @@ internal static partial class EntryParser
                 int close = body.IndexOf("</span>", start, Math.Min(limit - start, 768), IgnoreCase);
                 if (close >= 0)
                 {
-                    string title = Plain(body[start..close]).Replace("7", "").Replace("'", "").Trim().ToLowerInvariant();
+                    string title = OxfordPrintedPhraseTitle(body[start..close]).Replace("7", "").Replace("'", "")
+                        .Replace("ˌ", "").Replace("ˈ", "").Trim().ToLowerInvariant();
                     string[] keys = OxfordPhraseKeys(title, parent).ToArray();
                     if (keys.Length > 0)
                     {
@@ -549,6 +564,9 @@ internal static partial class EntryParser
             marker = next;
         }
     }
+
+    // 原书的 Kingsoft 字形与旧合并卷的 Unicode 排版共用可见标题；保留重音和宾语标记以核对同名义项。
+    internal static string OxfordPrintedPhraseTitle(string html) => Plain(DecodeOxfordFont(html));
 
     [GeneratedRegex(@"<(?:div|span)\b[^>]*>\s*<b>\s*【(?<section>PHR V|IDIOMS)】|<font\b[^>]*\scolor\s*=\s*[""']?darkred(?=[""'\s>])[^>]*>\s*<b>\s*<i>|(?<title><span\s+style\s*=\s*[""']color:\s*blue;\s*font-weight:\s*bold;?[""']>\s*<font\s+color\s*=\s*[""']?red[""']?>\s*◘\s*</font>)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex OxfordPhraseMarker();
@@ -752,7 +770,7 @@ internal static partial class EntryParser
         return null;
     }
 
-    private static ParsedEntry Sanseido(string key, string body)
+    private static ParsedEntry Sanseido(string key, string body, string? indexedPrefix)
     {
         // 带汉字的索引一般在首个粗体标出假名。无粗体的假名索引可直接作为读音依据。
         var prefix = body[..Math.Min(body.Length, 380)];
@@ -770,8 +788,18 @@ internal static partial class EntryParser
         // 标题内嵌另一种拼写时继续沿用原索引键，避免将排版标签或方括号写入词头。
         var written = title.Success && !title.Groups[1].Value.Contains('<') ? WrittenForms(title.Groups[1].Value) : [];
         var head = written.Contains(key) ? key : written.FirstOrDefault() ?? key;
-        var gloss = SanseidoSense(body);
-        return new(head, reading, evidence, Preview(FirstSentence(gloss), gloss == null ? DecodePrintedScripts(body, "sanseido") : body), null,
+        // 已索引正文先按 SQLite 的码点与 NUL 规则截取原文，再使用清理过的正文兜底。
+        string sensePrefix = indexedPrefix ?? body;
+        var gloss = SanseidoSense(sensePrefix);
+        if (gloss == null && indexedPrefix != null)
+        {
+            var cleanPrefix = body.AsSpan(0, Math.Min(body.Length, 2048));
+            if (!cleanPrefix.SequenceEqual(indexedPrefix.AsSpan(0, Math.Min(indexedPrefix.Length, 2048))))
+                gloss = SanseidoSense(body);
+            sensePrefix = body;
+        }
+        var preview = Preview(FirstSentence(gloss), gloss == null ? DecodePrintedScripts(body, "sanseido") : sensePrefix);
+        return new(head, reading, evidence, preview, null,
             written.Where(s => s != head).ToArray());
     }
 
@@ -847,36 +875,209 @@ internal static partial class EntryParser
     private const string BrokenIndex = ShinseikiBrokenSub + "sup>";
     private const string BrokenExponent = "<sup>" + ShinseikiBrokenSub + "/sup>";
     // 同一词条的日中释义两次写出相同的式子。己烷的 14 后紧跟“5種”，5 不能算作氢原子数。
-    private static readonly (string Head, string Raw, string Print)[] ShinseikiFormulas =
-    [
-        ("造血薬", $"B{BrokenIndex}12", "B₁₂"),
-        ("単糖类", $"CnH{BrokenIndex}2nOn", "CₙH₂ₙOₙ"),
-        ("ソルビット", $"C{BrokenIndex}6H{BrokenIndex}14O{BrokenIndex}6", "C₆H₁₄O₆"),
-        ("ソルビン酸", $"C{BrokenIndex}5H{BrokenIndex}7COOH", "C₅H₇COOH"),
-        ("ヘキサデカン", $"C{BrokenIndex}16H{BrokenIndex}34", "C₁₆H₃₄"),
-        ("ヘキサン", $"C{BrokenIndex}6H{BrokenIndex}14", "C₆H₁₄"),
-        ("ヘキソース", $"C{BrokenIndex}6H{BrokenIndex}12O{BrokenIndex}6", "C₆H₁₂O₆"),
-        ("幂級数", $"a{BrokenIndex}0+a{BrokenIndex}1x+a{BrokenIndex}2x<sup><sub>2</sub>+</sup>a{BrokenIndex}3x<sup><sub>3</sub>+</sup>…+a{BrokenIndex}nx{BrokenExponent}n+…", "a₀+a₁x+a₂x²+a₃x³+…+aₙxⁿ+…"),
-        ("幂指数", $"a{BrokenExponent}n", "aⁿ"),
-        ("幂集合", $"2{BrokenExponent}M", "2ᴹ")
-    ];
-
-    internal static string NormalizeShinseikiFormulas(string body, string? original = null)
+    private static readonly Dictionary<string, (string Raw, string Print)> ShinseikiFormulas = new()
     {
-        if (!body.Contains(ShinseikiBrokenSub, StringComparison.Ordinal)) return body;
-        // 详情反查按原始坐标分段。片段可从中文公式起始，标题与后续闭标签仍须在完整原文中查证。
-        original ??= body;
-        foreach (var (head, raw, print) in ShinseikiFormulas)
+        ["造血薬"] = ($"B{BrokenIndex}12", "B₁₂"),
+        ["単糖类"] = ($"CnH{BrokenIndex}2nOn", "CₙH₂ₙOₙ"),
+        ["ソルビット"] = ($"C{BrokenIndex}6H{BrokenIndex}14O{BrokenIndex}6", "C₆H₁₄O₆"),
+        ["ソルビン酸"] = ($"C{BrokenIndex}5H{BrokenIndex}7COOH", "C₅H₇COOH"),
+        ["ヘキサデカン"] = ($"C{BrokenIndex}16H{BrokenIndex}34", "C₁₆H₃₄"),
+        ["ヘキサン"] = ($"C{BrokenIndex}6H{BrokenIndex}14", "C₆H₁₄"),
+        ["ヘキソース"] = ($"C{BrokenIndex}6H{BrokenIndex}12O{BrokenIndex}6", "C₆H₁₂O₆"),
+        ["幂級数"] = ($"a{BrokenIndex}0+a{BrokenIndex}1x+a{BrokenIndex}2x<sup><sub>2</sub>+</sup>a{BrokenIndex}3x<sup><sub>3</sub>+</sup>…+a{BrokenIndex}nx{BrokenExponent}n+…", "a₀+a₁x+a₂x²+a₃x³+…+aₙxⁿ+…"),
+        ["幂指数"] = ($"a{BrokenExponent}n", "aⁿ"),
+        ["幂集合"] = ($"2{BrokenExponent}M", "2ᴹ")
+    };
+
+    internal static readonly Dictionary<string, (string Reading, string First)> ShogakukanJoinedHeads = new()
+    {
+        ["中指"] = ("zhōngzhǐ", "中止"), ["噪音"] = ("zàoyīn", "噪声污染"),
+        ["承印"] = ("chéngyìn", "承修"), ["软脂"] = ("ruǎnzhī", "软炸")
+    };
+
+    private static readonly Dictionary<string, (string Raw, string Print)[]> ShinseikiScriptEdges = new()
+    {
+        ["完全平方"] = [("x<sup>２+4</sup>x+4(=(x+2)", "x<sup>２</sup>+4x+4(=(x+2)")],
+        ["オイラーの多面体の定理"] = [("a<sub>１+</sub>a<sub>２</sub>=2", "a<sub>１</sub>+a<sub>２</sub>=2")],
+        ["フェルマ予想"] = [("x<sup>n+</sup>y<sup>n</sup>=z<sup>n</sup>", "x<sup>n</sup>+y<sup>n</sup>=z<sup>n</sup>")],
+        ["指标"] = [("log<sub>1021</sub>＝1.3222", "log<sub>10</sub>21＝1.3222"),
+                    ("log<sub>1021</sub>＝1 . 3222", "log<sub>10</sub>21＝1 . 3222")],
+        ["亜硫酸塩"] = [("SO<sup>2</sup>-<sub>3</sub>", "SO<sub>3</sub><sup>2-</sup>")],
+        ["複塩"] = [("CO<sup>2</sup>-<sub>3</sub>", "CO<sub>3</sub><sup>2-</sup>"),
+                    ("CO<sub>3</sub><sup>2</sup>-", "CO<sub>3</sub><sup>2-</sup>"),
+                    ("Mg<sup>2</sup>+", "Mg<sup>2+</sup>"), ("Ca<sup>2</sup>+", "Ca<sup>2+</sup>")]
+    };
+
+    // 桌面显示和离线修订使用相同的词头与公式，旧阅读器导出的配置仍由离线端按历史快照解释。
+    internal static object ExportLayoutRules() => new
+    {
+        formulas = ShinseikiFormulas.ToDictionary(r => r.Key, r => new[] { r.Value.Raw, r.Value.Print }),
+        scriptEdges = ShinseikiScriptEdges.ToDictionary(r => r.Key, r => r.Value.Select(pair => new[] { pair.Raw, pair.Print })),
+        joinedHeadings = ShogakukanJoinedHeads.ToDictionary(r => r.Key, r => new[] { r.Value.Reading, r.Value.First })
+    };
+
+    private static string FormulaNumberBoundary(string head) => head == "ヘキサン"
+        ? @"(?=5種の异性体|(?![0-9０-９]))" : @"(?![0-9０-９])";
+
+    [GeneratedRegex("""<!--.*?(?:-->|\z)|<(?<close>/)?(?<tag>[a-z][\w:-]*)(?=[\s/>])(?<attrs>(?:"[^"]*"|'[^']*'|[^"'<>])*)>""",
+        RegexOptions.Singleline | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex MarkupToken();
+
+    [GeneratedRegex("""(?<name>[^\s=/'"<>]+)(?:\s*=\s*(?:"(?<value>[^"]*)"|'(?<value>[^']*)'|(?<value>[^\s>]+)))?""")]
+    private static partial Regex HtmlAttribute();
+
+    [GeneratedRegex("""/\*.*?(?:\*/|\z)|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'""", RegexOptions.Singleline)]
+    private static partial Regex CssCommentOrString();
+
+    [GeneratedRegex(@"(?:^|;)\s*(?<name>display|visibility)\s*:\s*(?<value>[a-z-]+)\s*(?<priority>!\s*important)?\s*(?=;|$)",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex DisplayDeclaration();
+
+    private static void ApplyVisibility(string attributes, ref bool blocked, ref bool invisible)
+    {
+        // HTML 重复属性以首个为准，后写的 class/style 不能覆盖页面实际使用的属性。
+        bool sawClass = false, sawStyle = false;
+        foreach (Match attribute in HtmlAttribute().Matches(attributes))
         {
-            if (!body.Contains(raw, StringComparison.Ordinal) || !ShinseikiTitle().Matches(original)
-                .Any(title => title.Groups["word"].Value == head || title.Groups["form"].Value == head)) continue;
-            // 三个数学词还把公式后的一整句包进上标。只有这一句直接在 span 末尾闭合才恢复原来的基线。
-            body = raw.Contains(BrokenExponent, StringComparison.Ordinal)
-                ? Regex.Replace(body, Regex.Escape(raw) + @"(?<sentence>[^<>]*)</sup>(?=</span>|\z)", match =>
-                    original.Contains(match.Value + "</span>", StringComparison.Ordinal) ? print + match.Groups["sentence"].Value : match.Value)
-                : body.Replace(raw, print, StringComparison.Ordinal);
+            string name = attribute.Groups["name"].Value;
+            if (name.Equals("hidden", IgnoreCase)) { blocked = true; return; }
+            if (name.Equals("class", IgnoreCase))
+            {
+                if (sawClass) continue;
+                sawClass = true;
+            }
+            else if (name.Equals("style", IgnoreCase))
+            {
+                if (sawStyle) continue;
+                sawStyle = true;
+            }
+            else continue;
+            string value = WebUtility.HtmlDecode(attribute.Groups["value"].Value);
+            if (name.Equals("class", IgnoreCase) && value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+                .Any(c => c is "es-label" or "es-client-target")) { blocked = true; return; }
+            if (!name.Equals("style", IgnoreCase)) continue;
+            // 同一属性按声明次序和 !important 决定，注释和引号内的 CSS 示例不算作声明。
+            var styles = new Dictionary<string, (bool Important, string Value)>(StringComparer.OrdinalIgnoreCase);
+            foreach (Match declaration in DisplayDeclaration().Matches(CssCommentOrString().Replace(value,
+                         m => m.Value.StartsWith("/*", StringComparison.Ordinal) ? "" : "_")))
+            {
+                string property = declaration.Groups["name"].Value;
+                bool important = declaration.Groups["priority"].Success;
+                if (important || !styles.TryGetValue(property, out var old) || !old.Important)
+                    styles[property] = (important, declaration.Groups["value"].Value);
+            }
+            if (styles.TryGetValue("display", out var display) && display.Value.Equals("none", IgnoreCase)) { blocked = true; return; }
+            if (styles.TryGetValue("visibility", out var visibility))
+                invisible = visibility.Value.ToLowerInvariant() switch {
+                    "hidden" or "collapse" => true, "visible" or "initial" => false, _ => invisible
+                };
         }
-        return body;
+    }
+
+    internal static bool[] VisibleMarkupPositions(string html)
+    {
+        // 只标记可见文本和真实标签起点。校勘仍在原始 UTF-16 坐标上操作，隐藏内容及带引号的属性不参与匹配。
+        var visible = new bool[html.Length];
+        var stack = new List<(string Tag, bool Blocked, bool Invisible)>();
+        bool Hidden() => stack.Count != 0 && (stack[^1].Blocked || stack[^1].Invisible);
+        int previous = 0;
+        while (MarkupToken().Match(html, previous) is { Success: true } token)
+        {
+            if (!Hidden()) Array.Fill(visible, true, previous, token.Index - previous);
+            previous = token.Index + token.Length;
+            if (!token.Groups["tag"].Success) continue;
+            string tag = token.Groups["tag"].Value.ToLowerInvariant();
+            bool closing = token.Groups["close"].Success;
+            if (closing)
+            {
+                visible[token.Index] = !Hidden();
+                int at = stack.FindLastIndex(parent => parent.Tag == tag);
+                if (at >= 0) stack.RemoveRange(at, stack.Count - at);
+                continue;
+            }
+            bool rawText = tag is "script" or "style" or "iframe" or "textarea" or "title" or "xmp";
+            if (rawText)
+            {
+                // 原始文本中的注释或带引号的伪标签不能吞掉真正的结束标签及其后的可见词义。
+                string close = "</" + tag;
+                for (;;)
+                {
+                    int at = html.IndexOf(close, previous, IgnoreCase);
+                    if (at < 0) { previous = html.Length; break; }
+                    previous = at + close.Length;
+                    if (previous == html.Length || !(html[previous] is '>' or '/' || char.IsWhiteSpace(html[previous]))) continue;
+                    var terminator = MarkupToken().Match(html, at, html.Length - at);
+                    if (terminator.Index == at && terminator.Success && terminator.Groups["tag"].Value.Equals(tag, IgnoreCase))
+                    {
+                        previous = at + terminator.Length;
+                        break;
+                    }
+                }
+                continue;
+            }
+            // display:none 与模板会阻断整棵子树；visibility 是可由子元素重设的继承属性。
+            bool blocked = tag is "template" or "noscript" || stack.Count != 0 && stack[^1].Blocked;
+            bool invisible = stack.Count != 0 && stack[^1].Invisible;
+            if (!blocked) ApplyVisibility(token.Groups["attrs"].Value, ref blocked, ref invisible);
+            visible[token.Index] = !blocked && !invisible;
+            if (tag is not ("area" or "base" or "br" or "col" or "embed" or "hr" or "img" or "input" or "link" or
+                            "meta" or "param" or "source" or "track" or "wbr")) stack.Add((tag, blocked, invisible));
+        }
+        if (!Hidden()) Array.Fill(visible, true, previous, html.Length - previous);
+        return visible;
+    }
+
+    internal static string NormalizeShinseikiFormulas(string body, string? original = null, int offset = 0, bool repairEdges = true)
+    {
+        if (!body.Contains("<su", StringComparison.Ordinal)) return body;
+        bool broken = body.Contains(ShinseikiBrokenSub, StringComparison.Ordinal);
+        bool edges = repairEdges && ShinseikiScriptEdges.Values.Any(rows => rows.Any(row => body.Contains(row.Raw, StringComparison.Ordinal)));
+        if (!broken && !edges) return body;
+        // 用原文坐标验证所在词头、后续数字和闭标签，再把替换映射回当前高亮片段。
+        original ??= body;
+        var visible = VisibleMarkupPositions(original);
+        var titles = ShinseikiTitle().Matches(original).Where(m => visible[m.Index]).ToArray();
+        var edits = new List<(int Index, int Length, string Value)>();
+        void AddEdges((string Raw, string Print)[] rows, int start, int end)
+        {
+            foreach (var (raw, print) in rows)
+            {
+                for (int at = start; at < end;)
+                {
+                    int pos = original.IndexOf(raw, at, end - at, StringComparison.Ordinal);
+                    if (pos < 0) break;
+                    if (visible[pos] && pos + raw.Length <= offset + body.Length) edits.Add((pos, raw.Length, print));
+                    at = pos + raw.Length;
+                }
+            }
+        }
+        // 某些旧词身只保存没有题头的正文片段；保留它们已支持的精确校勘。含题头时则逐篇限制规则。
+        if (edges && titles.Length == 0 && !original.Contains("<h1", IgnoreCase))
+            foreach (var rows in ShinseikiScriptEdges.Values) AddEdges(rows, offset, offset + body.Length);
+        for (int i = 0; i < titles.Length; i++)
+        {
+            Match title = titles[i];
+            int start = Math.Max(offset, title.Index + title.Length);
+            int end = i + 1 < titles.Length ? titles[i + 1].Index : original.Length;
+            if (start >= end || start >= offset + body.Length || end <= offset) continue;
+            string head = title.Groups["form"].Value;
+            if (!ShinseikiFormulas.ContainsKey(head) && !ShinseikiScriptEdges.ContainsKey(head)) head = title.Groups["word"].Value;
+            if (edges && ShinseikiScriptEdges.TryGetValue(head, out var rows)) AddEdges(rows, start, end);
+            if (!broken || !ShinseikiFormulas.TryGetValue(head, out var rule) || !body.Contains(rule.Raw, StringComparison.Ordinal)) continue;
+            string suffix = rule.Raw.Contains(BrokenExponent, StringComparison.Ordinal)
+                ? @"(?<sentence>[^<>]*)</sup>(?=</span>)" : FormulaNumberBoundary(head);
+            var pattern = new Regex(Regex.Escape(rule.Raw) + suffix);
+            for (var m = pattern.Match(original, start, end - start); m.Success; m = m.NextMatch())
+            {
+                if (m.Index + m.Length > offset + body.Length) break;
+                if (visible[m.Index]) edits.Add((m.Index, m.Length, rule.Print + m.Groups["sentence"].Value));
+            }
+        }
+        if (edits.Count == 0) return body;
+        var result = new StringBuilder(body);
+        foreach (var edit in edits.OrderByDescending(e => e.Index))
+            result.Remove(edit.Index - offset, edit.Length).Insert(edit.Index - offset, edit.Value);
+        return result.ToString();
     }
 
     internal static string ShinseikiDisplayGloss(string head, string gloss)
@@ -885,9 +1086,8 @@ internal static partial class EntryParser
         // 两条旧摘要误收了原书的半截注释；其余字面示例仍保留。
         if (head == "後唐" && gloss.EndsWith("后被其重臣石敬塘所灭。<!--", StringComparison.Ordinal)
             || head == "新興" && gloss == "新しく勢いが盛んになること。新たに興ること。<!--") return gloss[..^4];
-        if (gloss.Contains("sup>", StringComparison.Ordinal))
-            foreach (var rule in ShinseikiFormulas)
-                if (head == rule.Head) return gloss.Replace(Plain(rule.Raw), rule.Print, StringComparison.Ordinal);
+        if (gloss.Contains("sup>", StringComparison.Ordinal) && ShinseikiFormulas.TryGetValue(head, out var rule))
+            return Regex.Replace(gloss, Regex.Escape(Plain(rule.Raw)) + FormulaNumberBoundary(head), rule.Print);
         return gloss;
     }
 
@@ -915,7 +1115,7 @@ internal static partial class EntryParser
 
     private static ParsedEntry Shinseiki(string key, string body, bool printScripts = true)
     {
-        body = NormalizeShinseikiFormulas(body);
+        body = NormalizeShinseikiFormulas(body, repairEdges: printScripts);
         var title = ShinseikiTitle().Match(body, 0, Math.Min(body.Length, 1536));
         string display = key;
         string? reading = Kana(key);
@@ -956,7 +1156,7 @@ internal static partial class EntryParser
             if (string.IsNullOrWhiteSpace(sense))
                 sense = ReadSense(body[start..(divider >= 0 ? divider : end)]);
         }
-        string ReadSense(string segment) => Plain(printScripts ? DecodePrintedScripts(RepairShinseikiScriptBoundaries(segment), "shinseiki") : segment);
+        string ReadSense(string segment) => Plain(printScripts ? DecodePrintedScripts(segment, "shinseiki") : segment);
         // 少数原条目只给参见或标音，甚至留下空的义项标签；仍展示原书能确定的内容。
         if (string.IsNullOrWhiteSpace(sense)) sense = Between(body, "<p class=\"cat-unit\">", "</p>");
         if (string.IsNullOrWhiteSpace(sense) && reading != null) sense = "原书注音 " + reading;
@@ -1031,8 +1231,8 @@ internal static partial class EntryParser
                 start = open + "<span>".Length;
                 int close = body.LastIndexOf("</span>", limit - 1, limit - start, IgnoreCase);
                 if (close <= start) continue;
-                var segment = NormalizeShinseikiFormulas(body[start..close], body);
-                string gloss = Plain(DecodePrintedScripts(RepairShinseikiScriptBoundaries(segment), "shinseiki"));
+                var segment = NormalizeShinseikiFormulas(body[start..close], body, start);
+                string gloss = Plain(DecodePrintedScripts(segment, "shinseiki"));
                 if (gloss.Length == 0) continue;
                 // Span 始终使用原 HTML 的 UTF-16 偏移，sup/sub、实体与中文标点留给详情视图统一转换。
                 yield return (gloss, start..close, "", "");
@@ -1169,10 +1369,9 @@ internal static partial class EntryParser
 
     private static string? Kana(string text)
     {
-        var cleaned = text.Replace("・", "").Replace("－", "").Trim();
-        return cleaned.Length > 0 && cleaned.All(c =>
-            c is >= 'ぁ' and <= 'ゖ' or >= 'ァ' and <= 'ヺ' or 'ー' or 'ゝ' or 'ゞ' or 'ヽ' or 'ヾ')
-            ? cleaned : null;
+        // 部分 MDX 把外来语分隔点写成半角；只移除分隔符，保留原书读音的宽度与拼写。
+        var cleaned = text.Replace("・", "").Replace("･", "").Replace("－", "").Trim();
+        return Lookup.IsKana(cleaned) ? cleaned : null;
     }
 
     private static string[] WrittenForms(string heading)
@@ -1196,19 +1395,6 @@ internal static partial class EntryParser
         var sample = html[..Math.Min(limit, html.Length)];
         return BlockBreak().Replace(sample, "\n").Split(['\r', '\n'])
             .Select(Plain).Where(s => s.Length > 0).ToArray();
-    }
-
-    internal static string RepairShinseikiScriptBoundaries(string html)
-    {
-        if (!html.Contains("<su", StringComparison.Ordinal)) return html;
-        // 日中两栏都给出完整公式。还原误入上下标的运算符、对数的真数及两种酸根的电荷位置。
-        return html.Replace("x<sup>２+4</sup>x+4(=(x+2)", "x<sup>２</sup>+4x+4(=(x+2)", StringComparison.Ordinal)
-            .Replace("a<sub>１+</sub>a<sub>２</sub>=2", "a<sub>１</sub>+a<sub>２</sub>=2", StringComparison.Ordinal)
-            .Replace("x<sup>n+</sup>y<sup>n</sup>=z<sup>n</sup>", "x<sup>n</sup>+y<sup>n</sup>=z<sup>n</sup>", StringComparison.Ordinal)
-            .Replace("log<sub>1021</sub>＝1.3222", "log<sub>10</sub>21＝1.3222", StringComparison.Ordinal)
-            .Replace("log<sub>1021</sub>＝1 . 3222", "log<sub>10</sub>21＝1 . 3222", StringComparison.Ordinal)
-            .Replace("SO<sup>2</sup>-<sub>3</sub>", "SO<sub>3</sub><sup>2-</sup>", StringComparison.Ordinal)
-            .Replace("CO<sup>2</sup>-<sub>3</sub>", "CO<sub>3</sub><sup>2-</sup>", StringComparison.Ordinal);
     }
 
     [GeneratedRegex("""<(?<tag>su[bp])>(?<value>[-+0-9０-９－A-Za-zθ]+)</\k<tag>>""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]

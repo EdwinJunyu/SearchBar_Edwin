@@ -508,7 +508,22 @@ def compatibility_entries(books, control_report):
     return out
 
 
-def compare_reachability(stage, original_indexes, produced_indexes, only_volume=None, compatibility=None):
+def compare_reachability(stage, original_indexes, produced_indexes, only_volume=None, compatibility=None,
+                         books=None, render_dbs=None):
+    from merge_dictionaries import render_db_path, verified_render_inputs
+    volumes = [only_volume] if only_volume else ORDER
+    has_build_audit = books is not None and ((books / "audit.json").exists() or
+                                              any((books / f"audit-{v}.json").exists() for v in volumes))
+    if has_build_audit:
+        ledger = json.loads((stage / "stage.json").read_text("utf-8"))
+        selected = verified_render_inputs(stage, books, volumes, ledger, render_dbs)
+        paths = {v: path for v, (path, _) in selected.items()}
+    else:
+        # 历史只读命令没有归档可供对照，必须能唯一定位对应卷，物理词头仍由下方独立索引逐一核实。
+        paths = {v: render_db_path(stage, v, explicit=(render_dbs or {}).get(v)) for v in volumes}
+    delivered_manifest = None
+    if books is not None and not has_build_audit:
+        delivered_manifest = json.loads((books / "E_search-merge.json").read_text("utf-8"))
     coarse = coarse_fold_function()
     compatibility = compatibility or {}
     originals, products = index_files_by_count(original_indexes),index_files_by_count(produced_indexes)
@@ -528,15 +543,25 @@ def compare_reachability(stage, original_indexes, produced_indexes, only_volume=
                 flags[source], row = indexed_physical_flags(originals[n],n,keys,coarse)
                 index_result["source"][source] = row
                 print(f"原版索引 {source} 可直接检索 {row['reachable_records']:,}/{n:,}",flush=True)
-            article_path = stage/f"book-{volume}-render.sqlite3"
+            article_path = paths[volume]
             with closing(sqlite3.connect(article_path.resolve().as_uri()+"?mode=ro",uri=True)) as built:
                 aliases = {k:r for (v,k),r in compatibility.items() if v==volume}
                 extra = [(k,1) for k in aliases if not built.execute("SELECT 1 FROM article WHERE head=?",(k,)).fetchone()]
                 def product_rows():
                     return heapq.merge(built.execute("SELECT head,helper FROM article ORDER BY head"),sorted(extra))
+                if delivered_manifest is not None:
+                    from mdict_io import read_entries
+                    archive = books / f"E_search-{volume}.mdx"
+                    ensure(file_hash(archive).lower() == delivered_manifest["files"][archive.name].lower(),
+                           f"成品 MDX 的哈希与清单不同：{archive}")
+                    # 成品可能已单独清洗可见正文。可达性只依赖物理词头次序和辅助页身份。
+                    physical = ((head, int(body.startswith(b"<!--ESHELP1-->"))) for _, head, body in read_entries(archive))
+                    ensure(all(a == b for a, b in itertools.zip_longest(product_rows(), physical)),
+                           f"成品词头或辅助页顺序与渲染库不同：{article_path}")
                 count = built.execute("SELECT count(*) FROM article").fetchone()[0]+len(extra)
                 keys = (r[0] for r in product_rows())
                 new, row = indexed_physical_flags(products[count],count,keys,coarse)
+                row["render_database"] = str(article_path)
                 index_result["merged"][volume] = row
                 source_cursors = [db.execute("SELECT head,source,ordinal FROM orig WHERE source=? ORDER BY head,ordinal",(s,))
                                   for s in sources]
@@ -725,7 +750,6 @@ def self_check_archive():
 class Audit:
     def __init__(self, db, root, inventory, lookup_profile="legacy"):
         self.db, self.root, self.inventory = db, root, inventory
-        self.lookup_profile = lookup_profile
         self.normalized_targets = {}
         self.alternatives, self.actual_fragment_targets = {}, {}
         self.fragment_stats, self.es_stats = Counter(), Counter()
@@ -1617,6 +1641,7 @@ def main():
     parser.add_argument("--lookup-profile", choices=("legacy","goldendict"), default="goldendict")
     parser.add_argument("--stage",type=Path)
     parser.add_argument("--books",type=Path)
+    parser.add_argument("--render-db", nargs=2, action="append", metavar=("VOLUME", "PATH"))
     parser.add_argument("--output",type=Path)
     parser.add_argument("--source-root",type=Path)
     parser.add_argument("--es-original-index",type=Path)
@@ -1647,8 +1672,10 @@ def main():
     if args.compare_index_reachability:
         if not all((args.stage,args.goldendict_index_dir,args.merged_index_dir,args.output)):
             parser.error("索引可达性核查需要 --stage --goldendict-index-dir --merged-index-dir --output")
+        from merge_dictionaries import render_db_options
         data = compare_reachability(args.stage,args.goldendict_index_dir,args.merged_index_dir,args.volume,
-                                    compatibility_entries(args.books,args.control_index_report))
+                                    compatibility_entries(args.books,args.control_index_report), args.books,
+                                    render_db_options(args.render_db))
         args.output.write_text(json.dumps(data,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
         return
     if args.self_test:

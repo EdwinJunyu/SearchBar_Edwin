@@ -80,9 +80,9 @@ static void RunDesktop(string? id, string? mergedDatabase = null)
             if (requested is null or "zh-en" or "zh-ja") return requested;
             var source = Source.All.FirstOrDefault(s => s.Id == requested);
             if (source != null && (!source.Optional || !File.Exists(databasePath))) return requested;
-            using var catalog = new DictionaryStore(databasePath, readOnly: File.Exists(databasePath));
+            using var catalog = DictionaryStore.OpenCatalog(databasePath);
             if (source != null) return catalog.InstalledId(source);
-            if (!catalog.ListDictionaries().Any(d => d.Id == requested))
+            if (!catalog.HasDictionary(requested))
                 throw new ArgumentException($"未知词典 {requested}");
             return requested;
         }
@@ -239,7 +239,9 @@ if (args is ["--version"] or ["version"])
     var assembly = typeof(Source).Assembly;
     var build = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion;
     Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new {
-        version = build.Split('+')[0], build, supportedDictionaries = Source.All.Select(source => source.Id)
+        version = build.Split('+')[0], build, supportedDictionaries = Source.All.Select(source => source.Id),
+        // 离线复建工具保有历史来源快照，跨端回归直接对照实际阅读器使用的文件名及卷归属。
+        mergeSources = Source.All.ToDictionary(s => s.Id, s => new { filename = s.RelativePath, volume = s.MergeGroup })
     }));
     return 0;
 }
@@ -298,7 +300,7 @@ try
     {
         if (id is "zh-en" or "zh-ja") return id;
         if (Source.All.FirstOrDefault(s => s.Id == id) is { } source) return store.InstalledId(source);
-        if (store.ListDictionaries().Any(d => d.Id == id)) return id;
+        if (store.HasDictionary(id)) return id;
         throw new ArgumentException($"未知词典 {id}");
     }
     void ImportMdx(DictionaryStore store, Source source, string path)
@@ -323,7 +325,8 @@ try
             var rules = Source.All.ToDictionary(s => s.Id, s => EntryParser.DisplayReplacements(s.Id)
                 .Select(pair => new[] { pair.Before, pair.After }).ToArray());
             Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new {
-                rules, kingsoft = new[] { EntryParser.KingsoftAlphabet, EntryParser.KingsoftUnicode }
+                rules, kingsoft = new[] { EntryParser.KingsoftAlphabet, EntryParser.KingsoftUnicode },
+                layout = EntryParser.ExportLayoutRules()
             }));
             break;
         }
@@ -338,10 +341,8 @@ try
         case ["pack-ja",_,_] or ["pack-volume","zh-en" or "zh-ja",_,_]:
         {
             string input = args[^2], output = args[^1];
-            using var source = File.OpenRead(input);
-            string hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(source));
             // 旧命令保留独立块格式，新版发布时只对日语卷使用跨块压缩。
-            MdxReader.PackDelivery(input, output, hash, groupBlocks: args is ["pack-volume","zh-ja",_,_]);
+            MdxReader.PackDelivery(input, output, groupBlocks: args is ["pack-volume","zh-ja",_,_]);
             break;
         }
         case ["restore-ja" or "restore-volume",var packed,var restored,var expectedHash]:
@@ -456,7 +457,7 @@ try
                 break;
             }
             IReadOnlyList<LookupHit> hits;
-            if (args[0] == "reverse" && ReverseEncoder.IsInstalled)
+            if (args[0] == "reverse" && ReverseEncoder.CanOpen(ReverseEncoder.ModelDirectory))
             {
                 try
                 {

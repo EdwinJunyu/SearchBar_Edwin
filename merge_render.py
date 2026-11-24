@@ -4,6 +4,7 @@ from functools import lru_cache
 from hashlib import sha256
 import html
 from html.parser import HTMLParser
+from bisect import bisect_left
 from itertools import groupby
 from pathlib import Path
 import posixpath
@@ -171,8 +172,13 @@ _INVISIBLE = frozenset('script style template noscript title iframe textarea xmp
 
 
 _HOMOPHONE_HEADING = re.compile(r'\A(<br><font color=black>[^<>\r\n]+?)&\+\{([1-9][0-9]?)\}(?=\r?\n<br><font color=)')
-_HIDDEN_MARKUP = re.compile(r'<(?:script|template|textarea|noscript|iframe)\b|<[^<>]+\shidden\b|'
-                            r'\b(?:display\s*:\s*none|visibility\s*:\s*hidden)\b', re.I)
+_CSS_LITERALS = re.compile(r"""/\*.*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|url\([^)]*\)""", re.I | re.S)
+_VISIBILITY_DECLARATION = re.compile(r'(display|visibility)\s*:\s*([a-z-]+(?:\s+[a-z-]+)*)\s*(!\s*important)?')
+_DISPLAY_VALUES = frozenset(('none contents block inline run-in flow flow-root table flex grid ruby list-item '
+                             'table-row-group table-header-group table-footer-group table-row table-cell '
+                             'table-column-group table-column table-caption ruby-base ruby-text ruby-base-container '
+                             'ruby-text-container inline-block inline-table inline-flex inline-grid inherit initial '
+                             'revert revert-layer unset').split())
 _PRESERVE_BLOCK = re.compile(r'<!--.*?-->|<style\b[^>]*>.*?</style>', re.I | re.S)
 _PRINTED_BLUE = '<font color=“#0000FF”>'
 _TRAILING_BREAKS = re.compile(r'(?:<br>){4,}(?=</font>\s*\Z)')
@@ -195,7 +201,7 @@ def _sanseido_typography(fragment):
     return fragment
 
 
-def repair_merged_layout(payload):
+def repair_merged_layout(payload, layout=None, *, hints=None):
     """只在本合并器生成的单一来源分区内修复已核对的排版。隐藏原文直接按字节复制。"""
     if not payload.startswith((b"<!--ESMERGE1:", b"<!--ESHELP1-->")):
         return payload
@@ -203,7 +209,8 @@ def repair_merged_layout(payload):
     if boundary < 0:
         return payload
     start = boundary + 3
-    hints = (b"&+{", _PRINTED_BLUE.encode(), b"<br><br><br><br>") + ENGLISH_LAYOUT_HINTS + JAPANESE_LAYOUT_HINTS
+    if hints is None:
+        hints = layout_hints(layout) if layout is not None else HISTORICAL_LAYOUT_HINTS
     if not any(payload.find(hint, start) >= 0 for hint in hints):
         return payload
     page = payload[start:].decode("utf-8")
@@ -225,14 +232,12 @@ def repair_merged_layout(payload):
             return payload
         end -= len("</div>")
         fragment = page[section.end():end]
-        if _HIDDEN_MARKUP.search(fragment):
-            continue
         if source == "sango":
             fixed = _HOMOPHONE_HEADING.sub(r'\1〔\2〕', fragment)
         elif source in ("hanying", "oxford"):
             fixed = repair_english_display(fragment, source)
         else:
-            fixed = repair_japanese_display(source, fragment)
+            fixed = repair_japanese_display(source, fragment, layout)
             if source == "sanseido" and (_PRINTED_BLUE in fixed or '<br><br><br><br>' in fixed):
                 fixed = _sanseido_typography(fixed)
         if fixed == fragment:
@@ -382,7 +387,8 @@ class _DisplayPage(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         source = self.stack[-1][1] if self.stack else None
-        values = dict(attrs)
+        # 浏览器保留起始标签中首次出现的属性；HTMLParser 会把重复项全部返回。
+        values = dict(reversed(attrs))
         classes = (values.get("class") or "").split()
         pos = self.source_index()
         if tag == "div" and "es-source" in classes:
@@ -394,9 +400,10 @@ class _DisplayPage(HTMLParser):
                 if all(origin == section[1] for origin in anchors):
                     source = section[1]
                     self.body_start, self.native_alias = section.end(), False
-        if tag in _INVISIBLE or "hidden" in values or "es-label" in classes or "es-client-target" in classes:
+        excluded, visible = _element_visibility(tag, values, classes, not self.stack or self.stack[-1][2])
+        if excluded:
             source = None
-        if tag == "font" and source == "oxford" and self.cleaner.kingsoft:
+        if visible and tag == "font" and source == "oxford" and self.cleaner.kingsoft:
             match = _PHONETIC.match(self.page, pos)
             if match and all(ch in self.cleaner.kingsoft for ch in match["text"]):
                 # 只替换这种已校对字体的完整单文字节点。改用 Unicode 字体可避免客户端二次转写。
@@ -404,7 +411,7 @@ class _DisplayPage(HTMLParser):
                 self.edits.append((*match.span("face"), "Segoe UI, sans-serif"))
                 self.edits.append((*match.span("text"), decoded))
                 source = None
-        if tag == "a" and source == "shinseiki":
+        if visible and tag == "a" and source == "shinseiki":
             # 生成器的首个别名直接在署名后；别名链只在随后直属的无属性 div 中展开。
             first = pos == self.body_start
             nested = self.native_alias and len(self.stack) == 2 and self.page.startswith("<div>", pos - 5)
@@ -422,7 +429,7 @@ class _DisplayPage(HTMLParser):
                         self.edits.append((*match.span(2), self.cleaner.replace_text(source, fixed)))
                         source = None
         if tag not in _VOID:
-            self.stack.append((tag, source))
+            self.stack.append((tag, source, visible))
 
     def handle_endtag(self, tag):
         for i in range(len(self.stack) - 1, -1, -1):
@@ -435,7 +442,7 @@ class _DisplayPage(HTMLParser):
         self.handle_starttag(tag, attrs)
 
     def mark(self, length):
-        if self.stack and (source := self.stack[-1][1]):
+        if self.stack and self.stack[-1][2] and (source := self.stack[-1][1]):
             a = self.source_index()
             if self.spans and self.spans[-1][1:] == [a, source]:
                 self.spans[-1][1] += length
@@ -617,6 +624,7 @@ class Tags(HTMLParser):
 class Renderer:
     def __init__(self, connection, resource_keys, styles=None):
         self.db = connection
+        self._has_native_table = None
         self.resources = {(source,path_key(old)):path_key(new) for source, paths in resource_keys.items() for old,new in paths.items()}
         self.styles = {k:scoped_css(k[0],v) for k,v in (styles or {}).items()}
         self.stats = Counter()
@@ -695,7 +703,11 @@ class Renderer:
     def native_reference(self, source, ordinal, target, pos):
         url, gd = self.reference(source,ordinal,pos,target)
         app_link = ""
-        if source == "shinseiki" and self.db.execute("SELECT 1 FROM sqlite_master WHERE name='render_es_native'").fetchone():
+        # 原生跳转表可在构造后建立，首次处理新世纪跳转时才探测。
+        if source == "shinseiki" and self._has_native_table is None:
+            self._has_native_table = bool(self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='render_es_native'").fetchone())
+        if source == "shinseiki" and self._has_native_table:
             row = self.db.execute("SELECT term,targets FROM render_es_native WHERE source=? AND ordinal=?",(source,ordinal)).fetchone()
             if row:
                 term, records = row
@@ -745,7 +757,7 @@ class Renderer:
             self.logging = previous
         return "".join(out)
 
-    def article(self, key, members):
+    def article(self, members):
         css, parts, handled = set(), [], set()
         # 纯文字使用相同的显式渲染，无资源/标记依赖。某一来源有重复实体时整类均不共享。
         plain = {}
@@ -780,7 +792,7 @@ class Renderer:
             # 公开页已经收集所有来源引用。辅助页保留同一源的所有同名落点及原序。
             for key, (source, ordinals) in sorted(self.helpers_by_key.items()):
                 members = [self.record(source,n) for n in ordinals]
-                yield key, "<!--ESHELP1-->" + self.article(key,members)
+                yield key, "<!--ESHELP1-->" + self.article(members)
         finally:
             self.logging = previous
 
@@ -795,9 +807,10 @@ _JA_COPIED_LINK = re.compile(
     r'(?P<label>(?:[^"<>]|<font color="#008000">[^"<>]*</font>)+)</a>')
 _JA_EMPTY_EXAMPLE = '<p><font color=green>例：</font></>'
 _JA_JOINED = re.compile(re.escape(_JA_EMPTY_EXAMPLE) +
-    r'(?=\r?\n(?P<second>中指|噪音|承印|软脂)  \r?\n<br>(?P<reading>[^<>\s]+)<font color=red>【(?P=second)】</font>)')
-_JA_FIRST_HEADING = {('中指','zhōngzhǐ'):'中止', ('噪音','zàoyīn'):'噪声污染',
-                     ('承印','chéngyìn'):'承修', ('软脂','ruǎnzhī'):'软炸'}
+    r'(?=\r?\n(?P<second>[^<>\s]+)  \r?\n<br>(?P<reading>[^<>\s]+)<font color=red>【(?P=second)】</font>)')
+# 「承修」「软炸」在第一篇正文内另有红色補足栏；带注音的真正词头仍须形成边界。
+_JA_JOIN_BOUNDARIES = re.compile(r'(?P<note><p><font color=red>【補足】</font>)|<div class="es-target">|<font color=red>【')
+_JA_ARTICLE_BOUNDARIES = re.compile(r'<div class="(wrap-switch|ncdata-sense)">')
 _JA_ANGSTROM = ('<h1><span class="word">⇒</span><!-- --><!-- --><!-- --></h1></div>'
                 '<div class="ncdata-body">[<span class="unabbrev">angstrom</span>]')
 _JA_GREBE = re.compile(r'(<span>カイツブリの古名。</span>(?:<!-- -->)*<span class="divide-imgs">'
@@ -827,15 +840,24 @@ _JA_SCRIPT_EDGES = {
              ('CO<sub>3</sub><sup>2</sup>-','CO<sub>3</sub><sup>2-</sup>'),
              ('Mg<sup>2</sup>+','Mg<sup>2+</sup>'), ('Ca<sup>2</sup>+','Ca<sup>2+</sup>')],
 }
+# 1b273e7 的导出文件只含字面校勘与音标。回放旧包使用当时的词表，新规则取自当前阅读器导出。
+HISTORICAL_LAYOUT = {
+    'formulas': {head: [raw.replace('@', _JA_BAD_INDEX).replace('^', _JA_BAD_POWER), printed]
+                 for head, (raw, printed) in _JA_FORMULA.items()},
+    'joinedHeadings': {'中指': ['zhōngzhǐ', '中止'], '噪音': ['zàoyīn', '噪声污染'],
+                       '承印': ['chéngyìn', '承修'], '软脂': ['ruǎnzhī', '软炸']},
+    'scriptEdges': {head: [list(pair) for pair in pairs] for head, pairs in _JA_SCRIPT_EDGES.items()},
+}
 JAPANESE_LAYOUT_HINTS = (
     b'<sub><</sub>', _JA_EMPTY_EXAMPLE.encode(), _JA_ANGSTROM.encode(), '⇒?的古名。'.encode(),
-    *(before.encode() for pairs in _JA_SCRIPT_EDGES.values() for before, _ in pairs),
     *(f'{digit}"#008000">'.encode() for digit in '0123456789abcdef'),
 )
 
 
-def repair_japanese_display(source, fragment):
+def repair_japanese_display(source, fragment, layout=None):
     """只改指定来源段的展示副本；保留 MDX 词头、真实链接目标和所有未举证的占位符。"""
+    if layout is None:
+        layout = HISTORICAL_LAYOUT
     edits = []
     if source == 'sanseido' and '"#008000">' in fragment:
         for match in _JA_COPIED_LINK.finditer(fragment):
@@ -847,13 +869,14 @@ def repair_japanese_display(source, fragment):
                 if sha256(prefix.encode()).hexdigest() == match['digest']:
                     edits.append((match.start(), match.end(), match['link'] + '>' + label + '</a>', 'tag', ()))
     elif source == 'shogakukan-zhja' and _JA_EMPTY_EXAMPLE in fragment:
+        markers = _visible_tag_matches(fragment, _JA_JOIN_BOUNDARIES)
+        positions = [m.start() for m in markers if not m['note']]
         for match in _JA_JOINED.finditer(fragment):
-            first = _JA_FIRST_HEADING.get((match['second'], match['reading']))
-            if first:
-                boundary = max(0, fragment.rfind('<div class="es-target">', 0, match.start()))
-                heading = fragment.rfind(f'<font color=red>【{first}】</font>', boundary, match.start())
-                if heading >= 0:
-                    edits.append((match.start(), match.end(), '<p>', 'tag', (heading,)))
+            pair = layout['joinedHeadings'].get(match['second'])
+            if pair and match['reading'] == pair[0]:
+                index = bisect_left(positions, match.start()) - 1
+                if index >= 0 and fragment.startswith(f'<font color=red>【{pair[1]}】</font>', positions[index]):
+                    edits.append((match.start(), match.end(), '<p>', 'tag', ()))
     elif source == 'shinseiki':
         for match in re.finditer(re.escape(_JA_ANGSTROM), fragment):
             edits.append((match.start(), match.end(), _JA_ANGSTROM.replace('⇒','Å'), 'tag', ()))
@@ -861,7 +884,7 @@ def repair_japanese_display(source, fragment):
             for match in _JA_GREBE.finditer(fragment):
                 edits.append((match.start(), match.end(), match.expand(r'\1䴙䴘的古名。\2'), 'tag', ()))
         if '<su' in fragment:
-            _japanese_formula_edits(fragment, edits)
+            _japanese_formula_edits(fragment, edits, layout['formulas'], layout['scriptEdges'])
     if not edits:
         return fragment
 
@@ -875,19 +898,26 @@ def repair_japanese_display(source, fragment):
     return fragment
 
 
-def _japanese_formula_edits(fragment, edits):
+def _japanese_formula_edits(fragment, edits, formulas, script_edges):
     # 同页可有数个同音词或别名落点。公式必须出现在相应题头之后、本篇释义之内。
-    starts = [m.start() for m in re.finditer('<div class="wrap-switch">', fragment)] + [len(fragment)]
+    if not any(head in fragment for head in formulas) and not any(head in fragment for head in script_edges):
+        return
+    markers = _visible_tag_matches(fragment, _JA_ARTICLE_BOUNDARIES)
+    starts = [m.start() for m in markers if m[1] == 'wrap-switch'] + [len(fragment)]
+    senses = [m.start() for m in markers if m[1] == 'ncdata-sense']
     for start, end in zip(starts, starts[1:]):
         title = _JA_TITLE.match(fragment, start, end)
-        sense = fragment.find('<div class="ncdata-sense">', start, end)
-        if title is None or sense < title.end():
+        if title is None:
             continue
-        head = title[2] if title[2] in _JA_FORMULA or title[2] in _JA_SCRIPT_EDGES else title[1]
-        if head in _JA_FORMULA and fragment.find('<sub><</sub>', sense, end) >= 0:
-            original, corrected = _JA_FORMULA[head]
-            damaged = re.escape(original.replace('@',_JA_BAD_INDEX).replace('^',_JA_BAD_POWER))
-            if '^' in original:
+        index = bisect_left(senses, title.end())
+        if index == len(senses) or senses[index] >= end:
+            continue
+        sense = senses[index]
+        head = title[2] if title[2] in formulas or title[2] in script_edges else title[1]
+        if head in formulas and fragment.find('<sub><</sub>', sense, end) >= 0:
+            original, corrected = formulas[head]
+            damaged = re.escape(original)
+            if _JA_BAD_POWER in original:
                 pattern = re.compile(damaged + r'([^<>]*)</sup>(?=</span>)')
                 replacement = corrected + r'\1'
             else:
@@ -896,7 +926,7 @@ def _japanese_formula_edits(fragment, edits):
                 pattern, replacement = re.compile(damaged + following), corrected
             for match in pattern.finditer(fragment, sense, end):
                 edits.append((match.start(), match.end(), match.expand(replacement), 'text', (start, sense)))
-        for old, new in _JA_SCRIPT_EDGES.get(head, ()):
+        for old, new in script_edges.get(head, ()):
             for match in re.compile(re.escape(old)).finditer(fragment, sense, end):
                 edits.append((match.start(), match.end(), new, 'text', (start, sense)))
 
@@ -905,6 +935,16 @@ def _japanese_formula_edits(fragment, edits):
 _CK_LINK = '<link rel="stylesheet" type="text/css" href="es/hanying/sf_cb.css"/>'
 ENGLISH_LAYOUT_HINTS = (b"FONT-FAMILY: <FONT", b"entry://esmissing-oxford-", b'(font size=-2>',
                         b'<Sup>1</up>/8', b'COLLOC)"&gt;', b'<span class="CK">')
+
+
+def layout_hints(layout):
+    rules = HISTORICAL_LAYOUT if layout is None else layout
+    edges = tuple(old.encode() for pairs in rules['scriptEdges'].values() for old, _ in pairs)
+    return ((b"&+{", _PRINTED_BLUE.encode(), b"<br><br><br><br>")
+            + ENGLISH_LAYOUT_HINTS + JAPANESE_LAYOUT_HINTS + edges)
+
+
+HISTORICAL_LAYOUT_HINTS = layout_hints(None)
 _CK_TEMPLATE = re.compile(re.escape(_CK_LINK) + r'(?=\r?\n<span class="CK">)')
 _CK_LAYOUT = "<style>" + ",".join(".es-hanying .CK span." + name for name in
                                   ("JS", "JX", "LY", "LS", "section_title", "DX")) + "{display:block}</style>"
@@ -925,6 +965,37 @@ _OX_TM = re.compile(re.escape('(font size=-2><sup>TM</sup></font>'))
 _OX_EIGHTH = re.compile(re.escape('<Sup>1</up>/8加仑'))
 
 
+def _element_visibility(tag, attributes, classes, inherited):
+    # hidden 和 display:none 隐藏整棵子树；visibility 可以在后代显式恢复。兄弟沿用父级状态。
+    excluded = tag in _INVISIBLE or "hidden" in attributes or "es-label" in classes or "es-client-target" in classes
+    style = (attributes.get("style") or "").lower()
+    if excluded or ("display" not in style and "visibility" not in style):
+        return excluded, inherited
+    if any(c in style for c in ('/', '"', "'", '(')):
+        style = _CSS_LITERALS.sub(lambda m: ' ' if m[0].startswith('/*') else '""', style)
+    effective, important = {}, set()
+    for declaration in style.split(';'):
+        match = _VISIBILITY_DECLARATION.fullmatch(declaration.strip())
+        if not match:
+            continue
+        name, value, priority = match.groups()
+        if name == 'display' and not all(v in _DISPLAY_VALUES for v in value.split()):
+            continue
+        if name == 'visibility' and value not in ('visible', 'hidden', 'collapse', 'inherit', 'initial', 'unset', 'revert', 'revert-layer'):
+            continue
+        if priority or name not in important:
+            effective[name] = value
+            if priority:
+                important.add(name)
+    visibility = effective.get('visibility')
+    visible = inherited
+    if visibility in ('visible', 'initial'):
+        visible = True
+    elif visibility in ('hidden', 'collapse'):
+        visible = False
+    return effective.get('display') == 'none', visible
+
+
 class _VisibleLocations(HTMLParser):
     """仅允许在可见文本或实际标签起点修正，字面示例、属性和隐藏片段保持原样。"""
 
@@ -942,18 +1013,22 @@ class _VisibleLocations(HTMLParser):
         return self.lines[line - 1] + col
 
     def handle_starttag(self, tag, attrs):
-        attributes = dict(attrs)
-        protected = (bool(self.stack and self.stack[-1][1]) or tag in _INVISIBLE or "hidden" in attributes
-                     or "es-label" in (attributes.get("class") or "").split())
+        attributes = dict(reversed(attrs))
+        excluded, visible = _element_visibility(tag, attributes, (attributes.get("class") or "").split(),
+                                                not self.stack or self.stack[-1][2])
+        protected = excluded or bool(self.stack and self.stack[-1][1])
         pos = self.position()
-        if not protected and self.candidates.get(pos) == "tag":
+        if visible and not protected and self.candidates.get(pos) == "tag":
             self.allowed.add(pos)
         if tag not in _VOID:
-            self.stack.append((tag, protected))
+            self.stack.append((tag, protected, visible))
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
 
     def handle_endtag(self, tag):
         pos = self.position()
-        if self.candidates.get(pos) == "end" and not (self.stack and self.stack[-1][1]):
+        if self.candidates.get(pos) == "end" and not (self.stack and (self.stack[-1][1] or not self.stack[-1][2])):
             self.allowed.add(pos)
         for i in range(len(self.stack) - 1, -1, -1):
             if self.stack[i][0] == tag:
@@ -961,12 +1036,21 @@ class _VisibleLocations(HTMLParser):
                 break
 
     def handle_data(self, data):
-        if self.stack and self.stack[-1][1]:
+        if self.stack and (self.stack[-1][1] or not self.stack[-1][2]):
             return
         start = self.position()
         for pos, kind in self.candidates.items():
             if kind == "text" and start <= pos < start + len(data):
                 self.allowed.add(pos)
+
+
+def _visible_tag_matches(fragment, pattern):
+    # 注释、属性和隐藏子树中的同名字串不能截断相邻词条，也不能充当修订依据。
+    matches = list(pattern.finditer(fragment))
+    if not matches:
+        return []
+    allowed = _VisibleLocations(fragment, {m.start(): "tag" for m in matches}).allowed
+    return [m for m in matches if m.start() in allowed]
 
 
 def _oxford_number(match):

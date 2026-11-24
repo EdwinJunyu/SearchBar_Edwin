@@ -181,14 +181,16 @@ public static class MdxReader
         }
     }
 
-    public static void PackDelivery(string mdxPath, string payloadPath, string expectedSha256, bool groupBlocks = true)
+    public static void PackDelivery(string mdxPath, string payloadPath, string? expectedSha256 = null, bool groupBlocks = true)
     {
-        byte[] hash = SourceDigest(expectedSha256);
+        byte[]? expected = expectedSha256 == null ? null : SourceDigest(expectedSha256);
+        // 同一只读句柄先计算卷摘要，再回卷读取块表和正文，避免 CLI 重开原卷。
         using var input = File.OpenRead(mdxPath);
-        Require(input.Length <= DeliveryFileLimit && SHA256.HashData(input).AsSpan().SequenceEqual(hash),
-            "MDXP 输入词卷长度或 SHA-256 不符。");
+        Require(input.Length <= DeliveryFileLimit, "MDXP 输入词卷长度或 SHA-256 不符。");
+        byte[] hash = SHA256.HashData(input);
+        Require(expected == null || expected.AsSpan().SequenceEqual(hash), "MDXP 输入词卷长度或 SHA-256 不符。");
         input.Position = 0;
-        using var layout = ReadDirectory(input, expectedSha256, includeKeys: false);
+        using var layout = ReadDirectory(input, Convert.ToHexString(hash), includeKeys: false);
         var blocks = layout.DeliveryBlocks;
         long prefix = blocks.Count == 0 ? input.Length : blocks[0].FileOffset;
         WriteDelivery(payloadPath, output =>
@@ -391,8 +393,7 @@ public static class MdxReader
                         lengths[j] = (raw, shapedLength);
                         combined += shapedLength;
                     }
-                    Require(size <= input.Length - input.Position, "MDXP 分组被截断。");
-                    byte[] data = ExpandDelivery(ReadBytes(input, size), combined);
+                    byte[] data = ExpandDelivery(ReadBytes(input, size, "MDXP 分组被截断。"), combined);
                     int offset = 0;
                     foreach (var member in lengths)
                     {
@@ -423,8 +424,7 @@ public static class MdxReader
                     Require(raw is > 0 and <= DeliveryBlockLimit && shapedLength is > 0 and <= DeliveryBlockLimit,
                         "MDXP 正文尺寸无效。");
                 }
-                Require(size <= input.Length - input.Position, "MDXP 块被截断。");
-                QueueFrame(new DeliveryFrame(ReadBytes(input, size), raw, shapedLength));
+                QueueFrame(new DeliveryFrame(ReadBytes(input, size, "MDXP 块被截断。"), raw, shapedLength));
             }
             FlushBatch();
             Require(input.Length - input.Position == total - output.Position, "MDXP 尾部长度不符。");
@@ -936,10 +936,9 @@ public static class MdxReader
         return BigNumber(buffer[..width]);
     }
 
-    private static byte[] ReadBytes(Stream input, long count)
+    private static byte[] ReadBytes(Stream input, long count, string error = "MDX 数据块长度无效。")
     {
-        Require(count >= 0 && count <= 128L * 1024 * 1024 && count <= input.Length - input.Position,
-            "MDX 数据块长度无效。");
+        Require(count >= 0 && count <= SizeLimit && count <= input.Length - input.Position, error);
         byte[] bytes = new byte[(int)count];
         input.ReadExactly(bytes);
         return bytes;
@@ -961,7 +960,7 @@ public static class MdxReader
 
     private static byte[] Unpack(byte[] packed, int size)
     {
-        Require(packed.Length >= 8 && size is >= 0 and <= 134217728, "MDX 压缩块长度无效。");
+        Require(packed.Length >= 8 && size is >= 0 and <= SizeLimit, "MDX 压缩块长度无效。");
         byte[] output = new byte[size];
         switch (BinaryPrimitives.ReadUInt32LittleEndian(packed))
         {

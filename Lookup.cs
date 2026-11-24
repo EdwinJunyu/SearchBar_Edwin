@@ -19,39 +19,70 @@ internal sealed class ReverseEncoder
     private const int MaxTokens = 128;
     private static readonly object Gate = new();
     private static ReverseEncoder? loaded;
+    private sealed record ModelFiles(string Folder, long GraphSize, long GraphTime, long VocabSize, long VocabTime);
+    private static ModelFiles? rejected;
     private readonly Dictionary<string,int> vocabulary;
     private readonly Lazy<InferenceSession> session;
     internal bool IsSessionReady => session.IsValueCreated;
-    private readonly string directory;
+    private readonly ModelFiles files;
     public int Dimension => 512;
     internal const string ModelFingerprint = "bge-small-zh-v1.5/" + ModelSha + "/" + VocabSha + "/cls-query-128-v1";
-    public string Fingerprint => ModelFingerprint;
     public static string ModelDirectory => Environment.GetEnvironmentVariable("E_SEARCH_REVERSE_MODEL")
         ?? Path.Combine(AppContext.BaseDirectory, "models", "bge-small-zh-v1.5");
     public static string CacheDirectory => Environment.GetEnvironmentVariable("E_SEARCH_REVERSE_CACHE")
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "E_Search", "reverse-index");
-    public static bool IsInstalled => File.Exists(Path.Combine(ModelDirectory, "model.onnx")) && File.Exists(Path.Combine(ModelDirectory, "vocab.txt"));
+    private static ModelFiles? Inspect(string directory)
+    {
+        if (string.IsNullOrWhiteSpace(directory)) return null;
+        string folder = Path.GetFullPath(directory);
+        var graph = new FileInfo(Path.Combine(folder, "model.onnx"));
+        var vocab = new FileInfo(Path.Combine(folder, "vocab.txt"));
+        return graph.Exists && vocab.Exists
+            ? new(folder, graph.Length, graph.LastWriteTimeUtc.Ticks, vocab.Length, vocab.LastWriteTimeUtc.Ticks) : null;
+    }
+
+    public static bool CanOpen(string directory)
+    {
+        var current = Inspect(directory);
+        lock (Gate) return current != null && current != rejected;
+    }
+
+    public static void Retry(string directory)
+    {
+        // 用户再次选中同一份文件时，即使元数据相同也应重新校验，包括此前失败的延迟 ONNX 会话。
+        lock (Gate)
+            if (rejected?.Folder.Equals(Path.GetFullPath(directory), StringComparison.OrdinalIgnoreCase) == true)
+            {
+                if (loaded?.files == rejected) loaded = null;
+                rejected = null;
+            }
+    }
 
     public static ReverseEncoder Open(string directory)
     {
-        string folder = Path.GetFullPath(directory);
+        var current = Inspect(directory) ?? throw new FileNotFoundException("找不到反查模型或词表。");
         lock (Gate)
         {
-            if (loaded?.directory == folder) return loaded;
-            return loaded = new ReverseEncoder(folder);
+            if (current == rejected) throw new InvalidDataException("该版本的本地模型未通过校验。");
+            if (loaded?.files == current) return loaded;
+            return loaded = new ReverseEncoder(current);
         }
     }
 
-    private ReverseEncoder(string folder)
+    private ReverseEncoder(ModelFiles current)
     {
-        directory = folder;
+        files = current;
         byte[] CheckedFile(string name, long size, string sha)
         {
-            string path = Path.Combine(folder, name);
-            if (new FileInfo(path).Length != size) throw new InvalidDataException($"反查模型文件大小不符：{name}");
-            byte[] bytes = File.ReadAllBytes(path);
-            if (Convert.ToHexString(SHA256.HashData(bytes)) != sha) throw new InvalidDataException($"反查模型文件校验失败：{name}");
-            return bytes;
+            string path = Path.Combine(current.Folder, name);
+            if (new FileInfo(path).Length == size)
+            {
+                byte[] bytes = File.ReadAllBytes(path);
+                if (Convert.ToHexString(SHA256.HashData(bytes)) == sha) return bytes;
+            }
+            // 只记忆确定的文件校验错误。临时访问失败可直接重试，替换文件会取得新的版本标识。
+            lock (Gate) rejected = current;
+            throw new InvalidDataException($"反查模型文件校验失败：{name}");
         }
         byte[] vocab = CheckedFile("vocab.txt", 109540, VocabSha);
         vocabulary = new(StringComparer.Ordinal);
@@ -60,9 +91,18 @@ internal sealed class ReverseEncoder
         // 未准备义项向量时仍可使用普通反查；只在真正编码时初始化 ONNX 和 CPU 线程池。
         session = new(() =>
         {
-            byte[] graph = CheckedFile("model.onnx", 23903394, ModelSha);
-            using var options = new SessionOptions { IntraOpNumThreads = Math.Min(4, Environment.ProcessorCount), InterOpNumThreads = 1 };
-            return new InferenceSession(graph, options);
+            try
+            {
+                byte[] graph = CheckedFile("model.onnx", 23903394, ModelSha);
+                using var options = new SessionOptions { IntraOpNumThreads = Math.Min(4, Environment.ProcessorCount), InterOpNumThreads = 1 };
+                return new InferenceSession(graph, options);
+            }
+            catch
+            {
+                // Lazy 会记住初始化异常。释放失败实例，让临时占用解除后重新加载；文件校验失败仍按版本拒绝。
+                lock (Gate) if (ReferenceEquals(loaded, this)) loaded = null;
+                throw;
+            }
         });
     }
 
@@ -238,12 +278,33 @@ public static partial class Lookup
 
     public static string NormalizeReading(string text)
     {
-        // 两种假名共用一个读音索引，原词条中的显示写法仍然保留。
-        var value = Normalize(text).ToCharArray();
-        for (int i = 0; i < value.Length; i++)
-            if (value[i] is >= 'ァ' and <= 'ヶ')
-                value[i] = (char)(value[i] - ('ァ' - 'ぁ'));
-        return new string(value);
+        // 平假名没有预组的浊音ワ行。索引用「わ + 浊点」等价表示，词条自身保留原书的拼写。
+        string value = Normalize(text);
+        var kana = new StringBuilder(value.Length);
+        foreach (char c in value)
+        {
+            if (c is >= 'ヷ' and <= 'ヺ') kana.Append("わゐゑを"[c - 'ヷ']).Append('\u3099');
+            else kana.Append(c is >= 'ァ' and <= 'ヶ' or 'ヽ' or 'ヾ' ? (char)(c - ('ァ' - 'ぁ')) : c);
+        }
+        return kana.ToString();
+    }
+
+    // 旧索引只折叠ァ–ヶ，多个迭字符或浊音ワ行可能各自保留不同写法。
+    // 用第一处分歧限定索引区间，再比较完整规范键，避免按字符组合枚举旧键。
+    internal static string[] LegacyReadingPrefixes(string key, bool prefix = false)
+    {
+        for (int i = 0; i < key.Length; i++)
+        {
+            char c = key[i];
+            int voiced = "わゐゑを".IndexOf(c);
+            bool hasMark = voiced >= 0 && i + 1 < key.Length && key[i + 1] == '\u3099';
+            if (c is not ('ゝ' or 'ゞ') && !hasMark && !(prefix && voiced >= 0 && i == key.Length - 1)) continue;
+            string before = key[..i], after = key[i..(i + (hasMark ? 2 : 1))];
+            char alternate = voiced >= 0 ? (char)('ヷ' + voiced) : (char)(c + ('ァ' - 'ぁ'));
+            return [.. new[] { before + after, before + alternate, ToKatakana(before) + after,
+                ToKatakana(before) + alternate }.Distinct(StringComparer.Ordinal)];
+        }
+        return [];
     }
 
     public static IReadOnlyList<LookupHit> Search(string input, Func<string, bool, IEnumerable<LookupEntry>> find)
@@ -293,14 +354,14 @@ public static partial class Lookup
         foreach (var lemma in direct) CollectJapanese(lemma, 2);
         // エ段＋る也可能本来就是一段动词。食べちゃった还原到已收录的食べる时，无须再猜食ぶ。
         var tried = direct.ToHashSet(StringComparer.Ordinal);
-        void CollectAuxiliaries(bool guessPotential)
-        {
-            foreach (var lemma in AuxiliaryLemmas(inflected, direct, guessPotential))
-                if (tried.Add(lemma)) CollectJapanese(lemma, 3);
-        }
-        CollectAuxiliaries(false);
+        // 第一轮保留已经剥离时态、体的动词形式，词库没有匹配时才猜测可能态。
+        var fallbackForms = new List<string>();
+        foreach (var lemma in AuxiliaryLemmas(inflected, direct, fallbackForms))
+            if (tried.Add(lemma)) CollectJapanese(lemma, 3);
         if (inflected.Any(c => c is >= 'ぁ' and <= 'ゖ') && !hits.Values.Any(x => IsJapanese(x.Hit.Entry)))
-            CollectAuxiliaries(true);
+            foreach (var form in fallbackForms)
+                if (Godan(form[..^1], "えけげせてねべめれ") is { } lemma && tried.Add(lemma))
+                    CollectJapanese(lemma, 3);
         // 有些可能动词也独立收录，如「読める＝能念」。只有外层活用、词典释义和同书原形三者
         // 同时支持时才添加更深一层，避免把日常的「食べました」解释为古语「食ぶ」。
         if (direct.Length > 0 && inflected.Any(c => c is >= '一' and <= '鿿')
@@ -376,8 +437,9 @@ public static partial class Lookup
     {
         var english = new EnglishSentence(input, token);
         var possible = new List<Phrase>();
+        var separable = new List<Phrase>();
         // 批量预筛的索引只含短键。查完最长候选后才加载正文、解析别名和生成释义。
-        foreach (var batch in SentenceSpans(input, english, token).Chunk(512))
+        foreach (var batch in SentenceSpans(input, english, separable, token).Chunk(512))
         {
             token.ThrowIfCancellationRequested();
             foreach (var group in batch.GroupBy(p => (p.Language, p.Reading)))
@@ -395,10 +457,10 @@ public static partial class Lookup
             return entries;
         }
         var indexed = LongestPhraseHits(possible, Resolve);
-        return SearchOxfordPhrases(english, subentries, indexed, token);
+        return SearchOxfordPhrases(english, separable, subentries, indexed, token);
     }
 
-    private static IReadOnlyList<LookupHit> SearchOxfordPhrases(EnglishSentence english,
+    private static IReadOnlyList<LookupHit> SearchOxfordPhrases(EnglishSentence english, IReadOnlyList<Phrase> separable,
         Func<string, IEnumerable<LookupEntry>> subentries, IReadOnlyList<LookupHit> indexed, CancellationToken token)
     {
         // 同一读快照内，逐个父词头缓存原书模板（包括未收录）。长句无需先把所有猜测按动词分组。
@@ -410,7 +472,7 @@ public static partial class Lookup
         int indexedWords = indexed.Count == 0 ? 0 : EnglishWords.Matches(indexed[0].Term).Count;
         var occupied = indexed.Select(hit => hit.SourceOffset).ToHashSet();
         int longest = indexedWords;
-        var candidates = SeparableSpans(english, token).Concat(EnglishSpans(english, token, phrasalVerbs: true));
+        var candidates = separable.Concat(EnglishSpans(english, token, phrasalVerbs: true));
         foreach (var phrase in candidates)
         {
             token.ThrowIfCancellationRequested();
@@ -475,7 +537,7 @@ public static partial class Lookup
 
     private static readonly System.Text.RegularExpressions.Regex EnglishWords = new(
         @"(?<![\p{L}\p{N}_])" + LatinLetter + "+(?:" + WordJoiner + LatinLetter + @"+)*(?![\p{L}\p{N}_])");
-    private static readonly System.Text.RegularExpressions.Regex JapaneseRuns = new(@"[ぁ-ゖァ-ヺーｦ-ﾟ々一-鿿]+");
+    private static readonly System.Text.RegularExpressions.Regex JapaneseRuns = new(@"[ぁ-ゖ\u3099\u309Aゝゞァ-ヺーヽヾｦ-ﾟ々一-鿿]+");
 
     private readonly record struct EnglishWord(string Key, int Start, int End, bool Joined);
 
@@ -636,32 +698,37 @@ public static partial class Lookup
         or "to" or "of" or "for" or "at" or "is" or "was" or "are" or "were" or "will" or "can"
         or "please" or "then" or "now" or "again" or "today" or "immediately";
 
-    private static IEnumerable<Phrase> SentenceSpans(string input, EnglishSentence english, CancellationToken token)
+    private static IEnumerable<Phrase> SentenceSpans(string input, EnglishSentence english, List<Phrase> separable, CancellationToken token)
     {
         foreach (var phrase in EnglishSpans(english, token, phrasalVerbs: false)) yield return phrase;
-        foreach (var phrase in SeparableSpans(english, token)) yield return phrase;
+        // 独立词头与牛津子词条使用同一组候选，复用原句位置与枚举顺序。
+        foreach (var phrase in SeparableSpans(english, token))
+        {
+            separable.Add(phrase);
+            yield return phrase;
+        }
         // 没有假名的汉语文本和短小的孤立词不做日语切片。窗口有上限，长句的候选数随字数线性增长。
-        if (!input.Any(c => c is >= 'ぁ' and <= 'ゖ' || IsKatakanaUnit(c))) yield break;
+        if (!input.Any(c => IsHiraganaUnit(c) || IsKatakanaUnit(c))) yield break;
         foreach (System.Text.RegularExpressions.Match run in JapaneseRuns.Matches(input))
         {
             if (run.Length == input.Length && Normalize(run.Value).Length <= 4) continue;
-            // 半角浊音可占两个原始字符。长度和排序按归一化后的字数，展示仍按原文位置取片段。
-            int maxSourceLength = run.ValueSpan.IndexOfAny('ﾞ', 'ﾟ') >= 0 ? 64 : 32;
+            // 半角或分解写法的浊音、半浊音可占两个原始字符，展示仍按原文位置取片段。
+            int maxSourceLength = run.ValueSpan.IndexOfAny("ﾞﾟ\u3099\u309A") >= 0 ? 64 : 32;
             for (int start = run.Index; start < run.Index + run.Length; start++)
             {
                 token.ThrowIfCancellationRequested();
-                if (start > run.Index && SameCompound(input[start-1], input[start])) continue;
+                if (start > run.Index && SameCompound(input, start)) continue;
                 int stop = Math.Min(start + maxSourceLength, run.Index + run.Length);
                 for (int end = start + 3; end <= stop; end++)
                 {
-                    if (end < run.Index + run.Length && SameCompound(input[end-1], input[end])) continue;
+                    if (end < run.Index + run.Length && SameCompound(input, end)) continue;
                     string surface = input[start..end];
                     string key = Normalize(surface);
                     if (key.Length < 3) continue;
                     if (key.Length > 32) break;
                     var inflected = IsKana(key) ? NormalizeReading(key) : key;
                     var direct = Lemmas(inflected).ToArray();
-                    var regular = direct.Prepend(key).Concat(AuxiliaryLemmas(inflected, direct, false));
+                    var regular = direct.Prepend(key).Concat(AuxiliaryLemmas(inflected, direct));
                     var potential = direct.Prepend(inflected).Where(form => form.EndsWith('る'))
                         .Select(form => Godan(form[..^1], "えけげせてねべめれ")).OfType<string>();
                     foreach (var (candidate, weak) in regular.Select(s => (s, false)).Concat(potential.Select(s => (s, true))).DistinctBy(p => p.Item1))
@@ -677,11 +744,18 @@ public static partial class Lookup
 
     }
 
-    private static bool IsKatakanaUnit(char c) => c is >= 'ァ' and <= 'ヺ' or 'ー' or >= 'ｦ' and <= 'ﾟ';
+    private static bool IsHiraganaUnit(char c) => c is >= 'ぁ' and <= 'ゖ' or 'ゝ' or 'ゞ';
+    private static bool IsKatakanaUnit(char c) => c is >= 'ァ' and <= 'ヺ' or 'ー' or 'ヽ' or 'ヾ' or >= 'ｦ' and <= 'ﾟ';
 
-    private static bool SameCompound(char left, char right) =>
-        (left is >= '一' and <= '鿿' or '々') && (right is >= '一' and <= '鿿' or '々')
-        || IsKatakanaUnit(left) && IsKatakanaUnit(right);
+    private static bool SameCompound(string input, int boundary)
+    {
+        char left = input[boundary-1], right = input[boundary];
+        if (right is '\u3099' or '\u309A') return true;
+        // 浊点随前一个假名判定词界，分解写法的片假名复合词也保持完整。
+        if (boundary >= 2 && left is ('\u3099' or '\u309A')) left = input[boundary-2];
+        return (left is >= '一' and <= '鿿' or '々') && (right is >= '一' and <= '鿿' or '々')
+            || IsKatakanaUnit(left) && IsKatakanaUnit(right);
+    }
 
     private static bool IsEnglish(LookupEntry entry) => entry.Language.Equals("en", StringComparison.OrdinalIgnoreCase)
         || entry.Language.StartsWith("en-", StringComparison.OrdinalIgnoreCase);
@@ -712,11 +786,20 @@ public static partial class Lookup
     private static bool IsJapanese(LookupEntry entry) =>
         entry.Language.StartsWith("ja", StringComparison.OrdinalIgnoreCase);
 
-    internal static bool IsKana(string text) => text.Length > 0 &&
-        text.All(c => c is >= 'ぁ' and <= 'ゖ' or >= 'ァ' and <= 'ヶ' or 'ー' or 'ゝ' or 'ゞ' or 'ヽ' or 'ヾ');
+    internal static bool IsKana(string text)
+    {
+        string normalized = text.Normalize(NormalizationForm.FormKC);
+        for (int i = 0; i < normalized.Length; i++)
+        {
+            char c = normalized[i];
+            if (!IsHiraganaUnit(c) && !IsKatakanaUnit(c)
+                && !(c == '\u3099' && i > 0 && "わゐゑを".Contains(normalized[i-1]))) return false;
+        }
+        return normalized.Length != 0;
+    }
 
     internal static string ToKatakana(string hiragana) =>
-        string.Concat(hiragana.Select(c => c is >= 'ぁ' and <= 'ゖ' or 'ゝ' or 'ゞ' ? (char)(c + ('ァ' - 'ぁ')) : c));
+        string.Concat(hiragana.Select(c => IsHiraganaUnit(c) ? (char)(c + ('ァ' - 'ぁ')) : c)).Normalize(NormalizationForm.FormC);
 
     internal static string Format(LookupEntry entry, string method)
     {
@@ -1079,13 +1162,14 @@ public static partial class Lookup
     [GeneratedRegex(@"^(?:能|会|會|可|can\b|be\s+able\s+to\b)|可能動詞|ことができる", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex PotentialGloss();
 
-    private static IEnumerable<string> AuxiliaryLemmas(string word, string[] direct, bool guessPotential)
+    private static IEnumerable<string> AuxiliaryLemmas(string word, string[] direct, List<string>? fallbackForms = null)
     {
         // 固定顺序最多各剥一层：礼貌/时态（direct）、体、语态。不会递归展开整棵候选树。
         foreach (var form in direct.Prepend(word))
         {
             if (form.Length < 2) continue;
-            foreach (var root in VoiceRoots(form, guessPotential)) yield return root;
+            if (form.EndsWith('る')) fallbackForms?.Add(form);
+            foreach (var root in VoiceRoots(form)) yield return root;
             // 「辞书形＋ことができる」可用于所有动词类型；只还原明确写出的谓语，避免误猜名词。
             const int constructionLength = 6;
             if (form.Length > constructionLength && (form.EndsWith("ことができる", StringComparison.Ordinal)
@@ -1096,7 +1180,8 @@ public static partial class Lookup
             foreach (var plain in Lemmas(teForm))
             {
                 yield return plain;
-                foreach (var root in VoiceRoots(plain, guessPotential)) yield return root;
+                if (plain.Length >= 2 && plain.EndsWith('る')) fallbackForms?.Add(plain);
+                foreach (var root in VoiceRoots(plain)) yield return root;
             }
         }
     }
@@ -1117,7 +1202,7 @@ public static partial class Lookup
         return auxiliaryLength != 0 && end > 1 && form[end - 1] is ('て' or 'で') ? form[..end] : null;
     }
 
-    private static IEnumerable<string> VoiceRoots(string form, bool guessPotential)
+    private static IEnumerable<string> VoiceRoots(string form)
     {
         if (form.Length < 2 || form[^1] != 'る') yield break;
         if (form.EndsWith("られる", StringComparison.Ordinal) && form.Length > 3)
@@ -1140,8 +1225,6 @@ public static partial class Lookup
         }
         if (form.EndsWith("せる", StringComparison.Ordinal))
             foreach (var root in CausativeRoots(form[..^2])) yield return root;
-        if (guessPotential && Godan(form[..^1], "えけげせてねべめれ") is { } potential)
-            yield return potential;
     }
 
     private static IEnumerable<string> CausativeRoots(string stem)

@@ -21,7 +21,10 @@
 **发布与复验。** 在 Windows PowerShell 7 中运行以下命令。打包使用指定的独立 SQLite 备份，生成自包含程序，解压最终 ZIP 并重新执行其中 EXE 的版本、清单与词条验收。只有通过的包才进入交付目录。可以用 `-VerifyReleaseZip` 独立复验。若源码含未提交改动，包内 reports 还会保存相对基准提交的构建输入差异。
 
 ```powershell
-.\regressions.ps1 -PackageSeed .data/stage5-delivery/dictionaries.db
+# 将已校验的二轮八书索引、两部 MDX 和配套 MDD 复制到独立目录，供发布工具读取。
+$seedCopy = Join-Path '.data' ('release-seed-' + [guid]::NewGuid().ToString('N'))
+Copy-Item -LiteralPath '.data/词书合并交付-20261123/index' -Destination $seedCopy -Recurse
+.\regressions.ps1 -PackageSeed (Join-Path $seedCopy 'dictionaries.db')
 $zip = Get-ChildItem .\bin\release-delivery\E_Search-0.2.0-*-win-x64*.zip | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 .\regressions.ps1 -VerifyReleaseZip $zip.FullName
 ```

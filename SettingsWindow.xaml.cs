@@ -61,7 +61,7 @@ public partial class SettingsWindow : Window
         Loaded -= InitializeFileHistory;
         try
         {
-            savedFilePreferences = await Task.Run(fileHistory.GetPreferences);
+            savedFilePreferences = await Task.Run(() => fileHistory.ReadPreferences(readOnly: true));
             FileRefindMode.SelectedIndex = savedFilePreferences.Mode;
             FileRefindMode.IsEnabled = ClearFileRefindButton.IsEnabled = true;
         }
@@ -117,7 +117,8 @@ public partial class SettingsWindow : Window
         {
             var (books, hotkey) = await Task.Run(() =>
             {
-                using var store = new DictionaryStore(databasePath);
+                // 已有词库只读打开，避免浏览设置与导入争用写锁。
+                using var store = DictionaryStore.OpenCatalog(databasePath);
                 return (store.ListDictionaries(), store.ReadHotkey());
             });
             if (closed) return;
@@ -271,6 +272,7 @@ public partial class SettingsWindow : Window
 
     private async void UpdateCatalog(Action<DictionaryStore> save, string selectedId, string success)
     {
+        catalogWritePending = true;
         Busy(true);
         try
         {
@@ -284,7 +286,7 @@ public partial class SettingsWindow : Window
             if (!closed) { BindCatalog(books, selectedId); Message(CatalogStatus, success); }
         }
         catch (Exception ex) { if (!closed) Message(CatalogStatus, $"未能更新词库。{ex.Message}", true); }
-        finally { Busy(false); }
+        finally { catalogWritePending = false; Busy(false); }
     }
 
     private async void Browse(object sender, RoutedEventArgs e)
