@@ -256,9 +256,12 @@ if (args is [] or ["help"] or ["--help"])
                                     搬迁或备份时请同时保留数据库及其同名 .sources 目录
         indexed-sources             列出当前数据库引用的 MDX 内容哈希
         indexed-ja-source           输出合并日语卷的原始 MDX 哈希（没有则留空）
+        indexed-volume-source <zh-en|zh-ja>  输出所选合并卷的原始 MDX 哈希（没有则留空）
         install-seed                首次安装随包词典到个人目录，并输出可使用的数据库路径
         pack-ja <MDX> <MDXP>        创建日语词典分发文件
         restore-ja <MDXP> <MDX> <SHA256>  还原并校验原始日语词典
+        pack-volume <zh-en|zh-ja> <MDX> <MDXP>  创建中英或日语词典分发文件
+        restore-volume <MDXP> <MDX> <SHA256>    还原并校验任一分发卷
         merged-resources            列出当前合并卷引用的 MDD 资源哈希
         compact                     整理现有数据库，回收重导后空闲的 SQLite 页
         import-merged <双卷目录>     校验两个卷及其资源，原子导入独立库（可用 E_SEARCH_DB 指定）
@@ -321,19 +324,21 @@ try
             Console.WriteLine(installed);
             break;
         }
-        case ["pack-ja",var input,var output]:
+        case ["pack-ja",_,_] or ["pack-volume","zh-en" or "zh-ja",_,_]:
         {
+            string input = args[^2], output = args[^1];
             using var source = File.OpenRead(input);
             string hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(source));
-            MdxReader.PackDelivery(input, output, hash);
+            // 旧命令保留独立块格式，新版发布时只对日语卷使用跨块压缩。
+            MdxReader.PackDelivery(input, output, hash, groupBlocks: args is ["pack-volume","zh-ja",_,_]);
             break;
         }
-        case ["restore-ja",var packed,var restored,var expectedHash]:
+        case ["restore-ja" or "restore-volume",var packed,var restored,var expectedHash]:
             MdxReader.RestoreDelivery(packed, restored, expectedHash);
             break;
-        case ["indexed-ja-source"]:
+        case ["indexed-ja-source"] or ["indexed-volume-source","zh-ja" or "zh-en"]:
             using (var store = OpenReader())
-                if (store.JapaneseVolumeHash() is string japaneseHash) Console.WriteLine(japaneseHash);
+                if (store.VolumeHash(args.Length == 1 ? "zh-ja" : args[1]) is string volumeHash) Console.WriteLine(volumeHash);
             break;
         case ["import-merged",var package]:
         {

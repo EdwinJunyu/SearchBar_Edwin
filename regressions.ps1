@@ -75,6 +75,21 @@ function Get-ReleaseBinaries([string]$Directory) {
     return $binaries
 }
 
+function Get-ReleaseVolumeHashes([string]$Directory, [string]$Database) {
+    $previousDb = $env:E_SEARCH_DB
+    $hashes = [ordered]@{}
+    try {
+        $env:E_SEARCH_DB = $Database
+        foreach ($volume in 'zh-en','zh-ja') {
+            $rows = @(& (Join-Path $Directory 'E_Search.exe') indexed-volume-source $volume | ForEach-Object { $_ })
+            if ($LASTEXITCODE -ne 0 -or $rows.Count -gt 1 -or
+                ($rows.Count -eq 1 -and $rows[0] -cnotmatch '^[0-9A-F]{64}$')) { throw "种子的 $volume 卷标识无效" }
+            if ($rows.Count) { $hashes[$volume] = $rows[0] }
+        }
+        return $hashes
+    } finally { $env:E_SEARCH_DB = $previousDb }
+}
+
 function Test-ReleaseZip([string]$Archive, [string]$Cache) {
     # 只复用本脚本的验证目录。独占锁覆盖解压和执行，避免并发复验交叉使用两包的文件。
     [void][IO.Directory]::CreateDirectory($Cache)
@@ -104,19 +119,43 @@ function Test-ReleaseZip([string]$Archive, [string]$Cache) {
         }
         if ((Get-ReleaseFingerprint $manifest.sourceFiles) -cne $manifest.sourceSha256 -or
             (Get-FileHash -LiteralPath $seed).Hash -cne $manifest.seedSha256) { throw 'ZIP 的源码清单或种子与发布记录不一致' }
-        if ($manifest.japaneseDelivery) {
-            $japanese = $manifest.japaneseDelivery
-            $hash = $japanese.sourceSha256
-            if ($hash -cnotmatch '^[0-9A-F]{64}$' -or $hash -cnotin $manifest.indexedSources) {
-                throw '发布清单的日语卷没有对应的种子引用'
+        $deliveries = @{}
+        if ($manifest.ContainsKey('volumeDeliveries')) {
+            $deliveries = $manifest.volumeDeliveries
+            $codecHash = $manifest.deliveryCodecSha256
+            $volumes = Get-ReleaseVolumeHashes $directory $seed
+            if ($volumes.Count -ne $deliveries.Count) { throw '分发清单与种子中的卷数不符' }
+            foreach ($volume in $volumes.Keys) {
+                if ($deliveries[$volume].sourceSha256 -cne $volumes[$volume]) { throw "分发清单与 $volume 原卷不符" }
             }
-            $packed = Join-Path ($seed + '.sources') "$hash.mdxp"
-            if ((Test-Path -LiteralPath (Join-Path ($seed + '.sources') "$hash.mdx")) -or
-                (Get-FileHash -LiteralPath $packed).Hash -cne $japanese.packedSha256) {
-                throw '日语卷须仅以经过校验的分发文件交付'
+        } elseif ($manifest.japaneseDelivery) {
+            # 老包只记录了日语卷，包内程序也只有当时的 CLI；保留其原来的验收入口。
+            $deliveries = @{'zh-ja'=$manifest.japaneseDelivery}
+            $codecHash = $manifest.japaneseDelivery.codecSha256
+        }
+        if ($deliveries.Count) {
+            if ((Get-FileHash -LiteralPath (Join-Path $directory 'es-zlib-ng.dll')).Hash -cne $codecHash) {
+                throw '分发卷还原组件与清单不一致'
             }
-            if ((Get-FileHash -LiteralPath (Join-Path $directory 'es-zlib-ng.dll')).Hash -cne $japanese.codecSha256) {
-                throw '日语卷还原组件与发布清单不一致'
+            foreach ($volume in $deliveries.Keys) {
+                $item = $deliveries[$volume]
+                $hash = $item.sourceSha256
+                if ($hash -cnotmatch '^[0-9A-F]{64}$' -or $hash -cnotin $manifest.indexedSources) {
+                    throw "$volume 分发卷没有对应的种子引用"
+                }
+                $packed = Join-Path ($seed + '.sources') "$hash.mdxp"
+                if ((Test-Path -LiteralPath (Join-Path ($seed + '.sources') "$hash.mdx")) -or
+                    (Get-FileHash -LiteralPath $packed).Hash -cne $item.packedSha256) {
+                    throw "$volume 须仅以经过校验的分发文件交付"
+                }
+                $stream = [IO.File]::OpenRead($packed)
+                try {
+                    $header = [byte[]]::new(8)
+                    $stream.ReadExactly($header,0,8)
+                    $expected = if ($manifest.japaneseDelivery) { 'ESMDXP01' } else { $item.format }
+                    if ($expected -cnotin 'ESMDXP01','ESMDXP02' -or
+                        [Text.Encoding]::ASCII.GetString($header) -cne $expected) { throw "$volume 分发格式与清单不一致" }
+                } finally { $stream.Dispose() }
             }
             # 使用与桌面首启相同的个人库安装入口。每次复验使用新目录，避免误用旧 MDX。
             $profileDirectory = Join-Path $Cache ('profile-' + [guid]::NewGuid().ToString('N'))
@@ -127,10 +166,9 @@ function Test-ReleaseZip([string]$Archive, [string]$Cache) {
                 $env:E_SEARCH_DB = $null
                 $timer = [Diagnostics.Stopwatch]::StartNew()
                 $paths = @(& (Join-Path $directory 'E_Search.exe') install-seed | ForEach-Object { $_ })
-                if ($LASTEXITCODE -ne 0) { throw '新用户安装日语卷失败' }
+                if ($LASTEXITCODE -ne 0) { throw '新用户安装分发卷失败' }
                 $seed = Join-Path $profileDirectory 'E_Search/dictionaries.db'
-                if ($paths.Count -ne 1 -or $paths[0] -ne [IO.Path]::GetFullPath($seed) -or
-                    !(Test-Path -LiteralPath (Join-Path ($seed + '.sources') "$hash.mdx"))) { throw '首启没有生成个人日语 MDX' }
+                if ($paths.Count -ne 1 -or $paths[0] -ne [IO.Path]::GetFullPath($seed)) { throw '首启没有生成个人词库' }
                 Write-Output ("PASS 首次创建个人词库 {0:N2} 秒" -f $timer.Elapsed.TotalSeconds)
             } finally {
                 $env:LOCALAPPDATA = $previousProfile
@@ -206,26 +244,28 @@ if ($PackageSeed -or $VerifyReleaseZip) {
         binaries=(Get-ReleaseBinaries $directory)
         seedSha256=(Get-FileHash -LiteralPath $seed).Hash
         indexedSources=$indexedSources; mergedResources=$mergedResources; verified=$evidence }
-    # 通过种子库的卷标识选择日语卷；中英卷和普通单书仍按原格式交付。
-    $previousDb = $env:E_SEARCH_DB
-    try {
-        $env:E_SEARCH_DB = $seed
-        $japaneseHashes = @(& (Join-Path $directory 'E_Search.exe') indexed-ja-source | ForEach-Object { $_ })
-        if ($LASTEXITCODE -ne 0 -or $japaneseHashes.Count -gt 1) { throw '无法识别种子的日语合并卷' }
-    } finally { $env:E_SEARCH_DB = $previousDb }
-    $japaneseHash = $null
-    if ($japaneseHashes.Count) {
-        $japaneseHash = $japaneseHashes[0]
-        if ($japaneseHash -cnotmatch '^[0-9A-F]{64}$' -or $japaneseHash -cnotin $indexedSources) { throw '日语卷与种子引用不符' }
-        $packed = Join-Path $work "$japaneseHash.mdxp"
-        $japaneseSource = Join-Path ($seed + '.sources') "$japaneseHash.mdx"
-        & (Join-Path $directory 'E_Search.exe') pack-ja $japaneseSource $packed | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw '日语卷分发编码失败' }
-        $manifest.japaneseDelivery = [ordered]@{
-            sourceSha256=$japaneseHash
-            packedSha256=(Get-FileHash -LiteralPath $packed).Hash
-            codecSha256=(Get-FileHash -LiteralPath (Join-Path $directory 'es-zlib-ng.dll')).Hash
+    # 从种子识别卷，普通单书仍随包提供原 MDX。相同 SHA 只需一个载体。
+    $volumes = Get-ReleaseVolumeHashes $directory $seed
+    $byHash = @{}
+    $manifest.volumeDeliveries = [ordered]@{}
+    if ($volumes.Count) {
+        $manifest.deliveryCodecSha256 = (Get-FileHash -LiteralPath (Join-Path $directory 'es-zlib-ng.dll')).Hash
+    }
+    foreach ($volume in $volumes.Keys) {
+        $hash = $volumes[$volume]
+        if ($hash -cnotin $indexedSources) { throw "$volume 与种子引用不符" }
+        if (!$byHash.ContainsKey($hash)) {
+            $packed = Join-Path $work "$hash.mdxp"
+            $sourcePath = Join-Path ($seed + '.sources') "$hash.mdx"
+            & (Join-Path $directory 'E_Search.exe') pack-volume $volume $sourcePath $packed | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw "$volume 分发编码失败" }
+            $byHash[$hash] = [ordered]@{
+                sourceSha256=$hash
+                packedSha256=(Get-FileHash -LiteralPath $packed).Hash
+                format=if ($volume -ceq 'zh-ja') { 'ESMDXP02' } else { 'ESMDXP01' }
+            }
         }
+        $manifest.volumeDeliveries[$volume] = $byHash[$hash]
     }
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $directory 'release.json')
     $filename = "E_Search-$($evidence.version)-$($commit.Substring(0,7))-$($fingerprint.Substring(0,12))-win-x64.zip"
@@ -251,7 +291,7 @@ if ($PackageSeed -or $VerifyReleaseZip) {
             # 仅发布当批种子确实引用的原书，历史版本与修复隔离区留在本机。
             foreach ($hash in $indexedSources) {
                 $file = Join-Path ($seed + '.sources') ($hash + '.mdx')
-                if ($hash -ceq $japaneseHash) { $file = $packed }
+                if ($byHash.ContainsKey($hash)) { $file = Join-Path $work "$hash.mdxp" }
                 [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,
                     ("E_Search-win-x64/Data/dictionaries.db.sources/" + [IO.Path]::GetFileName($file)),[IO.Compression.CompressionLevel]::NoCompression)
             }

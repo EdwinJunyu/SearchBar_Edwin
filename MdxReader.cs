@@ -53,6 +53,9 @@ public static class MdxReader
     private const int DeliveryBlockLimit = 2 * 1024 * 1024;
     private const long DeliveryFileLimit = 16L << 30;
     private static ReadOnlySpan<byte> DeliveryMagic => "ESMDXP01"u8;
+    private static ReadOnlySpan<byte> GroupedDeliveryMagic => "ESMDXP02"u8;
+    private const int DeliveryGroupLimit = 1024 * 1024;
+    private const int DeliveryGroupBlocks = 16;
     private static ReadOnlySpan<byte> MetadataPrefix => "<!--ESMERGE1:"u8;
 
     [DllImport("es-zlib-ng.dll", EntryPoint = "compress2", CallingConvention = CallingConvention.Cdecl)]
@@ -178,7 +181,7 @@ public static class MdxReader
         }
     }
 
-    public static void PackDelivery(string mdxPath, string payloadPath, string expectedSha256)
+    public static void PackDelivery(string mdxPath, string payloadPath, string expectedSha256, bool groupBlocks = true)
     {
         byte[] hash = SourceDigest(expectedSha256);
         using var input = File.OpenRead(mdxPath);
@@ -191,7 +194,7 @@ public static class MdxReader
         WriteDelivery(payloadPath, output =>
         {
             using var writer = new BinaryWriter(output, Encoding.UTF8, leaveOpen: true);
-            writer.Write(DeliveryMagic);
+            writer.Write(groupBlocks ? GroupedDeliveryMagic : DeliveryMagic);
             writer.Write(hash);
             writer.Write(input.Length);
             writer.Write(prefix);
@@ -199,6 +202,41 @@ public static class MdxReader
             input.Position = 0;
             byte[] buffer = new byte[65536];
             CopyDeliveryBytes(input, output, prefix, buffer);
+            var group = new List<DeliveryFrame>(DeliveryGroupBlocks);
+            using var groupData = new MemoryStream();
+
+            void WriteCompact(DeliveryFrame frame)
+            {
+                writer.Write((byte)1);
+                writer.Write(frame.Bytes.Length);
+                writer.Write(frame.RawLength);
+                writer.Write(frame.ShapedLength);
+                writer.Write(frame.Bytes);
+            }
+
+            void FlushGroup()
+            {
+                if (group.Count == 0) return;
+                // 原样块和超大块构成边界。组头也计入大小；没有收益时仍写逐块格式。
+                byte[] packed = group.Count > 1 ? CompressDelivery(groupData.ToArray()) : [];
+                if (group.Count > 1 && packed.Length <= DeliveryGroupLimit &&
+                    6 + 8 * group.Count + packed.Length < group.Sum(f => 13 + f.Bytes.Length))
+                {
+                    writer.Write((byte)2);
+                    writer.Write(packed.Length);
+                    writer.Write((byte)group.Count);
+                    foreach (var frame in group)
+                    {
+                        writer.Write(frame.RawLength);
+                        writer.Write(frame.ShapedLength);
+                    }
+                    writer.Write(packed);
+                }
+                else foreach (var frame in group) WriteCompact(frame);
+                group.Clear();
+                groupData.SetLength(0);
+            }
+
             foreach (var block in blocks)
             {
                 if (block.Plain <= DeliveryBlockLimit && block.Packed <= DeliveryBlockLimit)
@@ -214,37 +252,53 @@ public static class MdxReader
                             if (compressed.Length + 8 < original.Length &&
                                 CompressDelivery(plain).AsSpan().SequenceEqual(original.AsSpan(8)))
                             {
-                                writer.Write((byte)1);
-                                writer.Write(compressed.Length);
-                                writer.Write(plain.Length);
-                                writer.Write(shaped.Length);
-                                writer.Write(compressed);
+                                var frame = new DeliveryFrame(compressed, plain.Length, shaped.Length);
+                                if (groupBlocks && shaped.Length <= DeliveryGroupLimit)
+                                {
+                                    if (group.Count == DeliveryGroupBlocks || groupData.Length + shaped.Length > DeliveryGroupLimit)
+                                        FlushGroup();
+                                    groupData.Write(shaped);
+                                    group.Add(frame);
+                                }
+                                else
+                                {
+                                    FlushGroup();
+                                    WriteCompact(frame);
+                                }
                                 continue;
                             }
                         }
                     }
                     input.Position = block.FileOffset;
                 }
+                FlushGroup();
                 writer.Write((byte)0);
                 writer.Write(block.Packed);
                 CopyDeliveryBytes(input, output, block.Packed, buffer);
             }
+            FlushGroup();
             CopyDeliveryBytes(input, output, input.Length - input.Position, buffer);
         });
     }
 
-    private readonly record struct DeliveryFrame(byte[] Bytes, int RawLength, int ShapedLength);
+    private readonly record struct DeliveryFrame(byte[] Bytes, int RawLength, int ShapedLength, bool Expanded = false);
 
     private static (byte[] Bytes, uint? Checksum) RestoreFrame(DeliveryFrame frame)
     {
         if (frame.RawLength == 0) return (frame.Bytes, null);
-        using var compressed = new MemoryStream(frame.Bytes);
-        using var decoder = new ZLibStream(compressed, CompressionMode.Decompress);
-        byte[] shaped = new byte[frame.ShapedLength];
-        decoder.ReadExactly(shaped);
-        Require(decoder.ReadByte() == -1, "MDXP 变换流多出正文。");
+        byte[] shaped = frame.Expanded ? frame.Bytes : ExpandDelivery(frame.Bytes, frame.ShapedLength);
         byte[] plain = UnshapeDelivery(shaped, frame.RawLength);
         return (CompressDelivery(plain), Adler(plain));
+    }
+
+    private static byte[] ExpandDelivery(byte[] bytes, int length)
+    {
+        using var compressed = new MemoryStream(bytes);
+        using var decoder = new ZLibStream(compressed, CompressionMode.Decompress);
+        var result = new byte[length];
+        decoder.ReadExactly(result);
+        Require(decoder.ReadByte() == -1, "MDXP 变换流多出正文。");
+        return result;
     }
 
     public static void RestoreDelivery(string payloadPath, string mdxPath, string expectedSha256)
@@ -252,7 +306,9 @@ public static class MdxReader
         byte[] hash = SourceDigest(expectedSha256);
         using var input = File.OpenRead(payloadPath);
         using var reader = new BinaryReader(input);
-        Require(reader.ReadBytes(DeliveryMagic.Length).AsSpan().SequenceEqual(DeliveryMagic) &&
+        byte[] magic = reader.ReadBytes(DeliveryMagic.Length);
+        bool grouped = magic.AsSpan().SequenceEqual(GroupedDeliveryMagic);
+        Require((grouped || magic.AsSpan().SequenceEqual(DeliveryMagic)) &&
             reader.ReadBytes(HashSize).AsSpan().SequenceEqual(hash), "MDXP 版本或目标 SHA-256 不符。");
         long total = reader.ReadInt64(), prefix = reader.ReadInt64();
         int count = reader.ReadInt32();
@@ -305,11 +361,48 @@ public static class MdxReader
                 batchCost = 0;
             }
 
+            void QueueFrame(DeliveryFrame frame)
+            {
+                // 预算包含压缩输入、展开数据、还原原文和压缩器的输出缓冲。超预算的单块单独处理。
+                int cost = frame.Bytes.Length + frame.ShapedLength + 3 * frame.RawLength + 1024;
+                if (batch.Count == 32 || batchCost + cost > batchBudget) FlushBatch();
+                batch.Add(frame);
+                batchCost += cost;
+            }
+
             for (int i = 0; i < count; i++)
             {
                 byte kind = reader.ReadByte();
                 int size = reader.ReadInt32();
                 int raw = 0, shapedLength = 0;
+                if (kind == 2)
+                {
+                    Require(grouped && size is > 0 and <= DeliveryGroupLimit, "MDXP 分组版本或尺寸无效。");
+                    int members = reader.ReadByte();
+                    Require(members is >= 2 and <= DeliveryGroupBlocks && members <= count - i, "MDXP 分组块数无效。");
+                    var lengths = new (int Raw, int Shaped)[members];
+                    int combined = 0;
+                    for (int j = 0; j < members; j++)
+                    {
+                        raw = reader.ReadInt32();
+                        shapedLength = reader.ReadInt32();
+                        Require(raw is > 0 and <= DeliveryBlockLimit && shapedLength > 0 &&
+                            shapedLength <= DeliveryGroupLimit - combined, "MDXP 分组展开尺寸越界。");
+                        lengths[j] = (raw, shapedLength);
+                        combined += shapedLength;
+                    }
+                    Require(size <= input.Length - input.Position, "MDXP 分组被截断。");
+                    byte[] data = ExpandDelivery(ReadBytes(input, size), combined);
+                    int offset = 0;
+                    foreach (var member in lengths)
+                    {
+                        QueueFrame(new DeliveryFrame(data.AsSpan(offset, member.Shaped).ToArray(),
+                            member.Raw, member.Shaped, Expanded: true));
+                        offset += member.Shaped;
+                    }
+                    i += members - 1;
+                    continue;
+                }
                 if (kind == 0)
                 {
                     Require(size is >= 8 and <= SizeLimit && size <= total - output.Position, "MDXP 原样块越界。");
@@ -331,11 +424,7 @@ public static class MdxReader
                         "MDXP 正文尺寸无效。");
                 }
                 Require(size <= input.Length - input.Position, "MDXP 块被截断。");
-                // 预算包含压缩输入、展开数据、还原原文和压缩器的输出缓冲。超预算的单块单独处理。
-                int cost = size + shapedLength + 3 * raw + 1024;
-                if (batch.Count == 32 || batchCost + cost > batchBudget) FlushBatch();
-                batch.Add(new DeliveryFrame(ReadBytes(input, size), raw, shapedLength));
-                batchCost += cost;
+                QueueFrame(new DeliveryFrame(ReadBytes(input, size), raw, shapedLength));
             }
             FlushBatch();
             Require(input.Length - input.Position == total - output.Position, "MDXP 尾部长度不符。");

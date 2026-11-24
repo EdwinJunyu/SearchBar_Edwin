@@ -6,6 +6,7 @@ import json
 import os
 import random
 import shutil
+import struct
 import subprocess
 import zlib
 from pathlib import Path
@@ -228,7 +229,7 @@ class DeliveryTests(unittest.TestCase):
             mdx, archive, restored = (path / n for n in ("source.mdx", "delivery.mdxp", "restored.mdx"))
             rng = random.Random(42)
             rows = []
-            for i in range(300):
+            for i in range(2400):  # 超过一组，覆盖相邻组边界与最后不足一组的词条。
                 head = f"item-{i:04}"
                 definition = "".join(rng.choices("abcdefghijklmnopqrstuvwxyz", k=200))
                 metadata = json.dumps([["shinseiki", i + 1, head, definition]]).encode()
@@ -238,9 +239,19 @@ class DeliveryTests(unittest.TestCase):
             rows.append(("zz-plain", b"unchanged non-merged page" * 3000))
             write_mdict(mdx, rows, "test", "")
             digest = hashlib.sha256(mdx.read_bytes()).hexdigest()
-            run("pack-ja", mdx, archive)
+            run("pack-volume", "zh-ja", mdx, archive)
+            self.assertEqual(archive.read_bytes()[:8], b"ESMDXP02")
+            legacy = path / "legacy.mdxp"
+            run("pack-volume", "zh-en", mdx, legacy)
+            self.assertEqual(legacy.read_bytes()[:8], b"ESMDXP01")
+            shortcut = path / "old-command.mdxp"
+            run("pack-ja", mdx, shortcut)
+            self.assertEqual(legacy.read_bytes(), shortcut.read_bytes())
+            run("restore-ja", legacy, path / "legacy.mdx", digest)
+            self.assertEqual((path / "legacy.mdx").read_bytes(), mdx.read_bytes())
             if getattr(zlib, "ZLIBNG_VERSION", "") == "2.2.4":
                 self.assertLess(archive.stat().st_size, 0.85 * mdx.stat().st_size)
+                self.assertLess(archive.stat().st_size, legacy.stat().st_size)
             run("restore-ja", archive, restored, digest)
             self.assertEqual(mdx.read_bytes(), restored.read_bytes())
             run("restore-ja", archive, mdx, digest, success=False)
@@ -249,6 +260,17 @@ class DeliveryTests(unittest.TestCase):
             run("restore-ja", archive, invalid, "0" * 64, success=False)
             self.assertFalse(invalid.exists())
             bad = path / "cut.mdxp"
+            if getattr(zlib, "ZLIBNG_VERSION", "") == "2.2.4":
+                grouped = bytearray(archive.read_bytes())
+                first = 60 + struct.unpack_from("<q", grouped, 48)[0]
+                self.assertEqual(grouped[first], 2)
+                for offset, replacement in ((0, b"ESMDXP01"), (first + 5, b"\xff"),
+                                            (first + 10, struct.pack("<i", 1024 * 1024 + 1))):
+                    damaged = grouped.copy()
+                    damaged[offset:offset + len(replacement)] = replacement
+                    bad.write_bytes(damaged)
+                    run("restore-ja", bad, invalid, digest, success=False)
+                    self.assertFalse(invalid.exists())
             bad.write_bytes(archive.read_bytes()[:-12])
             run("restore-ja", bad, invalid, digest, success=False)
             self.assertFalse(invalid.exists())

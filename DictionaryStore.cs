@@ -1654,11 +1654,12 @@ internal sealed class DictionaryStore : IDisposable
         return ActiveSourceHashes(snapshot);
     }
 
-    internal string? JapaneseVolumeHash()
+    internal string? VolumeHash(string volume)
     {
         using var snapshot = db.BeginTransaction(deferred: true);
         if (!HasMergedMdxVolumes(snapshot)) return null;
-        using var query = Command("SELECT sha256 FROM merged_mdx_volumes WHERE volume='zh-ja'", snapshot);
+        using var query = Command("SELECT sha256 FROM merged_mdx_volumes WHERE volume=$group", snapshot);
+        query.Parameters.AddWithValue("$group", volume);
         return query.ExecuteScalar() as string;
     }
 
