@@ -184,7 +184,9 @@ public sealed record LookupEntry(string DictionaryId, long EntryId, string Langu
     string Headword, string? Reading, string Gloss)
 {
     internal string DisplaySourceId { get; init; } = DictionaryId;
-    internal string DisplayHeadword => EntryParser.DisplayHeadword(DisplaySourceId, Headword);
+    // 原书的问号也可能指向其他词条；长度单位的完整释义才足以确定标题。
+    internal string DisplayHeadword => DisplaySourceId == "shinseiki" && Headword == "?"
+        && Gloss == "表示长度的单位“埃”的符号，亦称A。" ? "Å" : EntryParser.DisplayHeadword(DisplaySourceId, Headword);
     internal string DisplayGloss => EntryParser.DisplayText(DisplaySourceId,
         DisplaySourceId == "shinseiki" ? EntryParser.ShinseikiDisplayGloss(Headword, Gloss) : Gloss);
     public string? DictionaryName { get; init; }
@@ -452,7 +454,7 @@ public static partial class Lookup
                     if (entry.Language != phrase.Language) continue;
                     if (!phrase.WeakPotential && phrase.Language == "ja") resolvedJapanese.Add(phrase.Offset);
                     var head = phrase.Canonical ?? entry.Headword;
-                    var displayHead = EntryParser.DisplayHeadword(entry.DisplaySourceId, head);
+                    var displayHead = head == entry.Headword ? entry.DisplayHeadword : EntryParser.DisplayHeadword(entry.DisplaySourceId, head);
                     var label = phrase.Surface == head ? displayHead : $"{phrase.Surface} → {displayHead}";
                     var hit = new LookupHit(entry, "phrase", phrase.Surface, $"{label} · {Format(entry, "headword")}") { SourceOffset = phrase.Offset };
                     // 同一位置同一标题只显示一次；句内另一处可分表达即使指向相同义项，也保留它自己的原文。

@@ -1945,6 +1945,7 @@ public partial class SearchWindow : Window
         if (html.Contains("\"#008000\">", StringComparison.Ordinal) || html.Contains("FONT-FAMILY: <FONT", StringComparison.Ordinal)
             || html.Contains(ShogakukanEmptyExample, StringComparison.Ordinal) || html.Contains(OxfordCollocationTail, StringComparison.Ordinal)
             || html.Contains(EntryParser.ShinseikiBrokenSub, StringComparison.Ordinal)
+            || html.Contains(EntryParser.ShinseikiAngstromHeading, StringComparison.Ordinal) || html.Contains("⇒?的古名。", StringComparison.Ordinal)
             || html.Contains("<su", StringComparison.OrdinalIgnoreCase)
             || html.Contains("\"font-weight:", StringComparison.Ordinal) && html.Contains("entry://esmissing-oxford-", StringComparison.Ordinal))
         {
@@ -1954,7 +1955,10 @@ public partial class SearchWindow : Window
                 if (sections[i].StartsWith("es-shogakukan-zhja\"><a name=\"es-shogakukan-zhja-", StringComparison.Ordinal))
                     sections[i] = SeparateShogakukanArticles(sections[i]);
                 else if (sections[i].StartsWith("es-shinseiki\"><a name=\"es-shinseiki-", StringComparison.Ordinal))
+                {
+                    sections[i] = EntryParser.RestoreShinseikiQuestionMarkup(sections[i]);
                     sections[i] = EntryParser.RepairShinseikiScriptBoundaries(EntryParser.NormalizeShinseikiFormulas(sections[i]));
+                }
                 else if (sections[i].StartsWith("es-sanseido\">", StringComparison.Ordinal))
                     sections[i] = SanseidoMergedLink().Replace(sections[i], m =>
                         m.Groups["label"].Value.EndsWith("<font color=\"#008000\">" + m.Groups["tail"].Value, StringComparison.Ordinal)
@@ -2053,6 +2057,7 @@ public partial class SearchWindow : Window
 
     private static DetailBody FormatDetail(string raw, EntryAnchor? anchor, string sourceId)
     {
+        if (sourceId == "shinseiki") raw = EntryParser.RestoreShinseikiQuestionMarkup(raw);
         bool hanyingCk = sourceId == "hanying" && raw.Contains("<span class=\"CK\">", StringComparison.Ordinal);
         // 坐标分界均在完整标签之间，先分段解码再映射。实体、嵌套标签和重复文字都不靠文本搜索定位。
         string Decode(string html)

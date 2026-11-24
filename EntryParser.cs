@@ -84,11 +84,21 @@ internal static partial class EntryParser
                           ("\uE184","𫚕"), ("眍\uE18C","眍䁖"), ("\uE185裆","𮖁裆"),
                           ("竹\uE1AA鱼","竹䇲鱼"), ("\uE217\uE218","𮩛𫗩"),
                           ("B\uE119","B₂"), ("核黄素,维生素\uE119","核黄素,维生素B₂"),
+                          // 「強化米」另本列 B1、B2；「帯分数」原句把数值直读作「二又七分之三」。
+                          ("加入维生素B\uE118","加入维生素B₁"), ("2\uE47Cを中国語で読む","2³⁄₇を中国語で読む"),
+                          // 「とろ」的唯一外字也是显示词头；另一转制的同条明写「瀞」，释义逐字相同。
+                          ("\uE11C","瀞"), ("\uE1A7bó、手鼓","钹bó、手鼓"),
+                          ("骐\uE197一老","骐骥一老"), ("阿\uE3AE奉承","阿谀奉承"),
                           ("」が異体字になっていたので修正した。\">","」が異体字になっていたので修正した。")],
         // 小学馆中日的「外字（繁字）读音」与 Unihan 17 的双向唯一简繁对及读音对照。
         // 只收录已知繁字、缺简字的方向；括注外字可能是同音异体，不能反向推断。
         ["shogakukan-zhja"] = [
             ("C\uE117I","C³I"), ("\uE11F","『量』"),
+            ("PH\uE11A）","PH₃）"), ("しんにゅう“\uE124”","しんにゅう“辶”"),
+            // 七个姓氏各只见于本卷一条的姓氏义。并行转制保有相同的汉字、读音与片假名；
+            // 原 HTML 将汉字单独放在两个字体标签之间，按本卷码位还原才覆盖该文字节点。
+            ("\uE126","萇"), ("\uE12A","莆"), ("\uE12C","蘧"), ("\uE12D","冉"),
+            ("\uE12E","茹"), ("\uE12F","芮"), ("\uE131","莘"),
             // 原书直接给出三个符号的名称或笔形：阴爻、提笔、竹字头。
             ("\uE11E","⚋"), ("\uE121","㇀"), ("\uE123","⺮"),
             // #39909 和 #41519 把第四声写在韵尾；其余实例在 #16961，是独立成音节的 ǹ。
@@ -124,6 +134,18 @@ internal static partial class EntryParser
         ["shinseiki"] = [
             // 秋田等三个原表头保有 U+2219；生卒年、例句中的普通问号不参与替换。
             ("市 ? 郡 ? 町 ? 村名","市 ∙ 郡 ∙ 町 ∙ 村名"),
+            // カイツブリ的日文义项、同书「鵒」的残字和同义词条共同确定中文鸟名。
+            ("⇒?。??目??科水鸟的总称。","䴙䴘。䴙䴘目䴙䴘科水鸟的总称。"),
+            ("小??。??的一种，体长约25cm。","小䴙䴘。䴙䴘的一种，体长约25cm。"),
+            ("用芦苇、水草及枯叶等在水面上营造的??的巢。","用芦苇、水草及枯叶等在水面上营造的䴙䴘的巢。"),
+            ("见于??科、鳍脚科、秧鸡科","见于䴙䴘科、鳍脚科、秧鸡科"),
+            ("\uE862捜的古名。","䴙䴘的古名。"),
+            // オングストローム、エー及人名的原书实例共同指向 Å，只匹配已核实的上下文。
+            ("オングストローム単位。→?","オングストローム単位。→Å"),
+            ("Anders Jonas \uE6A6ngström","Anders Jonas Ångström"),
+            ("(A·\uE6A6)","(A·Å)"), ("(A，\uE6A6)","(A，Å)"),
+            ("記号\uE6A6またはAで表す。","記号ÅまたはAで表す。"),
+            ("用符号\uE6A6或A表示。","用符号Å或A表示。"),
             // 火偏、日偏的中文对译逐字列出相同例字与部首。只还原日文的这两个例句。
             ("「炉」「煽」などの「??」の部分。","「炉」「煽」などの「火」の部分。"),
             ("「明」「昨」などの「鲉」の部分。","「明」「昨」などの「日」の部分。"),
@@ -138,6 +160,30 @@ internal static partial class EntryParser
             // 释义点名符号；E788 在同书还用于 phi，仅修复明示读作プサイ的粒子名。
             ("J/\uE788","J/ψ"), ("\uE02F","∀"), ("\uE055","∃"), ("\uE59E","©"),
             ("\uE0C8","𝄋"), ("\uE0AF","♠"), ("\uE080","$"), ("\uE054","℉"), ("\uE54F","∅"),
+            // 不等号的中译复写原式；「びぶん」写有 Δx，「フィー，ファイ」列出 Φ 和 φ。
+            ("a\uE075b","a≤b"), ("a\uE075x\uE075b","a≤x≤b"), ("a\uE073b","a≥b"),
+            ("d(y,z)\uE073d(x,z)","d(y,z)≥d(x,z)"), ("delta; \uE0C0.δ","delta; Δ.δ"),
+            ("\uE0C0x","Δx"), ("\uE0C0y","Δy"),
+            ("phi;Ф·\uE788","phi;Φ·φ"), ("斐，Ф，\uE788","斐，Φ，φ"),
+            // 日中两栏相应位置列出相同的字、音标或数量。「濁点」还直接排出了独立的浊点符号。
+            ("「\uE533」","「゛」"), ("“\uE533”","“゛”"), ("〔\uE13E〕","〔θ〕"),
+            ("\uE155線","γ線"), ("\uE155射线","γ射线"), ("红\uE781教","红卍教"),
+            ("红\uE781字会","红卍字会"), ("\uE02D形(まんじがた)","卍形(まんじがた)"),
+            ("金\uE588","金(Ⅲ)"), ("体長10\uE5D4内外","体長10mm内外"), ("100\uE5D9。","100kg。"),
+            // 原字的 Windows CP936 双字节在 GB18030 对应 䜣、䅟、䌷，限与词头或释义相合的词组。
+            ("恭亲王奕\uE844","恭亲王奕䜣"), ("\uE835子，野稗","䅟子，野稗"),
+            ("\uE837丝","䌷丝"), ("结城\uE837","结城䌷"),
+            // 两个引号须配对，所引词也必须在本条另一栏出现或被译文明确引用。
+            ("\uE526稲荷鮨(いなりずし)\uE527","「稲荷鮨(いなりずし)」"), ("\uE526荆冠\uE527","「荆冠」"),
+            ("\uE526オタマジゃクシ\uE527","「オタマジゃクシ」"), ("\uE526イネ科\uE527","「イネ科」"),
+            ("\uE526过料\uE527","「过料」"), ("\uE526ハゲイトウ\uE527","「ハゲイトウ」"),
+            ("\uE526声明\uE527","「声明」"), ("\uE526メハジキ\uE527","「メハジキ」"),
+            ("\uE526クロルカルキ\uE527","「クロルカルキ」"), ("\uE526タイプライター\uE527","「タイプライター」"),
+            // E5E9 也用于连接词语。只恢复日文栏直接列出的同一数字、缩写及其连字符。
+            ("1\uE5E9400家","1400家"), ("6\uE5E9800米","6800米"), ("1\uE5E9024MB","1024MB"),
+            ("1\uE5E9024(＝","1024(＝"), ("15\uE5E9000的糖蛋白","15000的糖蛋白"),
+            ("1\uE5E9000吨","1000吨"), ("1\uE5E9055×","1055×"),
+            ("CD\uE5E9\uE5E9ROM","CD-ROM"), ("D\uE5E9\uE5E9D反应","D-D反应"),
             // 法语 vasectomie 的元音无重音，须在本书常见的 é 字形前处理这个完整拼写。
             ("vas\uE7B0ctomie","vasectomie"),
             ("\uE003","様"), ("\uE578","ç"), ("\uE7B0","é"), ("\uE548","ł"), ("\uE568","ë"),
@@ -835,6 +881,7 @@ internal static partial class EntryParser
 
     internal static string ShinseikiDisplayGloss(string head, string gloss)
     {
+        if (head == "鵒鳥" && gloss == "⇒?的古名。") return "䴙䴘的古名。";
         // 两条旧摘要误收了原书的半截注释；其余字面示例仍保留。
         if (head == "後唐" && gloss.EndsWith("后被其重臣石敬塘所灭。<!--", StringComparison.Ordinal)
             || head == "新興" && gloss == "新しく勢いが盛んになること。新たに興ること。<!--") return gloss[..^4];
@@ -843,6 +890,20 @@ internal static partial class EntryParser
                 if (head == rule.Head) return gloss.Replace(Plain(rule.Raw), rule.Print, StringComparison.Ordinal);
         return gloss;
     }
+
+    internal const string ShinseikiAngstromHeading = """<h1><span class="word">⇒</span><!-- --><!-- --><!-- --></h1></div><div class="ncdata-body">[<span class="unabbrev">angstrom</span>]""";
+
+    // 两处替换前后 UTF-16 长度相同，原书标题及义项的偏移可继续用于分段与高亮。
+    internal static string RestoreShinseikiQuestionMarkup(string html)
+    {
+        if (html.Contains(ShinseikiAngstromHeading, StringComparison.Ordinal))
+            html = html.Replace(ShinseikiAngstromHeading, ShinseikiAngstromHeading.Replace('⇒', 'Å'), StringComparison.Ordinal);
+        return html.Contains("⇒?的古名。", StringComparison.Ordinal)
+            ? ShinseikiGrebeOldName().Replace(html, "${jp}䴙䴘的古名。") : html;
+    }
+
+    [GeneratedRegex("""(?<jp><span>カイツブリの古名。</span>(?:<!-- -->)*<span class="divide-imgs"><img alt="" src="[^"<>]+"\s*/?></span><span>)⇒\?的古名。(?=</span>)""")]
+    private static partial Regex ShinseikiGrebeOldName();
 
     internal static string RefreshShinseikiScriptGloss(string head, string stored, string body)
     {
@@ -907,6 +968,7 @@ internal static partial class EntryParser
 
     internal static IEnumerable<(string Gloss, Range Span, string Examples, string Definition)> ShinseikiReverseSenses(string body, string head)
     {
+        body = RestoreShinseikiQuestionMarkup(body);
         const string article = "<div class=\"wrap-switch\">";
         int first = body.IndexOf(article, IgnoreCase);
         int next = first < 0 ? -1 : body.IndexOf(article, first + article.Length, IgnoreCase);

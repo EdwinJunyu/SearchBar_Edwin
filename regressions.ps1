@@ -3900,7 +3900,23 @@ function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
         @('shinseiki',"アンドラ。ISOの国·地域コードの一。`u{E5E7}・フ`u{E5E7}Société","アンドラ。ISOの国·地域コードの一。・フ`u{E5E7}Société"),
         @('shinseiki',"`u{E526}院`u{E527}・J/`u{E788}・`u{E788}", "「院」・J/ψ・`u{E788}"),
         @('shinseiki',"`u{E02F}(全称)、`u{E055}(存在)、`u{E59E}",'∀(全称)、∃(存在)、©'),
+        @('shinseiki',"a`u{E075}b、a`u{E073}b、`u{E0C0}x、phi;Ф·`u{E788}",'a≤b、a≥b、Δx、phi;Φ·φ'),
+        @('shinseiki',"濁点「`u{E533}」、〔`u{E13E}〕、`u{E155}線、红`u{E781}教、`u{E02D}形(まんじがた)",'濁点「゛」、〔θ〕、γ線、红卍教、卍形(まんじがた)'),
+        @('shinseiki',"金`u{E588}、体長10`u{E5D4}内外、100`u{E5D9}。",'金(Ⅲ)、体長10mm内外、100kg。'),
+        @('shinseiki',"恭亲王奕`u{E844}、`u{E835}子，野稗、`u{E837}丝织物",'恭亲王奕䜣、䅟子，野稗、䌷丝织物'),
+        @('sango',"二`u{E835}烷，`u{E658}","二`u{E835}烷，`u{E658}"),
+        @('shinseiki',"`u{E526}荆冠`u{E527}、`u{E526}未確認`u{E527}","「荆冠」、`u{E526}未確認`u{E527}"),
+        @('shinseiki',"1`u{E5E9}024MB、CD`u{E5E9}`u{E5E9}ROM、建设`u{E5E9}`u{E5E9}拥有","1024MB、CD-ROM、建设`u{E5E9}`u{E5E9}拥有"),
         @('shinseiki',"Queir`u{E7B2}s・sch`u{E7B2}lia","Queirós・sch`u{E7B2}lia"),
+        @('shinseiki','⇒?。??目??科水鸟的总称。','䴙䴘。䴙䴘目䴙䴘科水鸟的总称。'),
+        @('shinseiki','小??。??的一种，体长约25cm。','小䴙䴘。䴙䴘的一种，体长约25cm。'),
+        @('shinseiki','见于??科、鳍脚科、秧鸡科','见于䴙䴘科、鳍脚科、秧鸡科'),
+        @('shinseiki','用芦苇、水草及枯叶等在水面上营造的??的巢。','用芦苇、水草及枯叶等在水面上营造的䴙䴘的巢。'),
+        @('shinseiki',"`u{E862}捜的古名。", '䴙䴘的古名。'),
+        @('shinseiki','オングストローム単位。→?','オングストローム単位。→Å'),
+        @('shinseiki',"Anders Jonas `u{E6A6}ngström・用符号`u{E6A6}或A表示。","Anders Jonas Ångström・用符号Å或A表示。"),
+        @('shinseiki','【⇒?】・⇒?海。・⇒?的古名。','【⇒?】・⇒?海。・⇒?的古名。'),
+        @('sango','⇒?。??目??科水鸟的总称。','⇒?。??目??科水鸟的总称。'),
         @('shinseiki','「炉」「煽」などの「??」の部分。','「炉」「煽」などの「火」の部分。'),
         @('shinseiki','「明」「昨」などの「鲉」の部分。鲉鱼・⇒?。??目??科','「明」「昨」などの「日」の部分。鲉鱼・⇒?。??目??科'),
         @('shogakukan-zhja',"C`u{E117}I系统",'C³I系统'),
@@ -3910,7 +3926,13 @@ function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
         @('shogakukan-zhja',"嗯 `u{E7C8}gに同じ",'嗯 ǹgに同じ'),
         @('shogakukan-zhja',"陰爻「`u{E11E}」；竹かんむり`u{E123}",'陰爻「⚋」；竹かんむり⺮'),
         @('shogakukan',"`u{E184}鱼；眍`u{E18C}；维生素B`u{E119}",'𫚕鱼；眍䁖；维生素B₂'),
-        @('shogakukan',"鼓、`u{E1A7}bó、手鼓","鼓、`u{E1A7}bó、手鼓"),
+        @('shogakukan',"鼓、`u{E1A7}bó、手鼓",'鼓、钹bó、手鼓'),
+        @('shogakukan',"【`u{E11C}】；加入维生素B`u{E118}、B`u{E119}；2`u{E47C}を中国語で読む",'【瀞】；加入维生素B₁、B₂；2³⁄₇を中国語で読む'),
+        @('shogakukan',"〔骐`u{E197}一老〕；阿`u{E3AE}奉承",'〔骐骥一老〕；阿谀奉承'),
+        @('shogakukan',"別の`u{E1A7}；`u{E47C}；`u{E187}虎鱼；`u{E194}头","別の`u{E1A7}；`u{E47C}；`u{E187}虎鱼；`u{E194}头"),
+        @('shogakukan-zhja',"燐化水素（PH`u{E11A}）；しんにゅう`u{201C}`u{E124}`u{201D}",'燐化水素（PH₃）；しんにゅう“辶”'),
+        @('shogakukan-zhja',"`u{E126}・`u{E12A}・`u{E12C}・`u{E12D}・`u{E12E}・`u{E12F}・`u{E131}",'萇・莆・蘧・冉・茹・芮・莘'),
+        @('shogakukan-zhja',"`u{E1A7}；阿`u{E3AE}奉承；`u{E416}","䥽；阿`u{E3AE}奉承；`u{E416}"),
         @('sango',"请回到`u{E0C8}记号处；D?bel；Independ?ncia?",'请回到𝄋记号处；Dübel；Independência?'),
         @('sango','l?art pour l?art；ballon d?essai；trompe－l?oeil',"l'art pour l'art；ballon d'essai；trompe－l'oeil"),
         @('shogakukan','D?bel','D?bel'),
@@ -3931,6 +3953,30 @@ function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
         Assert-Equal $entry.Headword $row[1] '显示后原词头仍可用作查词键'
     }
     $html = '<h1>あら<!-- --></h1><div>东洋鲈鱼。&lt;!--例--&gt;</div>'
+    # 同一个问号键可合收不同条目，名称或词头必须能与本书释义配对。
+    $headLabel = [LookupEntry].GetProperty('DisplayHeadword',[Reflection.BindingFlags]'Instance,NonPublic')
+    foreach ($row in @(
+        @('shinseiki','表示长度的单位“埃”的符号，亦称A。','Å'),
+        @('shinseiki','疑问符号。','?'), @('sango','表示长度的单位“埃”的符号，亦称A。','?')
+    )) {
+        $item=[LookupEntry]::new($row[0],1,'ja',1,'?',$null,$row[1])
+        Assert-Equal ($headLabel.GetValue($item)) $row[2] '保留物理问号，只凭已证实的释义展示单位'
+        Assert-Equal $item.Headword '?' '原始问号仍是检索键'
+    }
+    $unitTitle='<h1><span class="word">⇒</span><!-- --><!-- --><!-- --></h1></div><div class="ncdata-body">[<span class="unabbrev">angstrom</span>]'
+    $bird='<span>カイツブリの古名。</span><!-- --><span class="divide-imgs"><img alt="" src="separator.png"/></span><span>⇒?的古名。</span>'
+    Assert-Equal ($detail.Invoke($null,@($unitTitle,$null,'shinseiki')).Text.StartsWith('Å')) $true '原书 angstrom 标注证实单位标题'
+    Assert-Equal ($detail.Invoke($null,@(($unitTitle.Replace('angstrom','other')),$null,'shinseiki')).Text.StartsWith('⇒')) $true '其它标题里的箭头保持原形'
+    Assert-Equal ($detail.Invoke($null,@($bird,$null,'shinseiki')).Text.EndsWith('䴙䴘的古名。')) $true '同一义项日文明确指出鸟属'
+    Assert-Equal ($detail.Invoke($null,@(($bird.Replace('カイツブリ','別の鳥')),$null,'shinseiki')).Text.EndsWith('⇒?的古名。')) $true '不同鸟名不套用该译文'
+    $retained=$Assembly.GetType('ESearch.SearchWindow').GetMethod('RewriteMergedLinks',$flags)
+    $section='<div class="es-source es-shinseiki"><a name="es-shinseiki-1"></a>'
+    $other=$section.Replace('shinseiki','sango')
+    $rich=$retained.Invoke($null,@("$section$unitTitle$bird</div>$other$unitTitle$bird</div>",'/test'))
+    Assert-Equal $rich.Contains($section+$unitTitle.Replace('⇒','Å')+$bird.Replace('⇒?的古名。','䴙䴘的古名。')) $true '已建合并页的新世纪原文标题与同义古名'
+    Assert-Equal $rich.Contains($other+$unitTitle+$bird) $true '其余来源与来源锚点保持原样'
+    $birdHead=[LookupEntry]::new('shinseiki',169370,'ja',1,'鵒鳥',$null,'⇒?的古名。')
+    Assert-Equal ($format.Invoke($null,@($birdHead,'headword'))) '䴙䴘的古名。' '旧摘要用准确物理词头作证'
     Assert-Equal ($detail.Invoke($null,@($html,$null,'shinseiki'))).Text ("あら" + [Environment]::NewLine + '东洋鲈鱼。<!--例-->') '新世纪隐藏模板注释，保留实体编码的示例'
     $ipa = '<FONT face="Kingsoft Phonetic Plain, Tahoma" color=red>5Apl</FONT>'
     Assert-Equal ($detail.Invoke($null,@("5Apl / $ipa /",$null,'oxford'))).Text '5Apl / ˈæpl /' '仅在牛津音标标签内转写'
