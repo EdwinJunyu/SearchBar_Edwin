@@ -26,6 +26,27 @@
     <Content Include="$(DictionarySeed)" Condition="'$(DictionarySeed)' != ''"
              Link="Data/dictionaries.db" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
+  <!-- 发布原有单文件种子或带按需正文的种子，均用实际数据库引用决定随包的原书。 -->
+  <Target Name="IncludeIndexedSeedSources" BeforeTargets="ComputeFilesToPublish"
+          Condition="'$(DictionarySeed)' != '' and '$(TargetFramework)' == 'net10.0-windows'">
+    <PropertyGroup>
+      <_SeedPath>$([System.IO.Path]::GetFullPath('$(DictionarySeed)', '$(MSBuildProjectDirectory)'))</_SeedPath>
+    </PropertyGroup>
+    <Exec Command="&quot;$(NetCoreRoot)dotnet.exe&quot; &quot;$(TargetPath)&quot; indexed-sources"
+          EnvironmentVariables="E_SEARCH_DB=$(_SeedPath)" ConsoleToMSBuild="true" StandardOutputImportance="Low">
+      <Output TaskParameter="ConsoleOutput" ItemName="_SeedHashes"/>
+    </Exec>
+    <GetFileHash Files="@(_SeedHashes->'$(_SeedPath).sources/%(Identity).mdx')" Algorithm="SHA256"
+                 Condition="'@(_SeedHashes)' != ''">
+      <Output TaskParameter="Items" ItemName="_IndexedSeedFiles"/>
+    </GetFileHash>
+    <Error Condition="'%(_IndexedSeedFiles.Filename)' != '%(_IndexedSeedFiles.FileHash)'"
+           Text="种子引用的 MDX 内容哈希不匹配：%(_IndexedSeedFiles.Identity)"/>
+    <ItemGroup>
+      <ResolvedFileToPublish Include="@(_IndexedSeedFiles)" RelativePath="Data/dictionaries.db.sources/%(Filename)%(Extension)"
+                             CopyToPublishDirectory="PreserveNewest"/>
+    </ItemGroup>
+  </Target>
   <!-- 下载一次并校验官方 SDK；以后的桌面构建复用缓存，命令行目标不依赖 SDK。 -->
   <Target Name="PrepareEverythingSdk" BeforeTargets="PrepareForBuild" Condition="'$(TargetFramework)' == 'net10.0-windows'">
     <PropertyGroup>

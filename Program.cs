@@ -190,7 +190,12 @@ static string FindDatabase(bool readOnly = false)
         // 安装目录可以只读。并发首启只发布一份复制完整且可写的种子库。
         using (var source = File.OpenRead(seed))
         using (var target = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
             source.CopyTo(target);
+            target.Flush(flushToDisk: true);
+        }
+        // 只读安装目录可缺少 WAL 旁文件；从已经复制的快照取得原书清单，再发布个人库。
+        ManagedMdx.CopySources(temporary, seed, database);
         try { File.Move(temporary, database); }
         catch (IOException) when (File.Exists(database)) { }
     }
@@ -215,6 +220,13 @@ if (args is [] or ["help"] or ["--help"])
         发布版使用当前用户的 E_Search 词库；开发版使用项目 .data/dictionaries.db。可用 E_SEARCH_DB 指定。
         import <辞书根目录>          导入四本基础词典及目录中已有的扩展词典
         import <词典ID> <MDX路径>    单独导入或替换
+        import --language <ja|en|zh> <MDX路径>  内联导入自选词典，或在原路径切回内联正文
+        import-indexed <辞书根目录>   按需读取正文，导入基础及现有扩展词典
+        import-indexed <词典ID> <MDX路径>  按需读取正文，导入或替换一本词典
+        import-indexed --language <ja|en|zh> <MDX路径>  按需读取自选词典
+                                    搬迁或备份时请同时保留数据库及其同名 .sources 目录
+        indexed-sources             列出当前数据库引用的 MDX 内容哈希
+        compact                     整理现有数据库，回收重导后空闲的 SQLite 页
         list                        查看词典标识、语言、条数、哈希与文件名
         query <输入> [词典ID]        查询全部词库或限定一本
         entry <词典ID> <序号>        查看读音依据与 MDX 原始正文
@@ -244,9 +256,18 @@ try
         if (store.ListDictionaries().Any(d => d.Id == id)) return id;
         throw new ArgumentException($"未知词典 {id}");
     }
+    void ImportMdx(DictionaryStore store, Source source, string path)
+    {
+        if (args[0] == "import-indexed")
+        {
+            var book = store.ImportIndexedMdx(path, source.Language, source: source);
+            Console.WriteLine($"{book.Id}\t{book.Records}\t{book.Sha256}");
+        }
+        else store.Import(source, path);
+    }
     switch (args)
     {
-        case ["import",var root]:
+        case ["import" or "import-indexed",var root]:
         {
             using var store = new DictionaryStore(FindDatabase());
             foreach (var source in Source.All)
@@ -258,17 +279,43 @@ try
                     Console.WriteLine($"跳过未找到的扩展词典：{source.RelativePath}");
                     continue;
                 }
-                store.Import(source, path);
+                ImportMdx(store, source, path);
             }
             break;
         }
-        case ["import",var id,var path]:
+        case ["import" or "import-indexed","--language", "ja" or "en" or "zh", var customPath]:
         {
-            var source = Resolve(id);
             using var store = new DictionaryStore(FindDatabase());
-            store.Import(source,path);
+            var book = store.ImportMdx(customPath, args[2], indexed: args[0] == "import-indexed");
+            Console.WriteLine($"{book.Id}\t{book.Records}\t{book.Sha256}");
             break;
         }
+        case ["import" or "import-indexed",var id,var path]:
+        {
+            var source = Source.All.FirstOrDefault(s => s.Id == id);
+            if (source == null)
+            {
+                // 自选词典也可按已有 ID 换版或切回内联，原文件改名后仍能保留设置和引用。
+                DictionaryInfo book;
+                using (var catalog = OpenReader())
+                    book = catalog.ListDictionaries().FirstOrDefault(d => d.Id == id) ?? throw new ArgumentException($"未知词典 {id}");
+                using var customStore = new DictionaryStore(FindDatabase());
+                var updated = customStore.ImportMdx(path, book.Language, args[0] == "import-indexed", replaceId: id);
+                Console.WriteLine($"{updated.Id}\t{updated.Records}\t{updated.Sha256}");
+                break;
+            }
+            using var store = new DictionaryStore(FindDatabase());
+            ImportMdx(store, source, path);
+            break;
+        }
+        case ["indexed-sources"]:
+            using (var store = OpenReader())
+                foreach (var hash in store.IndexedHashes()) Console.WriteLine(hash);
+            break;
+        case ["compact"]:
+            if (!File.Exists(FindDatabase(readOnly: true))) throw new FileNotFoundException("没有可整理的词库。");
+            using (var store = new DictionaryStore(FindDatabase())) store.Compact();
+            break;
         case ["list"]:
             using (var store = OpenReader()) store.List();
             break;

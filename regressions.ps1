@@ -3,7 +3,7 @@ param([string] $RealDatabase, [switch] $Desktop, [switch] $FileDesktop, [string]
       [switch] $SettingsDesktop, [string] $MdxSample, [string] $GuiExecutable, [switch] $OutOfOrder, [switch] $RestartEngine,
       [ValidateSet('Files','Keyboard','ColdEdit','Tray')][string[]] $AcceptanceDesktop,
       [string] $BackendTestDirectory, [switch] $PrepareDesktop, [switch] $WindowDesktop, [switch] $FileActionsDesktop, [string] $FileFixtureRoot,
-      [string] $PackageSeed, [string] $VerifyReleaseZip)
+      [string] $PackageSeed, [string] $VerifyReleaseZip, [string] $IndexedMdxTestDirectory, [string] $CompareIndexedDatabase)
 $ErrorActionPreference = 'Stop'
 # 失败重导本身也是验收项，命令退出码由 Invoke-Search 明确检查。
 $PSNativeCommandUseErrorActionPreference = $false
@@ -32,6 +32,22 @@ function Get-ReleaseEvidence([string]$Directory, [string]$Database) {
 function Get-ReleaseFingerprint($Hashes) {
     $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $Hashes -Compress))
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+function Get-IndexedSeedHashes([string]$Directory, [string]$Database) {
+    $previousDb = $env:E_SEARCH_DB
+    try {
+        $env:E_SEARCH_DB = $Database
+        # WinExe 需显式接入管道，PowerShell 才会等待程序并收集标准输出。
+        $hashes = @(& (Join-Path $Directory 'E_Search.exe') indexed-sources | ForEach-Object { $_ })
+        if ($LASTEXITCODE -ne 0) { throw '无法读取种子所引用的 MDX 清单' }
+        foreach ($hash in $hashes) {
+            if ($hash -cnotmatch '^[0-9A-F]{64}$') { throw "种子的 MDX 哈希无效：$hash" }
+            $source = Join-Path ($Database + '.sources') ($hash + '.mdx')
+            if ((Get-FileHash -LiteralPath $source).Hash -cne $hash) { throw "托管 MDX 内容校验失败：$hash" }
+            $hash
+        }
+    } finally { $env:E_SEARCH_DB = $previousDb }
 }
 
 function Get-ReleaseSources {
@@ -82,6 +98,10 @@ function Test-ReleaseZip([string]$Archive, [string]$Cache) {
         }
         if ((Get-ReleaseFingerprint $manifest.sourceFiles) -cne $manifest.sourceSha256 -or
             (Get-FileHash -LiteralPath $seed).Hash -cne $manifest.seedSha256) { throw 'ZIP 的源码清单或种子与发布记录不一致' }
+        if ($manifest.ContainsKey('indexedSources') -and
+            ((@(Get-IndexedSeedHashes $directory $seed) -join ',') -cne ($manifest.indexedSources -join ','))) {
+            throw 'ZIP 的 MDX 与种子引用清单不一致'
+        }
         $observed = Get-ReleaseEvidence $directory $seed
         foreach ($field in $observed.Keys) {
             if ((ConvertTo-Json -Compress -InputObject $observed[$field]) -cne
@@ -136,11 +156,12 @@ if ($PackageSeed -or $VerifyReleaseZip) {
     if ((git @gitArgs rev-parse --verify HEAD) -cne $commit -or
         (Get-ReleaseFingerprint (Get-ReleaseSources)) -cne $fingerprint) { throw '构建时源码发生变化，请用当前工作区重新发布。' }
     $evidence = Get-ReleaseEvidence $directory $seed
+    $indexedSources = @(Get-IndexedSeedHashes $directory $seed)
     if ($evidence.build -cne "$($evidence.version)+$tag") { throw '编译标识与本次源码不一致' }
     $manifest = [ordered]@{ baseCommit=$commit; sourceSha256=$fingerprint; sourceFiles=$hashes
         binaries=(Get-ReleaseBinaries $directory)
         seedSha256=(Get-FileHash -LiteralPath $seed).Hash
-        verified=$evidence }
+        indexedSources=$indexedSources; verified=$evidence }
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $directory 'release.json')
     $filename = "E_Search-$($evidence.version)-$($commit.Substring(0,7))-$($fingerprint.Substring(0,12))-win-x64.zip"
     $candidate = Join-Path $work $filename
@@ -162,6 +183,12 @@ if ($PackageSeed -or $VerifyReleaseZip) {
             $entry = $zip.CreateEntry('E_Search-win-x64/Data/dictionaries.db',[IO.Compression.CompressionLevel]::Optimal)
             $stream = $entry.Open()
             try { $source.CopyTo($stream) } finally { $stream.Dispose() }
+            # 仅发布当批种子确实引用的原书，历史版本与修复隔离区留在本机。
+            foreach ($hash in $indexedSources) {
+                $file = Join-Path ($seed + '.sources') ($hash + '.mdx')
+                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,
+                    "E_Search-win-x64/Data/dictionaries.db.sources/$hash.mdx",[IO.Compression.CompressionLevel]::NoCompression)
+            }
         } finally { $zip.Dispose() }
     } finally { $source.Dispose() }
     Test-ReleaseZip $candidate $cache
@@ -203,35 +230,347 @@ function Block([byte[]]$Bytes) {
     return ,([byte[]]((BigEndian 0) + (BigEndian (Checksum $Bytes)) + $Bytes))
 }
 function Write-Mdx([string]$Path, [Collections.IDictionary]$Entries) {
-    $utf8 = [Text.Encoding]::UTF8
-    $keys = [byte[]]@()
-    $records = [byte[]]@()
-    $sizes = [byte[]]@()
+    $blocks = [Collections.Generic.List[byte[]]]::new()
+    $offsets = [Collections.Generic.List[int]]::new()
     $offset = 0
     foreach ($pair in $Entries.GetEnumerator()) {
-        $body = $utf8.GetBytes($pair.Value)
-        $packed = Block $body
-        $keys += (BigEndian $offset) + $utf8.GetBytes($pair.Key) + [byte]0
-        $sizes += (BigEndian $packed.Length) + (BigEndian $body.Length)
-        $records += $packed
+        $body = [Text.Encoding]::UTF8.GetBytes($pair.Value)
+        $offsets.Add($offset)
+        $blocks.Add($body)
         $offset += $body.Length
     }
-    $header = [Text.Encoding]::Unicode.GetBytes('<Dictionary GeneratedByEngineVersion="1.2" Encoding="UTF-8"/>')
+    Write-MdxLayout $Path @($Entries.Keys) ($offsets.ToArray()) ($blocks.ToArray())
+}
+
+# 词头区间与压缩块边界独立；测试可以指定共享偏移及跨块的 UTF-8 字符。
+function Write-MdxLayout([string]$Path, [string[]]$Names, [int[]]$Offsets, [byte[][]]$Blocks, [switch]$Utf16) {
+    $charset = if ($Utf16) { 'UTF-16' } else { 'UTF-8' }
+    $encoding = [Text.Encoding]::GetEncoding($charset)
+    $terminator = $encoding.GetBytes([string][char]0)
+    $keys = [byte[]]@()
+    for ($i = 0; $i -lt $Names.Count; $i++) {
+        $keys += (BigEndian $Offsets[$i]) + $encoding.GetBytes($Names[$i]) + $terminator
+    }
+    $records = [byte[]]@()
+    $sizes = [byte[]]@()
+    foreach ($body in $Blocks) {
+        $packed = Block $body
+        $sizes += (BigEndian $packed.Length) + (BigEndian $body.Length)
+        $records += $packed
+    }
+    $header = [Text.Encoding]::Unicode.GetBytes('<Dictionary GeneratedByEngineVersion="1.2" Encoding="{0}"/>' -f $charset)
     $packedKeys = Block $keys
-    $names = @($Entries.Keys)
-    $first = $utf8.GetBytes($names[0])
-    $last = $utf8.GetBytes($names[-1])
-    $count = BigEndian $Entries.Count
-    $index = $count + [byte]$first.Length + $first + [byte]$last.Length + $last +
+    $first = $encoding.GetBytes($Names[0])
+    $last = $encoding.GetBytes($Names[-1])
+    $count = BigEndian $Names.Count
+    $index = $count + [byte]($first.Length/$terminator.Length) + $first + [byte]($last.Length/$terminator.Length) + $last +
         (BigEndian $packedKeys.Length) + (BigEndian $keys.Length)
     $headerChecksum = [BitConverter]::GetBytes((Checksum $header))
     $data = (BigEndian $header.Length) + $header + $headerChecksum + (BigEndian 1) + $count +
         (BigEndian $index.Length) + (BigEndian $packedKeys.Length) + $index + $packedKeys +
-        $count + $count + (BigEndian $sizes.Length) + (BigEndian $records.Length) + $sizes + $records
+        (BigEndian $Blocks.Count) + $count + (BigEndian $sizes.Length) + (BigEndian $records.Length) + $sizes + $records
     [IO.File]::WriteAllBytes($Path, $data)
 }
 function Assert-Equal($Actual, $Expected, $Scenario) {
     if ($Actual -cne $Expected) { throw "$Scenario 预期「$Expected」，实际「$Actual」" }
+}
+
+function Test-IndexedLiveRepair([string]$Directory, [Reflection.Assembly]$Assembly) {
+    $previousDb = $env:E_SEARCH_DB
+    try {
+        $env:E_SEARCH_DB = Join-Path $Directory 'live-repair.db'
+        $book = Join-Path $Directory 'live-repair.mdx'
+        Write-Mdx $book ([ordered]@{alpha='AAAA'; bravo='BBBB'})
+        Invoke-Search @('import-indexed','oxford',$book) | Out-Null
+        $managed = Join-Path ($env:E_SEARCH_DB + '.sources') ((Get-FileHash -LiteralPath $book).Hash + '.mdx')
+        Write-Mdx $managed ([ordered]@{alpha='AAAA'; bravo='XXXX'})
+        $type = $Assembly.GetType('DictionaryStore')
+        $store = $type.GetConstructor([type[]]@([string],[bool])).Invoke(@([string]$env:E_SEARCH_DB,$false))
+        try {
+            # 桌面进程可通过第一块建立长寿命句柄，随后在下一块遇错；修复不能依赖退出进程。
+            Assert-Equal ($store.Detail('oxford',1).Item2) 'AAAA' '同一进程可先打开完好块'
+            $badBlock = $false
+            try { $null = $store.Detail('oxford',2) } catch { $badBlock = $true }
+            Assert-Equal $badBlock $true '同一进程确实读到已损块'
+            $null = $store.ImportIndexedMdx($book,'en','oxford')
+            Assert-Equal ($store.Detail('oxford',2).Item2) 'BBBB' '原会话重导后立刻读到修复正文'
+        } finally { $store.Dispose() }
+    } finally { $env:E_SEARCH_DB = $previousDb }
+}
+
+function Test-IndexedReimportMode([string]$Directory, [Reflection.Assembly]$Assembly) {
+    $previousDb = $env:E_SEARCH_DB
+    try {
+        $env:E_SEARCH_DB = Join-Path $Directory 'reimport-mode.db'
+        $book = Join-Path $Directory 'mode.mdx'
+        Write-Mdx $book ([ordered]@{apple='第一版'})
+        Invoke-Search @('import-indexed','oxford',$book) | Out-Null
+        Write-Mdx $book ([ordered]@{apple='第二版'})
+        # 设置页的默认更新保留该本的存储方式；CLI 两个明确的导入动词可以主动切换。
+        $type = $Assembly.GetType('DictionaryStore')
+        $store = $type.GetConstructor([type[]]@([string],[bool])).Invoke(@([string]$env:E_SEARCH_DB,$false))
+        try {
+            $null = $type.GetMethod('ImportDictionary').Invoke($store,@([string]$book,'en',$null,$null))
+        } finally { $store.Dispose() }
+        Assert-Equal (@(Invoke-Search @('indexed-sources')) -join '|') (Get-FileHash -LiteralPath $book).Hash '设置页更新已索引 MDX 保留按块方式'
+        Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1]) '第二版' '设置页重导采用新正文'
+        Invoke-Search @('import','oxford',$book) | Out-Null
+        Assert-Equal @(Invoke-Search @('indexed-sources')).Count 0 '明确的普通 CLI 导入可以切回 SQLite 正文'
+        [IO.Directory]::Move(($env:E_SEARCH_DB + '.sources'),(Join-Path $Directory 'retired-mode-sources'))
+        Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1]) '第二版' '切回后即使移走 MDX 目录亦可打开完整正文'
+    } finally { $env:E_SEARCH_DB = $previousDb }
+}
+
+function Test-IndexedCompaction([string]$Directory) {
+    $previousDb = $env:E_SEARCH_DB
+    try {
+        $env:E_SEARCH_DB = Join-Path $Directory 'compact.db'
+        $book = Join-Path $Directory 'compact.mdx'
+        # 扩展不可见 HTML 属性只增加旧库的正文列；实际预览在两种模式下一样短。
+        $raw = '<p data-padding="' + ('x' * 131072) + '">体积样本</p>'
+        Write-Mdx $book ([ordered]@{size=$raw})
+        Invoke-Search @('import','oxford',$book) | Out-Null
+        Invoke-Search @('import-indexed','oxford',$book) | Out-Null
+        $before = (Get-Item -LiteralPath $env:E_SEARCH_DB).Length
+        Invoke-Search @('compact') | Out-Null
+        $after = (Get-Item -LiteralPath $env:E_SEARCH_DB).Length
+        Assert-Equal ($after -lt $before) $true '旧 MDX 改索引后压缩可回收旧正文空闲页'
+        Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1] -ceq $raw) $true '收缩后索引、源和完整正文仍然可读'
+    } finally { $env:E_SEARCH_DB = $previousDb }
+}
+
+function Test-SequentialMdxBlocks([string]$Directory) {
+    $path = Join-Path $Directory 'sequential.mdx'
+    $bytes = [Text.Encoding]::UTF8
+    Write-MdxLayout $path @('a','b','c','d') @(0,2,4,6) @($bytes.GetBytes('aabbc'),$bytes.GetBytes('cdd'))
+    $budget = [MdxReader]::CacheBudgetBytes
+    try {
+        # 模拟物理块超过查询缓存预算。一次顺序导入仍然应复用游标刚解压的当前块。
+        [MdxReader]::CacheBudgetBytes = 0
+        $before = [MdxReader]::CacheStats.DecodedBlocks
+        $rows = @([MdxReader]::Read($path))
+        Assert-Equal (($rows | ForEach-Object { $_.Item3 }) -join '|') 'aa|bb|cc|dd' '四个词条含跨块记录均按序读全'
+        Assert-Equal ([MdxReader]::CacheStats.DecodedBlocks - $before) 2 '顺序读四条只解压两个物理块'
+    } finally { [MdxReader]::CacheBudgetBytes = $budget }
+}
+
+function Test-CustomStorageFallback([string]$Directory) {
+    $previousDb = $env:E_SEARCH_DB
+    try {
+        $env:E_SEARCH_DB = Join-Path $Directory 'custom-mode.db'
+        $book = Join-Path $Directory 'custom.mdx'
+        Write-Mdx $book ([ordered]@{apple='自选第一版'})
+        $indexed = @(Invoke-Search @('import-indexed','--language','en',$book))
+        $id = ($indexed[0] -split "`t")[0]
+        Assert-Equal ([string]::IsNullOrWhiteSpace($id)) $false '自选索引导入取得词典 ID'
+        Write-Mdx $book ([ordered]@{apple='自选第二版'})
+        Invoke-Search @('import','--language','en',$book) | Out-Null
+        $catalog = @(Invoke-Search @('list'))
+        Assert-Equal $catalog.Count 1 '自选文件切回原模式没有重复词典'
+        Assert-Equal (($catalog[0] -split "`t")[0]) $id '同一路径自选原书切换模式保留 ID'
+        Assert-Equal @(Invoke-Search @('indexed-sources')).Count 0 '自选原书切回 SQLite 后不再引用托管源'
+        Assert-Equal (@(Invoke-Search @('entry',$id,'1'))[-1]) '自选第二版' '旧 ID 可查看自选词典的最新原文'
+        $renamed = Join-Path $Directory 'custom-renamed.mdx'
+        [IO.File]::Move($book,$renamed)
+        Invoke-Search @('import-indexed',$id,$renamed) | Out-Null
+        Invoke-Search @('import',$id,$renamed) | Out-Null
+        Assert-Equal @(Invoke-Search @('list')).Count 1 '按自选 ID 切换改名原书只保留一条目录记录'
+        Assert-Equal @(Invoke-Search @('indexed-sources')).Count 0 '改名后也可按 ID 恢复内联存储'
+        Assert-Equal (@(Invoke-Search @('entry',$id,'1'))[-1]) '自选第二版' '自选 ID 经改名回退后仍可读原文'
+    } finally { $env:E_SEARCH_DB = $previousDb }
+}
+
+function Test-IndexedColdIntegrity([string]$Directory) {
+    $path = Join-Path $Directory 'cold-integrity.mdx'
+    Write-Mdx $path ([ordered]@{alpha='AAAA'; bravo='BBBB'})
+    $hash = (Get-FileHash -LiteralPath $path).Hash
+    $index = [MdxReader]::OpenIndexed($path)
+    try { $directoryBytes = $index.ExportVerifiedDirectory($hash) }
+    finally { $index.Dispose() }
+    $budget = [MdxReader]::CacheBudgetBytes
+    try {
+        [MdxReader]::CacheBudgetBytes = 0
+        [MdxReader]::CacheBudgetBytes = 8
+        # 重写第二块及其有效 Adler32，保留长度和偏移；仅验证 MDX 自带校验无法发现替换。
+        Write-Mdx $path ([ordered]@{alpha='AAAA'; bravo='XXXX'})
+        $reader = [MdxReader]::OpenRecords($path,$hash,$directoryBytes)
+        try {
+            Assert-Equal ($reader.ReadBody(0,4)) 'AAAA' '其他块损坏时冷读完好块仍成功'
+            $errorMessage = ''
+            try { $null = $reader.ReadBody(4,8) }
+            catch { $errorMessage = $_.Exception.GetBaseException().Message }
+            Assert-Equal ($errorMessage.Length -gt 0) $true '校验值正确但与导入时 SHA 不符的块必须拒绝'
+        } finally { $reader.Dispose() }
+        Write-Mdx $path ([ordered]@{alpha='AAAA'; bravo='BBBB'})
+        $reader = [MdxReader]::OpenRecords($path,$hash,$directoryBytes)
+        try { Assert-Equal ($reader.ReadBody(4,8)) 'BBBB' '修复后再次冷读可得正确正文' }
+        finally { $reader.Dispose() }
+    } finally { [MdxReader]::CacheBudgetBytes = $budget }
+}
+
+function Test-IndexedBlockCache([string]$Directory) {
+    $path = Join-Path $Directory 'cache.mdx'
+    Write-Mdx $path ([ordered]@{a='AAAA'; b='BBBB'; c='CCCC'; d='DDDD'})
+    $hash = (Get-FileHash -LiteralPath $path).Hash
+    $previousBudget = [MdxReader]::CacheBudgetBytes
+    try {
+        # 四个等长块、两个块的预算；再次访问 A 能区分 LRU 与插入顺序淘汰。
+        [MdxReader]::CacheBudgetBytes = 0
+        [MdxReader]::CacheBudgetBytes = 8
+        $cold = [MdxReader]::CacheStats
+        $index = [MdxReader]::OpenIndexed($path)
+        try { Assert-Equal $index.Entries.Count 4 '仅取元数据列出四个物理词条' }
+        finally { $index.Dispose() }
+        Assert-Equal ([MdxReader]::CacheStats.DecodedBlocks - $cold.DecodedBlocks) 0 '枚举词头不解压正文块'
+        $records = [MdxReader]::OpenRecords($path,$hash)
+        try {
+            foreach ($i in 0,1,0,2,0,1) {
+                $expected = @('AAAA','BBBB','CCCC')[$i]
+                Assert-Equal ($records.ReadBody(4*$i,4*$i+4)) $expected 'LRU 中命中正确的正文块'
+            }
+            $warm = [MdxReader]::CacheStats
+            Assert-Equal ($warm.DecodedBlocks - $cold.DecodedBlocks) 4 'LRU 淘汰最久未使用块'
+            Assert-Equal ($warm.Hits - $cold.Hits) 2 '重查 A 两次均命中缓存'
+            Assert-Equal $warm.RetainedBytes 8 '缓存按解压字节数计量'
+
+            # 冷块 D 由 16 个独立会话同时读取。屏障使所有会话都先打开同一不可变源。
+            $barrier = [Threading.Barrier]::new(16)
+            try {
+                $results = @(1..16 | ForEach-Object -ThrottleLimit 16 -Parallel {
+                    $gate = $using:barrier
+                    $session = [MdxReader]::OpenRecords($using:path,$using:hash)
+                    try {
+                        if (!$gate.SignalAndWait([TimeSpan]::FromSeconds(30))) { throw '等待并发读者超时' }
+                        $session.ReadBody(12,16)
+                    } finally { $session.Dispose() }
+                })
+                Assert-Equal $results.Count 16 '16 个并发会话均返回结果'
+                Assert-Equal @($results | Where-Object { $_ -cne 'DDDD' }).Count 0 '并发会话读同一块返回一致正文'
+            } finally { $barrier.Dispose() }
+            Assert-Equal ([MdxReader]::CacheStats.DecodedBlocks - $warm.DecodedBlocks) 1 '16 个冷读只解压一次'
+
+            [MdxReader]::CacheBudgetBytes = 0
+            $disabled = [MdxReader]::CacheStats
+            Assert-Equal ($records.ReadBody(4,8)) 'BBBB' '关闭缓存时首次回读'
+            Assert-Equal ($records.ReadBody(4,8)) 'BBBB' '关闭缓存时重复回读'
+            Assert-Equal ([MdxReader]::CacheStats.DecodedBlocks - $disabled.DecodedBlocks) 2 '零预算下两次读取各自解压'
+            Assert-Equal ([MdxReader]::CacheStats.RetainedBytes) 0 '零预算下不保留解压块'
+        } finally { $records.Dispose() }
+    } finally { [MdxReader]::CacheBudgetBytes = $previousBudget }
+}
+
+function Test-IndexedMdx([string]$Directory, [Reflection.Assembly]$Assembly) {
+    $scratch = [IO.Directory]::CreateDirectory((Join-Path $Directory ('indexed-' + [guid]::NewGuid().ToString('N')))).FullName
+    $originalDb = $env:E_SEARCH_DB
+    try {
+        # 用原查询及详情作为基准，并在索引库中保留另一部旧格式 MDX 和一份 CSV。
+        $book = Join-Path $scratch 'test-oxford.mdx'
+        $raw = '<p data-original="indexed正文校验">收到</p>'
+        Write-Mdx $book ([ordered]@{ receive=$raw; alias='@@@LINK=receive' })
+        $env:E_SEARCH_DB = Join-Path $scratch 'baseline.db'
+        Invoke-Search @('import','oxford',$book) | Out-Null
+        $baselineHit = @(Invoke-Search @('query','alias','oxford')) -join "`n"
+        $baselineDetail = @(Invoke-Search @('entry','oxford','1')) -join "`n"
+        Assert-Equal ($baselineHit.StartsWith("oxford:1`t")) $true '对照词库的重定向命中原词'
+        Assert-Equal ($baselineDetail.Contains($raw)) $true '对照词库详情含完整正文'
+
+        $env:E_SEARCH_DB = Join-Path $scratch 'indexed.db'
+        $legacy = Join-Path $scratch 'legacy.mdx'
+        Write-Mdx $legacy ([ordered]@{ 'たべる'='たべる<br>【食べる】<br>吃' })
+        Invoke-Search @('import','shogakukan',$legacy) | Out-Null
+        $csv = Join-Path $scratch 'glossary.csv'
+        [IO.File]::WriteAllText($csv,"head,gloss`nportable,便携")
+        $storeCtor = $Assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool]))
+        $store = $storeCtor.Invoke(@($env:E_SEARCH_DB,$false))
+        try {
+            $mapping = [Activator]::CreateInstance($Assembly.GetType('TableMapping'), @(0,1,$null,$true))
+            $csvId = $store.ImportDictionary($csv,'en',$mapping).Id
+        } finally { $store.Dispose() }
+
+        Invoke-Search @('import-indexed','oxford',$book) | Out-Null
+        $firstHash = (Get-FileHash -LiteralPath $book).Hash
+        Assert-Equal (@(Invoke-Search @('indexed-sources')) -join '|') $firstHash '旧 MDX 和 CSV 不需要随包附带原书'
+        # 模拟两次 CLI 运行之间托管文件的内容损坏；用户仍有正确的原档可供重导。
+        $managed = Join-Path ($env:E_SEARCH_DB + '.sources') ($firstHash + '.mdx')
+        $damagedSource = [IO.File]::ReadAllBytes($managed)
+        $damagedSource[-1] = $damagedSource[-1] -bxor 1
+        [IO.File]::WriteAllBytes($managed,$damagedSource)
+        Invoke-Search @('import-indexed','oxford',$book) | Out-Null
+        Assert-Equal (Get-FileHash -LiteralPath $managed).Hash $firstHash '正确原档重导后修复已损托管副本'
+        [IO.File]::Move($book,(Join-Path $scratch 'original-moved.mdx'))
+        Assert-Equal (@(Invoke-Search @('query','alias','oxford')) -join "`n") $baselineHit '索引导入保留重定向及预览'
+        Assert-Equal (@(Invoke-Search @('entry','oxford','1')) -join "`n") $baselineDetail '移动原档后新进程仍可读完整正文'
+        Assert-Equal (@(Invoke-Search @('query','taberu','shogakukan')) -join ' ' -like '*食べる*') $true '混合库的旧 MDX 仍可按读音检索'
+        Assert-Equal (@(Invoke-Search @('query','portable',$csvId)) -join ' ' -like '*便携*') $true '混合库的 CSV 仍可查词'
+        $connectionString = [Microsoft.Data.Sqlite.SqliteConnectionStringBuilder]::new()
+        $connectionString.DataSource = $env:E_SEARCH_DB
+        $db = [Microsoft.Data.Sqlite.SqliteConnection]::new($connectionString.ToString())
+        try {
+            $db.Open()
+            $cmd = $db.CreateCommand()
+            $cmd.CommandText = "SELECT coalesce(sum(length(raw)),0) FROM entries WHERE dict='oxford'"
+            Assert-Equal ($cmd.ExecuteScalar()) 0 '索引词典在 SQLite 中不保存展开正文'
+            $cmd.Dispose()
+        } finally { $db.Dispose() }
+
+        $oldCatalog = @(Invoke-Search @('list')) -join "`n"
+        Write-Mdx $book ([ordered]@{ receive='新版本'; replaced='新词' })
+        $damaged = [IO.File]::ReadAllBytes($book)
+        $damaged[-1] = $damaged[-1] -bxor 1
+        $broken = Join-Path $scratch 'bad.mdx'
+        [IO.File]::WriteAllBytes($broken,$damaged)
+        Invoke-Search @('import-indexed','oxford',$broken) 1 | Out-Null
+        Assert-Equal (@(Invoke-Search @('list')) -join "`n") $oldCatalog '失败重导保留已发布词典元数据'
+        Assert-Equal (@(Invoke-Search @('entry','oxford','1')) -join "`n") $baselineDetail '失败重导后原正文可读'
+        Assert-Equal (@(Invoke-Search @('indexed-sources')) -join '|') $firstHash '失败候选未进入原书发布清单'
+        Invoke-Search @('import-indexed','oxford',$book) | Out-Null
+        Assert-Equal (@(Invoke-Search @('indexed-sources')) -join '|') (Get-FileHash -LiteralPath $book).Hash '换版后发布清单仅含当前引用的原书哈希'
+        Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1]) '新版本' '换版后同序号读取新正文'
+        Assert-Equal (@(Invoke-Search @('query','replaced','oxford')) -join ' ' -like 'oxford:2*') $true '换版后新词可查'
+        Assert-Equal @(Invoke-Search @('query','alias','oxford')).Count 0 '换版后旧跳转已退出活动索引'
+
+        $layout = Join-Path $scratch 'offsets.mdx'
+        $utf8 = [Text.Encoding]::UTF8.GetBytes('界😀水!末尾')
+        $names = @('alpha','bravo','echo','zulu')
+        $starts = @(0,7,0,11)
+        $ends = @(7,11,7,17)
+        $bodies = @('界😀','水!','界😀','末尾')
+        Write-MdxLayout $layout $names $starts @([byte[]]$utf8[0..0], [byte[]]$utf8[1..7], [byte[]]$utf8[8..16])
+        $index = [MdxReader]::OpenIndexed($layout)
+        try {
+            $entries = @($index.Entries)
+            Assert-Equal $entries.Count 4 '共享正文保留四个物理词条'
+            for ($i=0; $i -lt $entries.Count; $i++) {
+                $e = $entries[$i]
+                Assert-Equal $e.Ordinal ($i+1) '物理词条使用稳定的 1 基序号'
+                Assert-Equal $e.Headword $names[$i] '逆序偏移保留原始词头顺序'
+                Assert-Equal $e.Start $starts[$i] '索引记录起点'
+                Assert-Equal $e.End $ends[$i] '同偏移、跨块或末条的结束位置'
+                Assert-Equal ($index.ReadBody($e.Start,$e.End)) $bodies[$i] '多字节跨块和同偏移记录的实际正文'
+            }
+        } finally { if ($index -is [IDisposable]) { $index.Dispose() } }
+        $wideLayout = Join-Path $scratch 'utf16.mdx'
+        $wide = [Text.Encoding]::Unicode.GetBytes('日😀')
+        Write-MdxLayout $wideLayout @('末') @(0) @([byte[]]$wide[0..2], [byte[]]$wide[3..5]) -Utf16
+        $wideIndex = [MdxReader]::OpenIndexed($wideLayout)
+        try {
+            Assert-Equal $wideIndex.Entries[0].Headword '末' 'UTF-16 头部与双字节终止符'
+            $previousDecoded = [MdxReader]::CacheStats.DecodedBlocks
+            $rejected = $false
+            try { $null = $wideIndex.ReadBody(2,7) } catch { $rejected = $true }
+            Assert-Equal $rejected $true '正文范围不可超过实际记录流'
+            Assert-Equal ([MdxReader]::CacheStats.DecodedBlocks - $previousDecoded) 0 '无效区间在读取记录块前被拒绝'
+            Assert-Equal ($wideIndex.ReadBody(0,6)) '日😀' 'UTF-16 代理对在码元中间跨块时仍可还原'
+        } finally { $wideIndex.Dispose() }
+        Test-SequentialMdxBlocks $scratch
+        Test-CustomStorageFallback $scratch
+        Test-IndexedColdIntegrity $scratch
+        Test-IndexedBlockCache $scratch
+        Test-IndexedLiveRepair $scratch $Assembly
+        Test-IndexedReimportMode $scratch $Assembly
+        Test-IndexedCompaction $scratch
+    } finally { $env:E_SEARCH_DB = $originalDb }
+    Write-Output 'PASS 索引导入、按块详情、换版及旧库兼容'
 }
 
 function Test-Calculation([Reflection.Assembly]$Assembly) {
@@ -2978,7 +3317,7 @@ function Test-CliAccess([string]$Directory) {
     } finally { $env:E_SEARCH_DB = $oldDb }
 }
 
-function Test-ReleaseDataLocation {
+function Test-ReleaseDataLocation([switch]$Indexed) {
     # 程序和两个启动目录均位于项目树外，以真实 CLI 进程验证发布版的默认位置。
     $root = [IO.Directory]::CreateDirectory([IO.Path]::Combine([IO.Path]::GetTempPath(), 'ESearch-location-' + [guid]::NewGuid().ToString('N'))).FullName
     $install = [IO.Directory]::CreateDirectory((Join-Path $root 'program')).FullName
@@ -3007,6 +3346,18 @@ function Test-ReleaseDataLocation {
         $env:LOCALAPPDATA = Join-Path $root 'fresh-profile'
         Assert-Equal @(Invoke-Search @('query','example','oxford')).Count 1 '首次只读查询可以直接读取发布种子'
         Assert-Equal (Test-Path -LiteralPath $env:LOCALAPPDATA) $false '首次只读查询不得创建用户副本'
+        if ($Indexed) {
+            # 在已安装目录生成真实索引种子，再由首次写操作将它部署到全新用户目录。
+            $env:E_SEARCH_DB = $seed
+            Invoke-Search @('import-indexed','oxford',$fixture) | Out-Null
+            $env:E_SEARCH_DB = $null
+            Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1]) 'verified definition' '索引种子的首个只读进程从种子目录拿到正文'
+            $other = Join-Path $root 'added.mdx'
+            Write-Mdx $other ([ordered]@{'たべる'='たべる<br>【食べる】<br>吃'})
+            Invoke-Search @('import','shogakukan',$other) | Out-Null
+            [IO.Directory]::Move($seedDir.FullName,(Join-Path $install 'previous-seed'))
+            Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1]) 'verified definition' '首次写入携带不可变源，安装种子移开后个人库仍可查原书'
+        }
     } finally {
         Pop-Location
         $env:E_SEARCH_DB = $oldDb
@@ -3215,12 +3566,14 @@ function Test-EngineProbeBinding {
     Write-Output 'PASS 三种架构的探针绑定及当前架构的原生 SDK 调用'
 }
 
-if ($BackendTestDirectory) {
+if ($BackendTestDirectory -or $IndexedMdxTestDirectory) {
     $uiDir = Join-Path $PSScriptRoot 'bin/Release/net10.0-windows'
     foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search') {
         $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $uiDir "$lib.dll"))
     }
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+    if ($IndexedMdxTestDirectory) { Test-IndexedMdx $IndexedMdxTestDirectory $assembly; Test-ReleaseDataLocation -Indexed; return }
+    Test-IndexedMdx $BackendTestDirectory $assembly
     Test-Calculation $assembly
     Test-LookupAudit $BackendTestDirectory $assembly
     # 直接使用窗口所用的预览逻辑，同时保留详情选择器所需的全部原始命中。
@@ -3269,11 +3622,147 @@ if ($BackendTestDirectory) {
     Test-TablePreviewImport $BackendTestDirectory $assembly
     Test-EntryRevision $BackendTestDirectory $assembly
     Test-CliAccess $BackendTestDirectory
-    Test-ReleaseDataLocation
+    Test-ReleaseDataLocation -Indexed
     Test-RunningCancellation $assembly
     Test-QuickLookPipe $assembly
     Test-EngineProbeBinding
     if ($PrepareDesktop) { Initialize-DesktopDatabases $BackendTestDirectory $assembly $RealDatabase }
+    return
+}
+
+function Test-RealIndexedComparison([string]$Baseline, [string]$Indexed) {
+    # 两个路径都由调用者显式提供。只用当前 Release 后端和只读连接，不通过默认个人词库。
+    if ([StringComparer]::OrdinalIgnoreCase.Equals($Baseline,$Indexed)) { throw '请分别指定普通库与索引库。' }
+    foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search') {
+        $assembly = [Reflection.Assembly]::LoadFrom((Join-Path (Split-Path $app) "$lib.dll"))
+    }
+    [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
+    $ctor = $assembly.GetType('DictionaryStore').GetConstructor([type[]]@([string],[bool]))
+    $stores = [Collections.Generic.List[IDisposable]]::new()
+    try {
+        foreach ($path in $Baseline,$Indexed) { $stores.Add($ctor.Invoke(@($path,$true))) }
+        $books = $stores[0].ListDictionaries()
+        Assert-Equal (ConvertTo-Json -Compress -InputObject $stores[1].ListDictionaries()) (ConvertTo-Json -Compress -InputObject $books) '两库词典、内容哈希、顺序和启停'
+        if ($stores[0].IndexedHashes().Count -or !$stores[1].IndexedHashes().Count) { throw '对照需要普通库和至少含一本按需读取 MDX 的索引库。' }
+
+        $queries = [Collections.Generic.List[string]]::new()
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        function Add-Probe([string]$text) { if ($text -and $seen.Add($text)) { $queries.Add($text) } }
+        foreach ($text in 'apple','went','run out of','I ran out of time.','recieve','食べる','たべる','taberu','食べちゃった','橋','苹果','张臂长度','预约') { Add-Probe $text }
+        # 搜索候选可能经别名跳转。用独立种子直接核对原始序号、读音证据和解码后的完整正文。
+        $physicalRng = [Random]::new(20261124)
+        $physicalCount = 0
+        foreach ($book in $books) {
+            if ($book.Records -le 0) { continue }
+            $ordinals = [Collections.Generic.HashSet[int]]::new()
+            [void]$ordinals.Add(1)
+            [void]$ordinals.Add($book.Records)
+            while ($ordinals.Count -lt [Math]::Min(102,$book.Records)) {
+                [void]$ordinals.Add($physicalRng.Next(2,$book.Records))
+            }
+            foreach ($ordinal in $ordinals) {
+                $a = $stores[0].Detail($book.Id,$ordinal)
+                $b = $stores[1].Detail($book.Id,$ordinal)
+                if (![object]::Equals($a.Item1,$b.Item1) -or ![StringComparer]::Ordinal.Equals($a.Item2,$b.Item2)) {
+                    throw "物理词条 $($book.Id):$ordinal 的读音证据或完整正文不同"
+                }
+            }
+            $physicalCount += $ordinals.Count
+        }
+        Write-Output "PASS $physicalCount 个物理词条的读音证据与完整正文一致。"
+        $rng = [Random]::new(20261123)
+        $cfg = [Microsoft.Data.Sqlite.SqliteConnectionStringBuilder]::new()
+        $cfg.DataSource = $Baseline
+        $cfg.Mode = [Microsoft.Data.Sqlite.SqliteOpenMode]::ReadOnly
+        $cn = [Microsoft.Data.Sqlite.SqliteConnection]::new($cfg.ToString())
+        try {
+            $cn.Open()
+            $cmd = $cn.CreateCommand()
+            try {
+                # 每本启用词典按物理序号定种子取样，复用主键，含词头与有证据的读音。
+                $cmd.CommandText = 'SELECT head,reading FROM entries WHERE dict=$d AND ordinal=$o'
+                $dict = $cmd.Parameters.Add('$d',[Microsoft.Data.Sqlite.SqliteType]::Text)
+                $ord = $cmd.Parameters.Add('$o',[Microsoft.Data.Sqlite.SqliteType]::Integer)
+                foreach ($book in $books) {
+                    if (!$book.Enabled) { continue }
+                    $dict.Value = $book.Id
+                    $sample = [Collections.Generic.HashSet[int]]::new()
+                    while ($sample.Count -lt [Math]::Min(36,$book.Records)) {
+                        $num = $rng.Next(1,$book.Records+1)
+                        if (!$sample.Add($num)) { continue }
+                        $ord.Value = $num
+                        $row = $cmd.ExecuteReader()
+                        try { if ($row.Read()) { Add-Probe $row.GetString(0); if (!$row.IsDBNull(1)) { Add-Probe $row.GetString(1) } } }
+                        finally { $row.Dispose() }
+                    }
+                }
+            } finally { $cmd.Dispose() }
+        } finally { $cn.Dispose() }
+        foreach ($i in 1..50) { Add-Probe ('zzqxverify' + $rng.Next().ToString('x8')) }
+
+        $all = [Management.Automation.Language.NullString]::Value
+        $token = [Threading.CancellationToken]::None
+        $hitCount = 0
+        foreach ($q in $queries) {
+            $left = $stores[0].Search($q,$all,$token)
+            $right = $stores[1].Search($q,$all,$token)
+            Assert-Equal $right.Count $left.Count "命中数 $q"
+            $hitCount += $left.Count
+            for ($i=0; $i -lt $left.Count; $i++) {
+                $a,$b = $left[$i],$right[$i]
+                foreach ($field in 'Method','Term','Display') {
+                    if (![object]::Equals($a.$field,$b.$field)) { throw "查询 $q 候选 $i 的 $field 不同" }
+                }
+                foreach ($field in 'DictionaryId','EntryId','Language','Priority','Headword','Reading','Gloss') {
+                    if (![object]::Equals($a.Entry.$field,$b.Entry.$field)) { throw "查询 $q 候选 $i 的 $field 不同" }
+                }
+                $raw = $stores[0].CurrentBody($a.Entry)
+                if ($null -eq $raw -or ![StringComparer]::Ordinal.Equals($raw,$stores[1].CurrentBody($b.Entry))) {
+                    throw "查询 $q 候选 $i 的完整正文不同或缺失"
+                }
+            }
+        }
+        if (!$hitCount) { throw '取样未命中任何可核验的词条。' }
+        Write-Output "PASS $($queries.Count) 个固定输入，$hitCount 个候选的排序、摘要与完整正文一致。"
+
+        # 前面的对照已预热两库。逐轮交替先后次序；计时不含抽样、对照、打印或 WPF 绘制。
+        $totals = @{}
+        function Get-Percentiles($round,[int]$variant,[string]$metric,[double[]]$times) {
+            [Array]::Sort($times)
+            [pscustomobject]@{ Round=$round; Storage=@('inline','indexed')[$variant]; Metric=$metric; N=$times.Count
+                P50ms=$times[[Math]::Ceiling($times.Count*.50)-1]; P95ms=$times[[Math]::Ceiling($times.Count*.95)-1] }
+        }
+        foreach ($round in 1..5) {
+            foreach ($variant in @((($round+1)%2),($round%2))) {
+                $search = [Collections.Generic.List[double]]::new()
+                $first = [Collections.Generic.List[double]]::new()
+                foreach ($q in $queries) {
+                    $watch = [Diagnostics.Stopwatch]::StartNew()
+                    $matches = $stores[$variant].Search($q,$all,$token)
+                    $search.Add($watch.Elapsed.TotalMilliseconds)
+                    if ($matches.Count) {
+                        $null = $stores[$variant].CurrentBody($matches[0].Entry)
+                        $first.Add($watch.Elapsed.TotalMilliseconds)
+                    }
+                }
+                foreach ($metric in 'search','first') {
+                    [double[]]$times = if ($metric -eq 'search') { $search.ToArray() } else { $first.ToArray() }
+                    $key = "$variant/$metric"
+                    if (!$totals.ContainsKey($key)) { $totals[$key] = [Collections.Generic.List[double]]::new() }
+                    $totals[$key].AddRange($times)
+                    Get-Percentiles $round $variant $metric $times
+                }
+            }
+        }
+        foreach ($variant in 0,1) {
+            foreach ($metric in 'search','first') { Get-Percentiles 'all' $variant $metric $totals["$variant/$metric"].ToArray() }
+        }
+    } finally { foreach ($store in $stores) { $store.Dispose() } }
+}
+
+if ($CompareIndexedDatabase) {
+    if (!$RealDatabase) { throw '-CompareIndexedDatabase 需要同时指定 -RealDatabase。' }
+    Test-RealIndexedComparison $RealDatabase (Resolve-Path -LiteralPath $CompareIndexedDatabase -ErrorAction Stop).Path
     return
 }
 

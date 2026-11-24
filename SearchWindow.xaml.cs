@@ -1137,7 +1137,7 @@ public partial class SearchWindow : Window
                 ReadingPreferencePanel.Visibility = Visibility.Visible;
             }
         }
-        catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or InvalidOperationException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or InvalidDataException or InvalidOperationException or UnauthorizedAccessException)
         {
             if (request == detailRevision && DetailsPanel.IsVisible) EntryText.Text = "正文读取失败：" + ex.Message;
         }
