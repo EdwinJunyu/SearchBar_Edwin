@@ -1506,12 +1506,13 @@ function Test-FileNameCompletions([string]$Scratch, [Reflection.Assembly]$Assemb
     $completed = $type.GetField('fileRevision',$flags)
     $composing = $type.GetField('composing',$flags)
     $hitType = $Assembly.GetType('ESearch.FileHit')
-    function Set-Page([string]$prefix, [string[]]$names) {
+    function Set-Page([string]$prefix, [string[]]$names, [switch]$Folders) {
         $query.Text = $prefix
         $rows = [Array]::CreateInstance($hitType,$names.Length)
         for ($i=0; $i -lt $names.Length; $i++) {
             $folder = "C:\test\$i"
             $rows[$i] = [Activator]::CreateInstance($hitType,@($names[$i],$folder,[IO.Path]::Combine($folder,$names[$i])))
+            if ($Folders) { $hitType.GetProperty('IsFolder').SetValue($rows[$i],$true) }
         }
         $completed.SetValue($window,$revision.GetValue($window))
         [void]$update.Invoke($window,@($prefix,$rows))
@@ -1554,14 +1555,18 @@ function Test-FileNameCompletions([string]$Scratch, [Reflection.Assembly]$Assemb
         Click-Choice $case[1]
         Assert-Equal $query.Text $case[1] '点击写回实际大小写和符号'
         Assert-Equal $query.CaretIndex $query.Text.Length '光标置于采纳的文件名末尾'
-        Assert-Equal ($fileQuery.Invoke($window,@($query.Text))) ('file:wfn:"'+$case[1]+'"') '采纳后使用整名字面查询'
+        Assert-Equal ($fileQuery.Invoke($window,@($query.Text))) ('wfn:"'+$case[1]+'"') '采纳后使用文件和文件夹均可命中的整名字面查询'
         foreach ($route in 'InChatGptMode','IsReverseInput','ShowCalculation') {
             Assert-Equal ($type.GetMethod($route,$flags).Invoke($window,@($query.Text))) $false '采纳文件名后仍进入文件查询'
         }
         $query.Text += 'a'
         Assert-Equal ($fileQuery.Invoke($window,@($query.Text))) $query.Text '手动改动立即恢复普通查询'
     }
-    Write-Output 'PASS 文件补全独立控件、候选顺序、采纳、原生查询和输入模式'
+    Set-Page '项目' @('项目 归档') -Folders
+    Click-Choice '项目 归档'
+    Assert-Equal $query.Text '项目 归档' '点击文件夹补全写回目录名'
+    Assert-Equal ($fileQuery.Invoke($window,@($query.Text))) 'wfn:"项目 归档"' '采纳文件夹名称后可再次搜到目录'
+    Write-Output 'PASS 文件和文件夹补全、候选顺序、采纳、原生查询和输入模式'
 }
 
 function Test-FileRefind([string]$Scratch, [Reflection.Assembly]$Assembly) {
@@ -1625,7 +1630,7 @@ function Test-FileRefind([string]$Scratch, [Reflection.Assembly]$Assembly) {
             }
             $before = Scalar 'shell' 'SELECT total(weight) FROM opens'
             if ($target -gt $sdk.Count) {
-                [void]$start.Invoke($window,@([IO.Path]::Combine($root,'missing.exe'),$action,$false))
+                [void]$start.Invoke($window,@([IO.Path]::Combine($root,'missing.exe'),$action,$false,$false))
                 Assert-Equal (Scalar 'shell' 'SELECT total(weight) FROM opens') $before '失败打开不写历史'
                 continue
             }
@@ -1635,7 +1640,7 @@ function Test-FileRefind([string]$Scratch, [Reflection.Assembly]$Assembly) {
             $list.ItemsSource = $sdk; $list.SelectedItem = $sdk[$target-1]
             Assert-Equal (Scalar 'shell' 'SELECT total(weight) FROM opens') $before '默认选择或切换选择不写历史'
             if ([IO.File]::Exists("$path.ok")) { [IO.File]::Move("$path.ok",("$path." + [guid]::NewGuid().ToString('N') + '.ok')) }
-            [void]$start.Invoke($window,@($path,$action,$false))
+            [void]$start.Invoke($window,@($path,$action,$false,$false))
             $watch = [Diagnostics.Stopwatch]::StartNew()
             while (![IO.File]::Exists("$path.ok") -and $watch.Elapsed.TotalSeconds -lt 6) { Start-Sleep -Milliseconds 10 }
             Assert-Equal ([IO.File]::ReadAllText("$path.ok")) $path 'Shell 进程实际运行目标文件'
@@ -2091,15 +2096,19 @@ function Test-FileDisplayLayout([Reflection.Assembly]$Assembly,[string]$Director
     foreach ($i in 0,1) {
         $part=$stem+@('甲','乙')[$i]
         $parentDir=[IO.Directory]::CreateDirectory((Join-Path $Directory "$part\run")).FullName
-        $path=Join-Path $parentDir '待确认.md'
-        [IO.File]::WriteAllText($path,"$part 布局样本")
-        $hits[$i]=$type.GetConstructors()[0].Invoke(@('待确认.md',[string]$parentDir,[string]$path))
+        # 用同名目录和文件检验混排，父路径仍须能区分两行。
+        $path=Join-Path $parentDir '待确认'
+        if ($i -eq 0) { [void][IO.Directory]::CreateDirectory($path) }
+        else { [IO.File]::WriteAllText($path,"$part 布局样本") }
+        $hits[$i]=$type.GetConstructors()[0].Invoke(@('待确认',[string]$parentDir,[string]$path))
+        $type.GetProperty('IsFolder').SetValue($hits[$i],($i -eq 0))
     }
     $rows=$type.GetMethod('WithDisplayPaths',[Reflection.BindingFlags]'Static,NonPublic').Invoke($null,[object[]](,$hits))
-    function Find-FileLabel($element,[string]$text) {
-        if ($element -is [Windows.Controls.TextBlock] -and $element.Text -ceq $text) {return $element}
+    function Find-FileRowElement($element,[string]$label,[string]$name) {
+        if ($name -and $element -is [Windows.FrameworkElement] -and $element.Name -ceq $name) {return $element}
+        if ($label -and $element -is [Windows.Controls.TextBlock] -and $element.Text -ceq $label) {return $element}
         for ($j=0; $j -lt [Windows.Media.VisualTreeHelper]::GetChildrenCount($element); $j++) {
-            $match=Find-FileLabel ([Windows.Media.VisualTreeHelper]::GetChild($element,$j)) $text
+            $match=Find-FileRowElement ([Windows.Media.VisualTreeHelper]::GetChild($element,$j)) $label $name
             if ($match) {return $match}
         }
     }
@@ -2117,7 +2126,12 @@ function Test-FileDisplayLayout([Reflection.Assembly]$Assembly,[string]$Director
             $layout.UpdateLayout()
             foreach ($i in 0,1) {
                 $row=$list.ItemContainerGenerator.ContainerFromIndex($i)
-                $label=Find-FileLabel $row ($stem+@('甲','乙')[$i]+'\run')
+                $preview=Find-FileRowElement $row -name 'PreviewButton'
+                $icon=Find-FileRowElement $row -name 'FolderIcon'
+                Assert-Equal ($null -ne $preview -and $null -ne $icon) $true '行模板具有预览按钮和目录图标'
+                Assert-Equal ($preview.Visibility -eq 'Visible') ($i -eq 1) '仅文件行显示预览'
+                Assert-Equal ($icon.Visibility -eq 'Visible') ($i -eq 0) '仅目录行显示文件夹图标'
+                $label=Find-FileRowElement $row -label ($stem+@('甲','乙')[$i]+'\run')
                 Assert-Equal ($null -ne $label) $true "宽度 $width 同名行 $i 的可见目录"
                 Assert-Equal ([string]$label.TextWrapping) 'Wrap' "宽度 $width 的长目录换行"
                 Assert-Equal ([string]$label.TextTrimming) 'None' "宽度 $width 的可辨后缀不截断"
@@ -2156,6 +2170,42 @@ function Test-FileResultActions([int]$Hotkey = 130) {
         $point=$button.GetClickablePoint()
         [ESearchDesktop]::ClickPoint($handle,[int]$point.X,[int]$point.Y)
     }
+    $shell=New-Object -ComObject Shell.Application
+    foreach ($gesture in '回车','点击') {
+        # 使用不同的空目录，第二次打开时不能由上一次留下的 Explorer 视图误判成功。
+        $needle="$tag 跳转$gesture"
+        $target=[IO.Directory]::CreateDirectory((Join-Path $fixtureRoot $needle)).FullName
+        $partial=Join-Path $fixtureRoot "$needle 说明.txt"
+        [IO.File]::WriteAllText($partial,'用于确认普通查询混排文件和文件夹。')
+        Wait-Desktop {
+            $indexed=@(Get-EnginePaths $needle -IncludeFolders)
+            $indexed -contains $target -and $indexed -contains $partial
+        } '目录与部分匹配的文件未进入索引' 90000
+        $value.SetValue($needle)
+        Wait-Desktop { (SelectedPath) -ceq $target -and (PathsOnScreen).Split("`n") -contains $partial } '完整目录名应优先选中，部分匹配文件仍可见'
+        if ($gesture -eq '点击') {
+            $value.SetValue(('folder: "'+$needle+'"'))
+            Wait-Desktop { (PathsOnScreen) -ceq $target } 'folder: 查询应只显示目标目录'
+        }
+        $previousHandles=@($shell.Windows() | ForEach-Object HWND)
+        try {
+            if ($gesture -eq '回车') { [ESearchDesktop]::Press($handle,13) }
+            else { Click-FileAction OpenFileButton }
+            Wait-Desktop {
+                foreach ($browser in $shell.Windows()) {
+                    if ($browser.Document.Folder.Self.Path -ieq $target -and
+                        [IntPtr]$browser.HWND -eq [ESearchDesktop]::GetForegroundWindow()) { return $true }
+                }
+            } "$gesture 后资源管理器未进入目录 $target" 15000
+            Write-Output "PASS $gesture 打开文件夹，前台资源管理器当前目录为 $target"
+        } finally {
+            foreach ($view in $shell.Windows()) {
+                if ($view.Document.Folder.Self.Path -ieq $target -and $view.HWND -notin $previousHandles) { $view.Quit() }
+            }
+            [ESearchDesktop]::ActivateFixture($handle)
+            Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle } '未返回原搜索窗'
+        }
+    }
     $value.SetValue($name)
     Wait-Desktop {
         $rows=@(FileRows)
@@ -2186,7 +2236,6 @@ function Test-FileResultActions([int]$Hotkey = 130) {
         Wait-Desktop { [ESearchDesktop]::GetForegroundWindow() -eq $handle } '无法激活已保留的搜索窗'
     }
     Write-Output "PASS 单击第二项在上层浏览器打开 $target；关闭样本标签后保留原搜索和选择"
-    $shell=New-Object -ComObject Shell.Application
     $existingExplorer=@($shell.Windows() | ForEach-Object HWND)
     Click-FileAction RevealFileButton
     function FixtureExplorerViews {

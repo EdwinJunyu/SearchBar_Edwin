@@ -656,7 +656,7 @@ public partial class SearchWindow : Window
             else if (e.Key == Key.Space && Keyboard.Modifiers == ModifierKeys.None
                 && (navigatingFiles || FileList.IsKeyboardFocusWithin)
                 && Keyboard.FocusedElement is not System.Windows.Controls.Button
-                && fileRevision == revision && FileList.SelectedItem is FileHit selected)
+                && fileRevision == revision && FileList.SelectedItem is FileHit { IsFolder: false } selected)
             {
                 e.Handled = true;
                 if (!e.IsRepeat) ActivateFile(selected, FileAction.Preview);
@@ -692,8 +692,11 @@ public partial class SearchWindow : Window
         if (file == null || !IsVisible || composing || fileRevision != revision || !FileList.Items.Contains(file)) return;
         FileList.SelectedItem = file;
         userPickedFile = true;
-        if (action == FileAction.Preview) _ = PreviewFileAsync(file.FullPath);
-        else OpenWithShell(file.FullPath, action);
+        if (action == FileAction.Preview)
+        {
+            if (!file.IsFolder) _ = PreviewFileAsync(file.FullPath);
+        }
+        else OpenWithShell(file.FullPath, action, isFolder: file.IsFolder);
     }
 
     private async Task PreviewFileAsync(string path)
@@ -752,7 +755,7 @@ public partial class SearchWindow : Window
         }
     }
 
-    private void OpenWithShell(string target, FileAction? fileAction = null, bool openChatGpt = false)
+    private void OpenWithShell(string target, FileAction? fileAction = null, bool openChatGpt = false, bool isFolder = false)
     {
         pendingPreview?.Cancel();
         long request = ++fileActionRevision;
@@ -760,7 +763,9 @@ public partial class SearchWindow : Window
         {
             if (fileAction != null)
             {
-                if (!File.Exists(target)) throw new FileNotFoundException("文件已移动、已删除或无法访问。");
+                // 按索引记录的类型复核，避免目录被同名文件替换后意外启动该文件。
+                if (isFolder && !Directory.Exists(target)) throw new DirectoryNotFoundException("文件夹已移动、已删除或无法访问。");
+                if (!isFolder && !File.Exists(target)) throw new FileNotFoundException("文件已移动、已删除或无法访问。");
                 // 先把输入焦点留在搜索框，再让出置顶层，关闭外部窗口后即可继续输入。
                 QueryBox.Focus();
                 Topmost = false;
@@ -781,7 +786,7 @@ public partial class SearchWindow : Window
             {
                 using var process = Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
                 // Shell 可复用进程而返回 null；只有正常返回的文件打开才作为反馈。
-                if (fileAction == FileAction.Open)
+                if (fileAction == FileAction.Open && !isFolder)
                 {
                     QueueShellOpen(target);
                 }
@@ -1377,8 +1382,8 @@ public partial class SearchWindow : Window
         QueryBox.Focus();
     }
 
-    // 选择的是具体文件名，空格、感叹号等应当按字面检索。输入框保留真实名称，手动编辑后恢复原生语法。
-    private string GetFileQuery(string text) => text == acceptedFileName ? $"file:wfn:\"{text}\"" : text;
+    // 补全候选来自文件和文件夹；两者都按完整名称检索，并保留名称中的空格。
+    private string GetFileQuery(string text) => text == acceptedFileName ? $"wfn:\"{text}\"" : text;
 
     private void OpenReverseChoice(object sender, RoutedEventArgs args)
     {
@@ -1396,7 +1401,7 @@ public partial class SearchWindow : Window
     private async Task SearchFilesAsync(string text, long request, CancellationToken token)
     {
         FilePanel.Visibility = Visibility.Visible;
-        SetFileStatus("正在搜索文件…");
+        SetFileStatus("正在搜索文件和文件夹…");
         bool finished = false;
         try
         {
@@ -1491,8 +1496,8 @@ public partial class SearchWindow : Window
 
     private void ShowFileCount(int count) => SetFileStatus(count switch
     {
-        0 => "没有匹配的文件",
-        EverythingSearch.ResultLimit => $"当前显示前 {EverythingSearch.ResultLimit} 个文件",
+        0 => "没有匹配的文件或文件夹",
+        EverythingSearch.ResultLimit => $"当前显示前 {EverythingSearch.ResultLimit} 个结果",
         _ => ""
     });
 
@@ -2226,6 +2231,7 @@ public partial class SearchWindow : Window
 
 internal sealed record FileHit(string Name, string Parent, string FullPath)
 {
+    public bool IsFolder { get; init; }
     [System.Text.Json.Serialization.JsonIgnore]
     public string DisplayParent => distinguishingParent ?? Parent;
     [System.Text.Json.Serialization.JsonIgnore]
@@ -2638,14 +2644,14 @@ internal sealed class EverythingSearch
 
     private static IReadOnlyList<FileHit> Search(string input)
     {
-        // 额外的精确查询覆盖整个索引，避免普通查询先截断时，漏掉排在后面的同名文件。
+        // 先在整个索引中匹配文件名和文件夹名，避免精确匹配被普通查询的数量上限截掉。
         // 原查询始终原样发送；原生表达式只走原查询。两批内部均保留 SDK 的原始顺序。
         bool plain = IsPlainFileQuery(input);
         var output = new List<FileHit>(ResultLimit);
         try
         {
-            if (plain) AppendFiles($"file:wfn:\"{input}\"", input, true, output);
-            AppendFiles(input, plain ? input : null, false, output);
+            if (plain) AppendResults($"wfn:\"{input}\"", input, true, output);
+            if (output.Count < ResultLimit) AppendResults(input, plain ? input : null, false, output);
             return output;
         }
         finally
@@ -2654,7 +2660,7 @@ internal sealed class EverythingSearch
         }
     }
 
-    private static void AppendFiles(string query, string? exactName, bool exactPass, List<FileHit> output)
+    private static void AppendResults(string query, string? exactName, bool exactPass, List<FileHit> output)
     {
         Native.Everything_SetSearchW(query);
         Native.Everything_SetRequestFlags(3); // EVERYTHING_REQUEST_FILE_NAME | EVERYTHING_REQUEST_PATH
@@ -2667,7 +2673,8 @@ internal sealed class EverythingSearch
             uint count = Native.Everything_GetNumResults();
             for (uint i = 0; i < count && output.Count < ResultLimit; i++)
             {
-                if (!Native.Everything_IsFileResult(i)) continue;
+                bool isFolder = Native.Everything_IsFolderResult(i);
+                if (!isFolder && !Native.Everything_IsFileResult(i)) continue;
                 var name = Marshal.PtrToStringUni(Native.Everything_GetResultFileNameW(i));
                 if (string.IsNullOrEmpty(name)) continue;
                 if (exactName != null && string.Equals(name, exactName, StringComparison.OrdinalIgnoreCase) != exactPass) continue;
@@ -2676,7 +2683,7 @@ internal sealed class EverythingSearch
                 // SDK 对卷根目录可能返回 "C:"；只向 Shell 交付可独立解析的绝对路径。
                 if (parent.Length == 2 && char.IsAsciiLetter(parent[0]) && parent[1] == ':') parent += "\\";
                 if (Path.IsPathFullyQualified(parent))
-                    output.Add(new FileHit(name, parent, Path.Combine(parent, name)));
+                    output.Add(new FileHit(name, parent, Path.Combine(parent, name)) { IsFolder = isFolder });
             }
             if (output.Count >= ResultLimit || count < PageSize || offset > uint.MaxValue - PageSize) break;
         }
@@ -2709,6 +2716,7 @@ internal sealed class EverythingSearch
         [DllImport(Library)] internal static extern uint Everything_GetNumResults();
         [DllImport(Library)] internal static extern uint Everything_GetLastError();
         [DllImport(Library)] internal static extern bool Everything_IsFileResult(uint index);
+        [DllImport(Library)] internal static extern bool Everything_IsFolderResult(uint index);
         [DllImport(Library, ExactSpelling=true)] internal static extern IntPtr Everything_GetResultFileNameW(uint index);
         [DllImport(Library, ExactSpelling=true)] internal static extern IntPtr Everything_GetResultPathW(uint index);
         [DllImport(Library)] internal static extern void Everything_Reset();

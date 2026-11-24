@@ -72,7 +72,7 @@
                 </Label>
                 <Grid Grid.Column="1" Margin="13,0,0,0">
                     <TextBox x:Name="QueryBox" AutomationProperties.AutomationId="QueryBox"
-                             AutomationProperties.Name="搜索词典和文件、计算算式，或按意思反查词" VerticalContentAlignment="Center"
+                             AutomationProperties.Name="搜索词典、文件和文件夹，计算算式，或按意思反查词" VerticalContentAlignment="Center"
                              ToolTip="直接写中文描述可按意思联想。输入「反查」「反查日语」或「反查英语」可直接按释义找词。「ai 」加问题，按回车打开 ChatGPT。算式示例：2^3、sqrt(16)、sin(30)。三角函数使用角度，log 为常用对数，ln 为自然对数。"
                              Foreground="{StaticResource Ink}" CaretBrush="{StaticResource Accent}"
                              FontSize="21" Padding="1,0" BorderThickness="0" Background="Transparent"
@@ -240,9 +240,9 @@
                                 </Style.Triggers>
                             </Style>
                         </DockPanel.Style>
-                        <TextBlock Text="补全文件名" VerticalAlignment="Center" Foreground="#506770" Margin="0,0,8,0"/>
+                        <TextBlock Text="补全名称" VerticalAlignment="Center" Foreground="#506770" Margin="0,0,8,0"/>
                         <ItemsControl x:Name="FileCompletionChoices" AutomationProperties.AutomationId="FileCompletionChoices"
-                                      AutomationProperties.Name="文件名补全">
+                                      AutomationProperties.Name="文件和文件夹名称补全">
                             <ItemsControl.ItemsPanel><ItemsPanelTemplate><UniformGrid Rows="1"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate>
@@ -257,7 +257,7 @@
                         </ItemsControl>
                     </DockPanel>
                     <ListBox x:Name="FileList" AutomationProperties.AutomationId="FileList"
-                             AutomationProperties.Name="文件结果" MaxHeight="280" Visibility="Collapsed"
+                             AutomationProperties.Name="文件和文件夹结果" MaxHeight="280" Visibility="Collapsed"
                              BorderThickness="0" Background="Transparent" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                              VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
                              ScrollViewer.CanContentScroll="True">
@@ -318,8 +318,12 @@
                                                 <ColumnDefinition Width="5*"/>
                                                 <ColumnDefinition Width="6*"/>
                                             </Grid.ColumnDefinitions>
-                                            <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="{StaticResource Ink}"
-                                                       TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                                            <DockPanel Margin="0,0,12,0" VerticalAlignment="Center">
+                                                <TextBlock x:Name="FolderIcon" Text="&#xE8B7;" FontFamily="Segoe MDL2 Assets"
+                                                           Foreground="#80631F" Margin="0,0,6,0" VerticalAlignment="Center" Visibility="Collapsed"/>
+                                                <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="{StaticResource Ink}"
+                                                           TextTrimming="CharacterEllipsis"/>
+                                            </DockPanel>
                                             <TextBlock Grid.Column="1" Text="{Binding DisplayParent}" FontSize="12" Foreground="#506770"
                                                        FlowDirection="LeftToRight" VerticalAlignment="Center">
                                                 <TextBlock.Style>
@@ -337,15 +341,21 @@
                                             </TextBlock>
                                         </Grid>
                                     </Button>
-                                    <Button Grid.Column="1" AutomationProperties.AutomationId="PreviewFileButton"
+                                    <Button x:Name="PreviewButton" Grid.Column="1" AutomationProperties.AutomationId="PreviewFileButton"
                                             AutomationProperties.Name="{Binding FullPath, StringFormat='用 QuickLook 预览 {0}'}"
                                             Style="{StaticResource IconButton}" Content="预览" Width="48" Height="32" Margin="0,1,4,1"
                                             ToolTip="用 QuickLook 预览（↑/↓ 选中文件后按空格）" Click="PreviewFileClicked" Cursor="Hand"/>
                                     <Button Grid.Column="2" AutomationProperties.AutomationId="RevealFileButton"
                                             AutomationProperties.Name="{Binding FullPath, StringFormat='在资源管理器中定位 {0}'}"
                                             Style="{StaticResource IconButton}" Content="定位" Width="48" Height="32" Margin="0,1,4,1"
-                                            ToolTip="在资源管理器中选中文件 (Shift+Enter)" Click="RevealFileClicked" Cursor="Hand"/>
+                                            ToolTip="在上级目录中选中此项 (Shift+Enter)" Click="RevealFileClicked" Cursor="Hand"/>
                                 </Grid>
+                                <DataTemplate.Triggers>
+                                    <DataTrigger Binding="{Binding IsFolder}" Value="True">
+                                        <Setter TargetName="FolderIcon" Property="Visibility" Value="Visible"/>
+                                        <Setter TargetName="PreviewButton" Property="Visibility" Value="Collapsed"/>
+                                    </DataTrigger>
+                                </DataTemplate.Triggers>
                             </DataTemplate>
                         </ListBox.ItemTemplate>
                     </ListBox>
