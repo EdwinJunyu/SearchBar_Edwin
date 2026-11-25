@@ -2,7 +2,8 @@
 setlocal
 chcp 65001 >nul
 set "book_root=%~dp0"
-set "book_app=%book_root%app\E_Search.exe"
+set "book_app=%book_root%app\SearchBar_Edwin.exe"
+if not exist "%book_app%" set "book_app=%book_root%app\E_Search.exe"
 set "E_SEARCH_DB=%book_root%index\dictionaries.db"
 if not exist "%book_app%" goto missing
 if not exist "%book_root%books\E_search-merge.json" goto missing

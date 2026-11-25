@@ -30,7 +30,7 @@ internal sealed class ReverseEncoder
     public static string ModelDirectory => Environment.GetEnvironmentVariable("E_SEARCH_REVERSE_MODEL")
         ?? Path.Combine(AppContext.BaseDirectory, "models", "bge-small-zh-v1.5");
     public static string CacheDirectory => Environment.GetEnvironmentVariable("E_SEARCH_REVERSE_CACHE")
-        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "E_Search", "reverse-index");
+        ?? Path.Combine(DictionaryStore.PersonalDirectory(), "reverse-index");
     private static ModelFiles? Inspect(string directory)
     {
         if (string.IsNullOrWhiteSpace(directory)) return null;

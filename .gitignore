@@ -1,5 +1,6 @@
 .tools/
 .data/
+/归档/
 bin/
 obj/
 *.mdx

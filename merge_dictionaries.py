@@ -396,14 +396,14 @@ def prepare_es_native(db, stage, ledger):
     portable = os.environ.get("E_SEARCH_MERGE_READER_EXE")
     if portable:
         runner = Path(portable).resolve(strict=True)
-        assembly = runner.with_name("E_Search.dll")
+        assembly = runner.with_suffix(".dll")
         command = [str(runner)]
     else:
         runner = ROOT / ".tools/dotnet/dotnet.exe"
-        assembly = ROOT / "bin/Release/net10.0/E_Search.dll"
+        assembly = ROOT / "bin/Release/net10.0/SearchBar_Edwin.dll"
         command = [str(runner),str(assembly)]
     if not all(p.is_file() for p in (runner,assembly)):
-        raise FileNotFoundError("需要已编译的 E_Search 读取器；便携复建可用 E_SEARCH_MERGE_READER_EXE 指定随书程序。")
+        raise FileNotFoundError("需要已编译的 SearchBar_Edwin 读取器；便携复建可用 E_SEARCH_MERGE_READER_EXE 指定随书程序。")
     path = stage / "es-native.db"
     profile = {"implementation_sha256":file_hash(assembly),"source_sha256":expected["sha256"],
                "database":"es-native.db","rule":"entries.link joins same-source terms(kind=0); ordered direct ordinals"}

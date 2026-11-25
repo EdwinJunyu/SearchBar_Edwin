@@ -1,10 +1,10 @@
-# E_Search
+# SearchBar_Edwin
 
 ## 中文
 
 Windows 搜索工具（自用）。默认按 `Alt + Space` 唤起搜索框，输入一次就能同时查本地词典和搜索文件。
 
-Windows x64 完整包内含中英、日语两部合并词典，保留八部原书的来源和释义。下载 ZIP、解压后打开 `E_Search-win-x64/E_Search.exe`，首次启动会在本机安装词库。[下载最新版本](https://github.com/EdwinJunyu/SearchBar_Edwin/releases/latest)
+Windows x64 完整包内含中英、日语两部合并词典，保留八部原书的来源和释义。下载 ZIP、解压后打开 `SearchBar_Edwin-win-x64/SearchBar_Edwin.exe`，旧版下载包的入口为 `E_Search.exe`。首次启动会在本机安装词库。[下载最新版本](https://github.com/EdwinJunyu/SearchBar_Edwin/releases/latest)
 
 - **离线查词**：整合八部词典，支持日语假名、罗马字和常见活用，也支持英文短语和拼写建议。搜索框旁可速览释义，展开后可阅读词典原文和排版详情。
 - **联想与反查**：输入词头前缀可看补全建议；想不起词时，可以输入中文描述，查找对应的日语或英语词。
@@ -16,7 +16,7 @@ Windows x64 完整包内含中英、日语两部合并词典，保留八部原�
 
 Personal search tool for Windows. Press `Alt + Space` by default to look up a word in local dictionaries and search for files with the same query.
 
-The Windows x64 ZIP includes Chinese–English and Japanese volumes with entries from eight source dictionaries. Extract the ZIP and open `E_Search-win-x64/E_Search.exe` to install the dictionaries on first launch. [Download the latest release](https://github.com/EdwinJunyu/SearchBar_Edwin/releases/latest)
+The Windows x64 ZIP includes Chinese–English and Japanese volumes with entries from eight source dictionaries. Extract the ZIP and open `SearchBar_Edwin-win-x64/SearchBar_Edwin.exe` to install the dictionaries on first launch. Earlier packages use `E_Search.exe`. [Download the latest release](https://github.com/EdwinJunyu/SearchBar_Edwin/releases/latest)
 
 - **Offline dictionaries** — Search eight dictionaries using Japanese kana, romaji, or common inflected forms. English lookups support phrases and spelling suggestions. Read a short definition beside the search box or expand the entry to see the original text and formatting.
 - **Suggestions and reverse lookup** — Type the start of a word for completions. If you can describe a word in Chinese but can’t recall it in Japanese or English, search by that description.

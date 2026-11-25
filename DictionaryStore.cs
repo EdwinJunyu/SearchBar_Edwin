@@ -7,10 +7,14 @@ internal sealed record DictionaryInfo(string Id, string Filename, string Languag
 {
     public bool IndexedSource { get; init; }
     public bool MissingSource { get; init; }
+    public string? MergedVolume { get; init; }
+    public string DisplayName { get; init; } = Filename;
+    public string? VolumeDisplayName { get; init; }
 }
 internal sealed record MergedArticle(string Group, string Key, string Html, string? ResourceArchive)
 {
     public string Revision { get; init; } = "";
+    public IReadOnlyDictionary<string,string>? SourceNames { get; init; }
 }
 internal sealed record PrefixChoice(string Key, string Display)
 {
@@ -37,6 +41,17 @@ internal sealed record TableMapping(int Headword, int Gloss, int? Reading, bool 
 }
 internal sealed class DictionaryStore : IDisposable
 {
+    internal static string PersonalDirectory()
+    {
+        string profile = Environment.GetEnvironmentVariable("LOCALAPPDATA") ??
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string directory = Path.Combine(profile, "SearchBar_Edwin");
+        string legacy = Path.Combine(profile, "E_Search");
+        // 原安装的词库、快捷键及缓存留在同一目录；首次安装使用新产品名。
+        return !File.Exists(Path.Combine(directory, "dictionaries.db")) && File.Exists(Path.Combine(legacy, "dictionaries.db"))
+            ? legacy : directory;
+    }
+
     private readonly SqliteConnection db;
     private readonly bool writable;
     private readonly MetadataSchema openedSchema;
@@ -168,10 +183,12 @@ internal sealed class DictionaryStore : IDisposable
     }
 
     private readonly record struct MetadataSchema(bool HasMetadata, bool HasParser, bool HasRevision, bool HasSummaryStamp,
-        bool HasMdxRecords, bool HasMergedRanges, bool HasSettings)
+        bool HasMdxRecords, bool HasMergedRanges, bool HasSettings, bool HasCatalogNames)
     {
         public bool IsCurrent => HasParser && HasRevision && HasSummaryStamp;
         public string Join => HasMetadata ? "LEFT JOIN dictionary_metadata m ON m.id=d.id" : "";
+        public string SourceName => HasCatalogNames
+            ? "COALESCE((SELECT name FROM catalog_names WHERE kind='source' AND id=d.id),d.filename)" : "d.filename";
         public string RecordJoin => (HasMdxRecords ? " LEFT JOIN mdx_records mr ON mr.dict=e.dict AND mr.ordinal=e.ordinal" : "")
             + (HasMergedRanges ? " LEFT JOIN merged_origins mo ON mo.dict=e.dict AND mo.ordinal=e.ordinal LEFT JOIN merged_mdx_pages mp ON mp.page=mo.page" : "");
         public string RangeColumn(string field) => (HasMdxRecords, HasMergedRanges) switch
@@ -193,18 +210,19 @@ internal sealed class DictionaryStore : IDisposable
                    COUNT(CASE WHEN name='summary_stamp' THEN 1 END),
                    EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mdx_records'),
                    EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='merged_mdx_pages'),
-                   EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_settings')
+                   EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_settings'),
+                   EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='catalog_names')
             FROM pragma_table_info('dictionary_metadata')
             """, tx);
         using var columns = check.ExecuteReader();
         columns.Read();
         return new(columns.GetBoolean(0), columns.GetBoolean(1), columns.GetBoolean(2), columns.GetBoolean(3),
-            columns.GetBoolean(4), columns.GetBoolean(5), columns.GetBoolean(6));
+            columns.GetBoolean(4), columns.GetBoolean(5), columns.GetBoolean(6), columns.GetBoolean(7));
     }
 
     // 长时间打开的旧库连接可能遇到另一进程升级。列结构与读取的数据必须来自同一快照。
     private MetadataSchema SchemaIn(SqliteTransaction snapshot) =>
-        openedSchema.IsCurrent && openedSchema.HasMdxRecords && openedSchema.HasMergedRanges && openedSchema.HasSettings
+        openedSchema.IsCurrent && openedSchema.HasMdxRecords && openedSchema.HasMergedRanges && openedSchema.HasSettings && openedSchema.HasCatalogNames
             ? openedSchema : ReadMetadataSchema(snapshot);
 
     private SqliteCommand Command(string sql, SqliteTransaction? tx = null)
@@ -546,7 +564,8 @@ internal sealed class DictionaryStore : IDisposable
     {
         using var tx = db.BeginTransaction(deferred: true);
         if (!HasMergedCatalog(tx)) return null;
-        bool indexed = SchemaIn(tx).HasMergedRanges;
+        var schema = SchemaIn(tx);
+        bool indexed = schema.HasMergedRanges;
         string range = indexed ? "vm.sha256,p.record_start,p.record_end" : "NULL,NULL,NULL";
         string select = $"SELECT a.volume,a.head,a.html,v.resource,v.revision,{range} FROM merged_articles a JOIN merged_volumes v ON v.volume=a.volume "
             + (indexed ? "LEFT JOIN merged_mdx_volumes vm ON vm.volume=a.volume LEFT JOIN merged_mdx_pages p ON p.page=a.page " : "");
@@ -572,10 +591,20 @@ internal sealed class DictionaryStore : IDisposable
         if (!rows.Read()) return null;
         var article = new MergedArticle(rows.GetString(0), rows.GetString(1), rows.GetString(2),
             rows.IsDBNull(3) ? null : ManagedArchivePath(db.DataSource, rows.GetString(3))) { Revision = rows.GetString(4) };
-        if (rows.IsDBNull(6)) return article;
-        string hash = rows.GetString(5);
-        long start = rows.GetInt64(6), end = rows.GetInt64(7);
+        bool external = !rows.IsDBNull(6);
+        string hash = external ? rows.GetString(5) : "";
+        long start = external ? rows.GetInt64(6) : 0, end = external ? rows.GetInt64(7) : 0;
         rows.Close();
+        if (schema.HasCatalogNames)
+        {
+            using var names = Command("SELECT n.id,n.name FROM catalog_names n JOIN merged_sources s ON s.dict=n.id WHERE n.kind='source' AND s.volume=$volume", tx);
+            names.Parameters.AddWithValue("$volume", article.Group);
+            using var labels = names.ExecuteReader();
+            var aliases = new Dictionary<string,string>(StringComparer.Ordinal);
+            while (labels.Read()) aliases.Add(labels.GetString(0), labels.GetString(1));
+            article = article with { SourceNames = aliases };
+        }
+        if (!external) return article;
         tx.Commit();
         string page = ReadIndexedBody(hash, start, end, exact: true);
         int prefixEnd = page.IndexOf("-->", StringComparison.Ordinal);
@@ -1015,16 +1044,44 @@ internal sealed class DictionaryStore : IDisposable
     private List<DictionaryInfo> ReadCatalog(SqliteTransaction tx)
     {
         var schema = SchemaIn(tx);
+        // 同名的独立导入和卷内来源都可能存在；只有库中保存的归属关系能区分它们。
+        bool hasVolumes = HasMergedCatalog(tx);
         using var cmd = Command($"""
-            SELECT d.id,d.filename,d.language,d.priority,d.records,d.sha256,{(schema.HasMetadata ? "COALESCE(m.enabled,1)" : "1")}
+            SELECT d.id,d.filename,d.language,d.priority,d.records,d.sha256,{(schema.HasMetadata ? "COALESCE(m.enabled,1)" : "1")},
+                   {(hasVolumes ? "s.volume" : "NULL")}, {schema.SourceName},
+                   {(hasVolumes && schema.HasCatalogNames ? "(SELECT name FROM catalog_names WHERE kind='volume' AND id=s.volume)" : "NULL")}
             FROM dictionaries d {schema.Join}
+            {(hasVolumes ? "LEFT JOIN merged_sources s ON s.dict=d.id" : "")}
             ORDER BY d.priority,d.id
             """, tx);
         var result = new List<DictionaryInfo>();
         using var r = cmd.ExecuteReader();
         while (r.Read()) result.Add(new(r.GetString(0), r.GetString(1), r.GetString(2), r.GetInt32(3),
-            r.GetInt32(4), r.GetString(5), r.GetBoolean(6)));
+            r.GetInt32(4), r.GetString(5), r.GetBoolean(6)) { MergedVolume = r.IsDBNull(7) ? null : r.GetString(7),
+                DisplayName = r.GetString(8), VolumeDisplayName = r.IsDBNull(9) ? null : r.GetString(9) });
         return result;
+    }
+
+    public void SetCatalogName(bool volume, string id, string name)
+    {
+        name = name.Trim();
+        if (name.Any(char.IsControl)) throw new ArgumentException("名称须为单行文字。");
+        using var tx = db.BeginTransaction();
+        if (volume && !HasMergedCatalog(tx)) throw new InvalidOperationException("当前词库没有合并卷。");
+        using var target = Command(volume ? "SELECT 1 FROM merged_sources WHERE volume=$id LIMIT 1"
+            : "SELECT 1 FROM dictionaries WHERE id=$id", tx);
+        target.Parameters.AddWithValue("$id", id);
+        if (target.ExecuteScalar() == null) throw new InvalidOperationException("所选词书或来源已不存在。");
+        // 名称绑定稳定 ID。重导、改优先级或恢复原档时，物理文件名和来源身份仍可用于校验。
+        using var schema = Command("CREATE TABLE IF NOT EXISTS catalog_names(kind TEXT NOT NULL,id TEXT NOT NULL,name TEXT NOT NULL,PRIMARY KEY(kind,id)) WITHOUT ROWID", tx);
+        schema.ExecuteNonQuery();
+        using var change = Command(name.Length == 0 ? "DELETE FROM catalog_names WHERE kind=$kind AND id=$id" :
+            "INSERT INTO catalog_names(kind,id,name) VALUES($kind,$id,$name) ON CONFLICT(kind,id) DO UPDATE SET name=excluded.name", tx);
+        change.Parameters.AddWithValue("$kind", volume ? "volume" : "source");
+        change.Parameters.AddWithValue("$id", id);
+        if (name.Length > 0) change.Parameters.AddWithValue("$name", name);
+        change.ExecuteNonQuery();
+        tx.Commit();
     }
 
     public void SaveDictionaryOrder(IReadOnlyList<string> ids)
@@ -1327,7 +1384,7 @@ internal sealed class DictionaryStore : IDisposable
                     AND {(schema.IsCurrent ? $"NOT COALESCE(m.summary_stamp=('{ShinseikiSummaryFormat}' || m.revision),0)" : "1")}
                     AND e.gloss GLOB '*[A-Za-z0-9０-９]*'
                     AND ({schema.RangeColumn("record_start")} IS NOT NULL OR instr(e.raw,'<su')>0)
-                    THEN e.raw END
+                    THEN e.raw END, {schema.SourceName}
             FROM (SELECT dict,ordinal,aliasReading,0 AS legacyChinese FROM found
                 {(legacyChinese ? legacyCandidates : "")}) f
             -- 先取得少量命中，再按词典和序号读取正文，避免优化器反过来扫描全部 entries。
@@ -1360,7 +1417,7 @@ internal sealed class DictionaryStore : IDisposable
             var entry = new LookupEntry(r.GetString(0), r.GetInt64(1), r.GetString(2), r.GetInt32(3),
                 r.GetString(4), r.IsDBNull(5) ? null : r.GetString(5), r.GetString(6))
                 {
-                    DictionaryName = r.GetString(7), DictionaryRevision = r.GetString(8), HasIndexedMergedPage = !r.IsDBNull(18),
+                    DictionaryName = r.GetString(21), DictionaryRevision = r.GetString(8), HasIndexedMergedPage = !r.IsDBNull(18),
                     // 同一本书在不同目录导入可有独立 GUID；显示跟随已识别的原书版式。
                     DisplaySourceId = r.IsDBNull(19) ? SourceForFilename(r.GetString(7))?.Id ?? r.GetString(0) : r.GetString(19)
                 };
@@ -1948,7 +2005,7 @@ internal sealed class DictionaryStore : IDisposable
     private List<ReverseBook> ReverseBooks(string? only, string? targetLanguage, SqliteTransaction snapshot, MetadataSchema schema)
     {
         using var sources = Command($"""
-            SELECT d.id,d.filename,d.priority,{schema.Revision},d.sha256,d.language FROM dictionaries d {schema.Join}
+            SELECT d.id,{schema.SourceName},d.priority,{schema.Revision},d.sha256,d.language FROM dictionaries d {schema.Join}
             WHERE ($language IS NULL OR d.language=$language) AND {ScopeSql(only,"d.id")}
                 AND COALESCE({(schema.HasParser ? "m.parser_id" : "NULL")},
                     CASE WHEN d.id='oxford' OR d.filename=$oxford THEN 'oxford'
@@ -2949,9 +3006,7 @@ internal static class ManagedMdx
 
     private static string CachedDelivery(string payload, string hash)
     {
-        string profile = Environment.GetEnvironmentVariable("LOCALAPPDATA") ??
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        string directory = CheckedPath(Path.Combine(CheckedPath(Path.Combine(profile, "E_Search")), "packed-source-cache"));
+        string directory = CheckedPath(Path.Combine(CheckedPath(DictionaryStore.PersonalDirectory()), "packed-source-cache"));
         string path = CheckedSource(Path.Combine(directory, hash.ToUpperInvariant() + ".mdx"));
         // 同一进程复用打开的 Reader；并发首读按散列互斥，缓存损坏时用分发件原子修复。
         using var cacheLock = new Mutex(false, "E_Search.PackedSource." + hash.ToUpperInvariant());

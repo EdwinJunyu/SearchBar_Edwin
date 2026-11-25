@@ -18,12 +18,16 @@ function Get-PowerShellHost([string]$FileName) {
     if ([IO.File]::Exists($path)) { return $path }
     return Join-Path (Split-Path (Get-Command pwsh -ErrorAction Stop).Source) $FileName
 }
+function Get-ReleaseAppName([string]$Directory) {
+    if (Test-Path -LiteralPath (Join-Path $Directory 'SearchBar_Edwin.exe')) { return 'SearchBar_Edwin' }
+    return 'E_Search'
+}
 function Get-ReleaseEvidence([string]$Directory, [string]$Database) {
     # 从 EXE 读取支持的辞书，再用包内种子运行验收。个人安装和用户词库不参与发布测试。
     $previousDb = $env:E_SEARCH_DB
     try {
         $env:E_SEARCH_DB = $Database
-        $exe = Join-Path $Directory 'E_Search.exe'
+        $exe = Join-Path $Directory ((Get-ReleaseAppName $Directory) + '.exe')
         $version = @(& $exe --version | ForEach-Object { $_ })
         if ($LASTEXITCODE -ne 0) { throw '发布程序无法输出版本' }
         $info = ($version -join "") | ConvertFrom-Json
@@ -52,7 +56,7 @@ function Get-IndexedSeedHashes([string]$Directory, [string]$Database, [switch]$R
         $env:E_SEARCH_DB = $Database
         # WinExe 需显式接入管道，PowerShell 才会等待程序并收集标准输出。
         $command = if ($Resources) { 'merged-resources' } else { 'indexed-sources' }
-        $hashes = @(& (Join-Path $Directory 'E_Search.exe') $command | ForEach-Object { $_ })
+        $hashes = @(& (Join-Path $Directory ((Get-ReleaseAppName $Directory) + '.exe')) $command | ForEach-Object { $_ })
         if ($LASTEXITCODE -ne 0) { throw "无法读取种子清单 $command" }
         foreach ($hash in $hashes) {
             if ($hash -cnotmatch '^[0-9A-F]{64}$') { throw "种子的 MDX 哈希无效：$hash" }
@@ -77,7 +81,8 @@ function Get-ReleaseSources {
 
 function Get-ReleaseBinaries([string]$Directory) {
     $binaries = [ordered]@{}
-    foreach ($name in 'E_Search.exe','E_Search.dll','Everything32.dll','Everything64.dll','EverythingARM64.dll') {
+    $product = Get-ReleaseAppName $Directory
+    foreach ($name in "$product.exe","$product.dll",'Everything32.dll','Everything64.dll','EverythingARM64.dll') {
         $binaries[$name] = (Get-FileHash -LiteralPath (Join-Path $Directory $name)).Hash
     }
     return $binaries
@@ -89,7 +94,7 @@ function Get-ReleaseVolumeHashes([string]$Directory, [string]$Database) {
     try {
         $env:E_SEARCH_DB = $Database
         foreach ($volume in 'zh-en','zh-ja') {
-            $rows = @(& (Join-Path $Directory 'E_Search.exe') indexed-volume-source $volume | ForEach-Object { $_ })
+            $rows = @(& (Join-Path $Directory ((Get-ReleaseAppName $Directory) + '.exe')) indexed-volume-source $volume | ForEach-Object { $_ })
             if ($LASTEXITCODE -ne 0 -or $rows.Count -gt 1 -or
                 ($rows.Count -eq 1 -and $rows[0] -cnotmatch '^[0-9A-F]{64}$')) { throw "种子的 $volume 卷标识无效" }
             if ($rows.Count) { $hashes[$volume] = $rows[0] }
@@ -118,7 +123,8 @@ function Test-ReleaseZip([string]$Archive, [string]$Cache) {
             }
             [IO.Compression.ZipFileExtensions]::ExtractToDirectory($archiveFile,$extract,$true)
         } finally { $archiveFile.Dispose() }
-        $directory = Join-Path $extract 'E_Search-win-x64'
+        $folder = if ($members.Contains('SearchBar_Edwin-win-x64/release.json')) { 'SearchBar_Edwin-win-x64' } else { 'E_Search-win-x64' }
+        $directory = Join-Path $extract $folder
         $manifest = Get-Content -Raw -Encoding utf8 -LiteralPath (Join-Path $directory 'release.json') | ConvertFrom-Json -AsHashtable
         $seed = Join-Path $directory 'Data/dictionaries.db'
         $binaries = Get-ReleaseBinaries $directory
@@ -173,9 +179,9 @@ function Test-ReleaseZip([string]$Archive, [string]$Cache) {
                 $env:LOCALAPPDATA = $profileDirectory
                 $env:E_SEARCH_DB = $null
                 $timer = [Diagnostics.Stopwatch]::StartNew()
-                $paths = @(& (Join-Path $directory 'E_Search.exe') install-seed | ForEach-Object { $_ })
+                $paths = @(& (Join-Path $directory ((Get-ReleaseAppName $directory) + '.exe')) install-seed | ForEach-Object { $_ })
                 if ($LASTEXITCODE -ne 0) { throw '新用户安装分发卷失败' }
-                $seed = Join-Path $profileDirectory 'E_Search/dictionaries.db'
+                $seed = Join-Path $profileDirectory ((Get-ReleaseAppName $directory) + '/dictionaries.db')
                 if ($paths.Count -ne 1 -or $paths[0] -ne [IO.Path]::GetFullPath($seed)) { throw '首启没有生成个人词库' }
                 Write-Output ("PASS 首次创建个人词库 {0:N2} 秒" -f $timer.Elapsed.TotalSeconds)
             } finally {
@@ -216,7 +222,7 @@ function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache) {
 
     $seed = (Resolve-Path -LiteralPath $PackageSeed).Path
     $stage = Join-Path $work 'stage'
-    $directory = [IO.Directory]::CreateDirectory((Join-Path $stage 'E_Search-win-x64')).FullName
+    $directory = [IO.Directory]::CreateDirectory((Join-Path $stage 'SearchBar_Edwin-win-x64')).FullName
     $gitArgs = @('-c',('safe.directory=' + $PSScriptRoot.Replace('\','/')),'-C',$PSScriptRoot)
     $commit = (git @gitArgs rev-parse --verify HEAD)
     if ($LASTEXITCODE -ne 0) { throw '无法读取发布源码的 Git 提交' }
@@ -225,7 +231,7 @@ function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache) {
     $hashes = Get-ReleaseSources
     $fingerprint = Get-ReleaseFingerprint $hashes
     $tag = "$commit.$fingerprint"
-    & $dotnet publish (Join-Path $PSScriptRoot 'E_Search.csproj') -c Release -f net10.0-windows -r win-x64 --self-contained true "-p:SourceRevisionId=$tag" -o $directory
+    & $dotnet publish (Join-Path $PSScriptRoot 'SearchBar_Edwin.csproj') -c Release -f net10.0-windows -r win-x64 --self-contained true "-p:SourceRevisionId=$tag" -o $directory
     if ($LASTEXITCODE -ne 0) { throw "发布构建失败，退出码 $LASTEXITCODE" }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'reports') -Destination $directory -Recurse
     # 基准提交加本次源码差异可以还原尚未提交的构建；仅打包参与构建与验收的文件。
@@ -266,7 +272,7 @@ function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache) {
         if (!$byHash.ContainsKey($hash)) {
             $packed = Join-Path $work "$hash.mdxp"
             $sourcePath = Join-Path ($seed + '.sources') "$hash.mdx"
-            & (Join-Path $directory 'E_Search.exe') pack-volume $volume $sourcePath $packed | Out-Host
+            & (Join-Path $directory 'SearchBar_Edwin.exe') pack-volume $volume $sourcePath $packed | Out-Host
             if ($LASTEXITCODE -ne 0) { throw "$volume 分发编码失败" }
             $byHash[$hash] = [ordered]@{
                 sourceSha256=$hash
@@ -277,7 +283,7 @@ function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache) {
         $manifest.volumeDeliveries[$volume] = $byHash[$hash]
     }
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $directory 'release.json')
-    $filename = "E_Search-$($evidence.version)-$($commit.Substring(0,7))-$($fingerprint.Substring(0,12))-win-x64.zip"
+    $filename = "SearchBar_Edwin-$($evidence.version)-$($commit.Substring(0,7))-$($fingerprint.Substring(0,12))-win-x64.zip"
     $candidate = Join-Path $work $filename
     # 以流式创建模式写入程序和种子，避免在内存或暂存目录中再复制整份大数据库。
     $source = [IO.File]::Open($seed,'Open','Read','Read')
@@ -294,7 +300,7 @@ function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache) {
                 [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,$member,[IO.Compression.CompressionLevel]::Fastest)
             }
             # 词库占包体的大部分，对这一项使用 Optimal 以减小下载体积。
-            $entry = $zip.CreateEntry('E_Search-win-x64/Data/dictionaries.db',[IO.Compression.CompressionLevel]::Optimal)
+            $entry = $zip.CreateEntry('SearchBar_Edwin-win-x64/Data/dictionaries.db',[IO.Compression.CompressionLevel]::Optimal)
             $stream = $entry.Open()
             try { $source.CopyTo($stream) } finally { $stream.Dispose() }
             # 仅发布当批种子确实引用的原书，历史版本与修复隔离区留在本机。
@@ -302,12 +308,12 @@ function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache) {
                 $file = Join-Path ($seed + '.sources') ($hash + '.mdx')
                 if ($byHash.ContainsKey($hash)) { $file = Join-Path $work "$hash.mdxp" }
                 [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,
-                    ("E_Search-win-x64/Data/dictionaries.db.sources/" + [IO.Path]::GetFileName($file)),[IO.Compression.CompressionLevel]::NoCompression)
+                    ("SearchBar_Edwin-win-x64/Data/dictionaries.db.sources/" + [IO.Path]::GetFileName($file)),[IO.Compression.CompressionLevel]::NoCompression)
             }
             foreach ($hash in $mergedResources) {
                 $file = Join-Path (Split-Path $seed) "merged-resources/$hash.mdd"
                 [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,
-                    "E_Search-win-x64/Data/merged-resources/$hash.mdd",[IO.Compression.CompressionLevel]::NoCompression)
+                    "SearchBar_Edwin-win-x64/Data/merged-resources/$hash.mdd",[IO.Compression.CompressionLevel]::NoCompression)
             }
         } finally { $zip.Dispose() }
     } finally { $source.Dispose() }
@@ -335,7 +341,7 @@ if ($PackageSeed -or $VerifyReleaseZip) {
     return
 }
 
-$app = Join-Path $PSScriptRoot 'bin/Release/net10.0/E_Search.dll'
+$app = Join-Path $PSScriptRoot 'bin/Release/net10.0/SearchBar_Edwin.dll'
 if (-not (Test-Path -LiteralPath $app)) { throw '请先执行 dotnet build -c Release' }
 if ($RealDatabase) { $RealDatabase = (Resolve-Path -LiteralPath $RealDatabase).Path }
 
@@ -955,7 +961,7 @@ function Test-IndexedMdx([string]$Directory, [Reflection.Assembly]$Assembly) {
 
 function Test-MergedAudioPlayback([string]$Database,[string]$UiDir,[switch]$BrokenResource) {
     Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
-    foreach($name in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','Microsoft.Web.WebView2.Core','E_Search'){
+    foreach($name in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','Microsoft.Web.WebView2.Core','SearchBar_Edwin'){
         $null=[Reflection.Assembly]::LoadFrom((Join-Path $UiDir "$name.dll"))
     }
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
@@ -1075,6 +1081,76 @@ function Test-MergedAudioPlayback([string]$Database,[string]$UiDir,[switch]$Brok
     }
 }
 
+function Test-CatalogVolumes($Store, [Reflection.Assembly]$Assembly, [string]$Database) {
+    $type = $Assembly.GetType('ESearch.SettingsWindow',$true)
+    $flags = [Reflection.BindingFlags]'Instance,NonPublic'
+    $window = $type.GetConstructors($flags)[0].Invoke(@($Database,[Func[uint32,uint32,Threading.Tasks.Task[string]]]{},[Action]{},''))
+    $previousContext = [Threading.SynchronizationContext]::Current
+    try {
+        [Threading.SynchronizationContext]::SetSynchronizationContext([Windows.Threading.DispatcherSynchronizationContext]::new($window.Dispatcher))
+        $window.ShowActivated = $false
+        $window.ShowInTaskbar = $false
+        $window.Opacity = 0
+        $window.Show()
+        $books = $Store.ListDictionaries()
+        $bind = $type.GetMethod('BindCatalog',$flags)
+        $null = $bind.Invoke($window,@($books,$null))
+        $list = $window.FindName('DictionaryList')
+        Assert-Equal $list.Items.Count 2 '默认只显示两个可选卷'
+        function Press-VolumeArrow($volume) {
+            $window.UpdateLayout()
+            $item = $list.ItemContainerGenerator.ContainerFromItem($volume)
+            $presenter = [Windows.Media.VisualTreeHelper]::GetChild([Windows.Media.VisualTreeHelper]::GetChild($item,0),0)
+            $arrow = $list.FindResource([Windows.DataTemplateKey]::new($volume.GetType())).FindName('VolumeArrow',$presenter)
+            $peer = [Windows.Automation.Peers.ToggleButtonAutomationPeer]::new($arrow)
+            $peer.GetPattern([Windows.Automation.Peers.PatternInterface]::Toggle).Toggle()
+        }
+        function Wait-CatalogUi([scriptblock]$Until) {
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+            while (!(& $Until)) {
+                if ($timer.Elapsed.TotalSeconds -gt 15) { throw "等待词库界面超时：$($window.FindName('CatalogStatus').Text)" }
+                $frame = [Windows.Threading.DispatcherFrame]::new()
+                $null = $window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background,[Action]{$frame.Continue=$false})
+                [Windows.Threading.Dispatcher]::PushFrame($frame)
+                Start-Sleep -Milliseconds 10
+            }
+        }
+        function Press-NameButton($button) { $button.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent)) }
+        Wait-CatalogUi { $window.FindName('ImportForm').IsEnabled }
+        $first = $list.Items[0]
+        $list.SelectedItem = $first
+        $editor = $window.FindName('CatalogNameBox')
+        $rename = $window.FindName('RenameButton')
+        Assert-Equal $rename.Content '重命名' '卷和来源共用底部重命名'
+        Assert-Equal $window.FindName('RestoreSourceButton').Content '重新定位原档' '定位按钮标题'
+        Assert-Equal $window.FindName('ToggleEnabledButton').IsEnabled $false '不能对卷执行来源操作'
+        Assert-Equal $list.Items.Count 2 '选中卷不会自动展开'
+        Press-NameButton $rename
+        Assert-Equal $editor.Text $first.Name '选中收起的卷后可用底部按钮改名'
+        $editor.Text = '测试合卷'
+        Press-NameButton ($window.FindName('SaveNameButton'))
+        Wait-CatalogUi { $window.FindName('NameEditor').Visibility -eq 'Collapsed' }
+        $first = $list.SelectedItem
+        Assert-Equal $first.Name '测试合卷' '保存后仍选中同一卷'
+        Press-VolumeArrow $first
+        Assert-Equal $list.Items.Count (2 + @{'zh-en'=2;'zh-ja'=6}[$first.Id]) '展开所选卷显示正确数量的来源'
+        $list.SelectedIndex = $list.Items.IndexOf($first) + 1
+        $source = $list.SelectedItem.Book
+        Assert-Equal $source.MergedVolume $first.Id '来源归属'
+        Press-NameButton $rename
+        $editor.Text = '取消改名测试'
+        Press-NameButton ($window.FindName('CancelNameButton'))
+        Assert-Equal $list.SelectedItem.Filename $source.Filename '取消编辑保留来源名'
+        Press-VolumeArrow $first
+        Assert-Equal $list.SelectedItem $first '收起后选中卷标题'
+        Assert-Equal $list.Items.Count 2 '收起后隐藏来源'
+        $Store.SetCatalogName($true,$first.Id,'')
+    } finally {
+        $window.Close()
+        [Threading.SynchronizationContext]::SetSynchronizationContext($previousContext)
+    }
+}
+
 function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, [switch]$Audio) {
     $dir = [IO.Directory]::CreateDirectory((Join-Path $Directory ([guid]::NewGuid().ToString('N')))).FullName
     $previous = $env:E_SEARCH_DB
@@ -1093,7 +1169,7 @@ function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, 
         $jaRows = @(@('shogakukan',1,'test','たべる<br>【食べる】<br>吃'), @('sanseido',1,'test','食べる'), @('shinseiki',1,'test','食べる'),
             @('sango',1,'test','食べる'), @('eijiro',1,'test','<br>日语释义'), @('shogakukan-zhja',1,'test','<br>訳'))
         $appTarget = 'esappref-shinseiki-' + ('a' * 64)
-        $appLink = '<a href="entry://' + $appTarget + '">E_Search 补充跳转</a>'
+        $appLink = '<a href="entry://' + $appTarget + '">SearchBar_Edwin 补充跳转</a>'
         $sampleAudio = '<p>主书及补充</p><audio id="native-audio" controls preload="metadata" src="es/shinseiki/voices/sample%20voice.wav"></audio><a id="sound-link" href="sound://es/shinseiki/voices/sample%20voice.wav?voice=1#t=0.125">发音</a><a id="missing-sound" href="sound://es/shinseiki/missing.wav">缺失</a><a id="external-link" href="https://media.invalid/missing.wav">外部</a><a id="file-link" href="file:///C:/unavailable-test.wav">文件</a>'
         $sampleAudio += '<div class="es-source es-shogakukan-zhja"><a name="C&#xE117;I" href="#C&#xE117;I">参见 <b>C&#xE117;I</b></a></div><div class="es-source es-sanseido">C&#xE117;I</div>'
         $sampleAudio += '<div class="es-source es-sango"><a name="es-sango-1"></a><a name="es-shinseiki-1"></a><div class="es-label"><b>两个来源共用</b></div><span>?ngstr?m</span></div>'
@@ -1159,7 +1235,7 @@ function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, 
             $sourceHtml = @(Invoke-Search @('article','zh-ja','alias')) -join ' '
             $navigation = $rewrite.Invoke($null,@($sourceHtml,'/page-2'))
             $url = [regex]::Match($navigation,'href="([^"]+)"').Groups[1].Value
-            Assert-Equal $url ("/page-2/lookup/" + $appTarget) 'E_Search 实体补救链接改写为该文档的内部路径'
+            Assert-Equal $url ("/page-2/lookup/" + $appTarget) 'SearchBar_Edwin 实体补救链接改写为该文档的内部路径'
             $target = [Uri]::UnescapeDataString($url.Substring('/page-2/lookup/'.Length))
             Assert-Equal (@(Invoke-Search @('article','zh-ja',$target)) -join ' ') '<p>新世纪的实体补救候选</p>' '从真实路由目标取回所属卷的补充富文本'
             # 复制数据库和内容寻址的 MDD，验证旧绝对路径及新相对路径都只定位到搬家后的同级缓存。
@@ -1174,6 +1250,45 @@ function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, 
             Copy-Item -LiteralPath ($env:E_SEARCH_DB + '.sources') -Destination ($movedDb + '.sources') -Recurse
             $store = $Assembly.GetType('DictionaryStore',$true).GetConstructor([type[]]@([string],[bool])).Invoke([object[]]@([string]$movedDb,$false))
             try {
+                Test-CatalogVolumes $store $Assembly $movedDb
+                # 在独立词库副本改名，重新打开后核对显示名、原档和检索身份。
+                function CatalogIdentity($db) {
+                    return ($db.ListDictionaries() | Select-Object Id,MergedVolume,Filename,Language,Priority,Enabled,Records,Sha256 | ConvertTo-Json -Compress)
+                }
+                function HitIdentity($db) {
+                    return ($db.Search('sample','zh-en') | ForEach-Object {
+                        [pscustomobject]@{ Source=$_.Entry.DictionaryId; Ordinal=$_.Entry.EntryId; Head=$_.Entry.Headword; Gloss=$_.Entry.DisplayGloss }
+                    } | ConvertTo-Json -Compress)
+                }
+                $catalogBefore = CatalogIdentity $store
+                $hitsBefore = HitIdentity $store
+                $articleBefore = $store.MergedArticleByKey('zh-en','sample')
+                $original = $store.ListDictionaries() | Where-Object Id -eq oxford
+                $store.SetCatalogName($true,'zh-en',' 双语卷 ')
+                $store.SetCatalogName($false,'oxford','牛津 <主书>')
+                $reader = $store.GetType().GetConstructor([type[]]@([string],[bool])).Invoke(@([string]$movedDb,$true))
+                try {
+                    $renamed = $reader.ListDictionaries() | Where-Object Id -eq oxford
+                    Assert-Equal $renamed.VolumeDisplayName '双语卷' '卷名重开后保留'
+                    Assert-Equal $renamed.DisplayName '牛津 <主书>' '来源名重开后保留'
+                    Assert-Equal $renamed.Filename $original.Filename '改显示名保留原文件名'
+                    Assert-Equal $renamed.Sha256 $original.Sha256 '改名仍使用同一 MDX'
+                    Assert-Equal $reader.Search('sample','oxford')[0].Entry.DictionaryName '牛津 <主书>' '查词使用自定义来源名'
+                    $article = $reader.MergedArticleByKey('zh-en','sample')
+                    Assert-Equal (CatalogIdentity $reader) $catalogBefore '八个来源改名前后的归属、顺序、启停、条数和原档完全相同'
+                    Assert-Equal (HitIdentity $reader) $hitsBefore '按卷查词返回相同来源、序号、次序和释义'
+                    Assert-Equal $article.Html $articleBefore.Html '正文和卷内链接保持原值'
+                    Assert-Equal $article.SourceNames['oxford'] '牛津 <主书>' '正文取得同一来源名'
+                    $header = '<a name="es-oxford-1"></a><a name="es-hanying-2"></a><div class="es-label"><b>牛津 #1 · 汉英 #2</b></div>'
+                    $render = $Assembly.GetType('ESearch.SearchWindow').GetMethod('EncodeMergedDocument',[Reflection.BindingFlags]'Static,NonPublic')
+                    $document = [Text.Encoding]::UTF8.GetString($render.Invoke($null,@($header,'/test',$article.SourceNames)))
+                    Assert-Equal ($document.Contains($header.Replace('牛津 #1','牛津 &lt;主书&gt; #1'))) $true '共用正文只改指定来源并转义名称'
+                } finally { $reader.Dispose() }
+                $store.SetCatalogName($true,'zh-en','')
+                $store.SetCatalogName($false,'oxford','  ')
+                $restored = $store.ListDictionaries() | Where-Object Id -eq oxford
+                Assert-Equal $restored.VolumeDisplayName $null '恢复默认卷名'
+                Assert-Equal $restored.DisplayName $original.Filename '恢复默认来源名'
                 $connection = $store.GetType().GetField('db',[Reflection.BindingFlags]'Instance,NonPublic').GetValue($store)
                 $budget = [MdxReader]::CacheBudgetBytes
                 try {
@@ -1304,12 +1419,12 @@ if ($MergeAuditDirectory) {
     if (!$MergeAuditHost) {
         # 工程的 .NET 10 宿主加载相同程序集，循环直接走界面调用的 Search 方法，计时排除启动 CLI 的时间。
         $psDll = Get-PowerShellHost 'pwsh.dll'
-        $config = Join-Path $PSScriptRoot 'bin/Release/net10.0/E_Search.runtimeconfig.json'
+        $config = Join-Path $PSScriptRoot 'bin/Release/net10.0/SearchBar_Edwin.runtimeconfig.json'
         & $dotnet exec --runtimeconfig $config --depsfile (Join-Path (Split-Path $psDll) 'pwsh.deps.json') $psDll -NoProfile -NonInteractive -File $PSCommandPath -MergeAuditHost -MergeAuditDirectory $MergeAuditDirectory -RealDatabase $RealDatabase -MergedDatabase $MergedDatabase
         if ($LASTEXITCODE) { throw '真实词书查询对照未通过' }
         return
     }
-    foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search') {
+    foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','SearchBar_Edwin') {
         $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $PSScriptRoot "bin/Release/net10.0/$lib.dll"))
     }
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
@@ -1398,7 +1513,7 @@ function Test-ImportInterruptions([string]$Directory,[Reflection.Assembly]$Assem
         # 只暂停携带独立数据库路径的本轮子进程；SQLite 提交前后分别验证旧版本和完整新版。
         $childCode=@'
 $ErrorActionPreference='Stop'
-foreach($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search'){
+foreach($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','SearchBar_Edwin'){
     $assembly=[Reflection.Assembly]::LoadFrom((Join-Path $env:E_RECOVERY_LIB ($lib+'.dll')))
 }
 [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
@@ -1766,6 +1881,7 @@ function Test-FileNameCompletions([string]$Scratch, [Reflection.Assembly]$Assemb
     $flags = [Reflection.BindingFlags]'Instance,NonPublic'
     $type = $window.GetType()
     $query = $window.FindName('QueryBox')
+    Assert-Equal $query.ToolTip $null '搜索输入框不再弹出整段操作提示'
     $choices = $window.FindName('FileCompletionChoices')
     Assert-Equal ($null -ne $choices) $true '文件区具有独立补全控件'
     $update = $type.GetMethod('UpdateFileCompletions',$flags)
@@ -2840,8 +2956,8 @@ function Test-SettingsPage([switch]$Restarted) {
         if ($drop.Current.ExpandCollapseState -ne 'Collapsed') { $drop.Collapse() }
         Wait-Desktop { (Control EntryText).Current.Name -like '*乙释义*' } 'TSV 候选未显示完整词条'
         Click SettingsButton
-        Wait-Desktop { @($root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object {$_.Current.Name -eq 'E_Search 设置'}).Count -gt 0 } '复验排序后设置页未打开'
-        @($root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object {$_.Current.Name -eq 'E_Search 设置'})[0]
+        Wait-Desktop { @($root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object {$_.Current.Name -eq 'SearchBar_Edwin 设置'}).Count -gt 0 } '复验排序后设置页未打开'
+        @($root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object {$_.Current.Name -eq 'SearchBar_Edwin 设置'})[0]
     }
     function Pick-Book([string]$name) {
         $row=@(Options (Control DictionaryList) | Where-Object { $_.Current.Name.Contains($name,[StringComparison]::OrdinalIgnoreCase) })[0]
@@ -2896,7 +3012,7 @@ function Test-SettingsPage([switch]$Restarted) {
             $window=$searchWindow
             Click SettingsButton
             function Visible-Settings {
-                $root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object { $_.Current.Name -eq 'E_Search 设置' }
+                $root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object { $_.Current.Name -eq 'SearchBar_Edwin 设置' }
             }
             Wait-Desktop { @(Visible-Settings).Count -eq 1 -and [ESearchDesktop]::FindSearch($appProcess.Id) -eq 0 } '重新进入时应只显示一个设置窗口'
             $window=@(Visible-Settings)[0]
@@ -2933,8 +3049,8 @@ function Test-SettingsPage([switch]$Restarted) {
     Click SettingsButton
     $root=[Windows.Automation.AutomationElement]::RootElement
     $windows=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty,$appProcess.Id)
-    Wait-Desktop { @($root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object {$_.Current.Name -eq 'E_Search 设置'}).Count -gt 0 } '未显示设置页'
-    $window=@($root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object {$_.Current.Name -eq 'E_Search 设置'})[0]
+    Wait-Desktop { @($root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object {$_.Current.Name -eq 'SearchBar_Edwin 设置'}).Count -gt 0 } '未显示设置页'
+    $window=@($root.FindAll([Windows.Automation.TreeScope]::Children,$windows) | Where-Object {$_.Current.Name -eq 'SearchBar_Edwin 设置'})[0]
     if ($Restarted) {
         Tab CatalogTab
         Pick-Book '优先级乙'
@@ -3068,7 +3184,7 @@ function Test-SettingsPage([switch]$Restarted) {
         Wait-Desktop { [ESearchDesktop]::FindSearch($appProcess.Id) -eq $handle } '快捷键等待写锁时无法返回搜索'
         $window=$searchWindow
         Click SettingsButton
-        $settingsFilter=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,'E_Search 设置')
+        $settingsFilter=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,'SearchBar_Edwin 设置')
         $settingsCondition=[Windows.Automation.AndCondition]::new($windows,$settingsFilter)
         Wait-Desktop { $root.FindFirst([Windows.Automation.TreeScope]::Children,$settingsCondition) } '快捷键保存期间无法重新进入设置'
         $window=$root.FindFirst([Windows.Automation.TreeScope]::Children,$settingsCondition)
@@ -4083,7 +4199,7 @@ function Test-SecondPassDisplay([Reflection.Assembly]$Assembly) {
     $legacy = 'Google(font size=-2><sup>TM</sup></font>・为 <Sup>1</up>/8加仑'
     $ox = '<div class="es-source es-oxford"><a name="es-oxford-15994"></a><a href="#origin">' + $legacy + '</a></div>'
     $foreign = '<div class="es-source es-hanying">' + $legacy + '</div>'
-    $encoded = $window.GetMethod('EncodeMergedDocument',$static).Invoke($null,@(($ox + $foreign),'/test'))
+    $encoded = $window.GetMethod('EncodeMergedDocument',$static).Invoke($null,@(($ox + $foreign),'/test',$null))
     $merged = [Text.Encoding]::UTF8.GetString($encoded)
     Assert-Equal ($merged.Contains($ox.Replace($legacy,'Google™・为 ⅛加仑') + $foreign)) $true '牛津合并页保留链接、锚点与其他书同形片段'
     $parser = $Assembly.GetType('EntryParser')
@@ -4119,7 +4235,7 @@ function Test-SecondPassDisplay([Reflection.Assembly]$Assembly) {
     Assert-Equal ($detail.Invoke($null,@($body,$null,'other')).Text.Contains('安全转移move')) $true '普通自定义词书沿用自己的格式'
     $section = '<div class="es-source es-sango"><a name="es-sango-242"></a><div class="es-label"><b>三合一日语辞典 #242</b></div>'
     $render = $window.GetMethod('EncodeMergedDocument',$static)
-    $rendered = [Text.Encoding]::UTF8.GetString($render.Invoke($null,@(($section+$serial+'</div>'),'/v/test')))
+    $rendered = [Text.Encoding]::UTF8.GetString($render.Invoke($null,@(($section+$serial+'</div>'),'/v/test',$null)))
     Assert-Equal ($rendered.Contains($section+'<br><font color=black>ADB〔2〕')) $true '旧合并页面的来源锚点和编号'
     Assert-Equal ($rendered.Contains('例 A&+{2}')) $true '旧合并页面的正文符号'
     # 新世纪 #24331 用图片隔开日中释义，用 example-source 标出日文例句。
@@ -4152,7 +4268,7 @@ function Test-ShogakukanJoinedDetail([Reflection.Assembly]$Assembly) {
     $interleaved = $body.Replace('騒音公害．','騒音公害．<font color=red>【引用】</font>')
     Assert-Equal ($detail.Invoke($null,@($interleaved,$null,'shogakukan-zhja')).Text.Contains('例：</>')) $true '相隔另一个词头时保留例句标记'
     $foreign = '<div class="es-source es-sango">' + $body + '</div>'
-    $page = [Text.Encoding]::UTF8.GetString($encode.Invoke($null,@(($section + $body + '</div>' + $foreign),'/local/1')))
+    $page = [Text.Encoding]::UTF8.GetString($encode.Invoke($null,@(($section + $body + '</div>' + $foreign),'/local/1',$null)))
     Assert-Equal ($page.Contains($section + $clean + '</div>' + $foreign)) $true '已保存合并页只改该书分区的分隔'
     $hiddenHeading = '<span hidden><font color=red>【引用】</font></span><!--<font color=red>【另一篇】</font>-->'
     $mixed = $section + $body.Replace('騒音公害．','騒音公害．' + $hiddenHeading) + '</div>'
@@ -4213,7 +4329,7 @@ function Test-ShinseikiTruncatedDetail([Reflection.Assembly]$Assembly) {
     $section = '<div class="es-source es-shinseiki"><a name="es-shinseiki-195342"></a>'
     $foreign = '<div class="es-source es-sango">' + $power + '</div>'
     $encoder = $Assembly.GetType('ESearch.SearchWindow').GetMethod('EncodeMergedDocument',[Reflection.BindingFlags]'Static,NonPublic')
-    $page = [Text.Encoding]::UTF8.GetString($encoder.Invoke($null,@(($section + $power + '</div>' + $foreign),'/local/1')))
+    $page = [Text.Encoding]::UTF8.GetString($encoder.Invoke($null,@(($section + $power + '</div>' + $foreign),'/local/1',$null)))
     Assert-Equal ($page.Contains($section + $powerTitle + '<span>对于aⁿ而言的n。</span></div>' + $foreign)) $true '复原幂指数后普通句子脱离上标'
     $rewrite = $Assembly.GetType('ESearch.SearchWindow').GetMethod('RewriteMergedLinks',[Reflection.BindingFlags]'Static,NonPublic')
     $bad = 'B<sub><</sub>sup>12'
@@ -5233,9 +5349,9 @@ function Test-Tray {
                 }
             }
         }
-        Wait-Desktop { (MenuItem) } '真实右键之后未找到 E_Search 自己的设置菜单项'
+        Wait-Desktop { (MenuItem) } '真实右键之后未找到 SearchBar_Edwin 自己的设置菜单项'
         (MenuItem).GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
-        function SettingsTop { @($root.FindAll([Windows.Automation.TreeScope]::Children,$appFilter) | Where-Object { $_.Current.Name -eq 'E_Search 设置' })[0] }
+        function SettingsTop { @($root.FindAll([Windows.Automation.TreeScope]::Children,$appFilter) | Where-Object { $_.Current.Name -eq 'SearchBar_Edwin 设置' })[0] }
         Wait-Desktop { (SettingsTop) } '未从托盘进入设置'
         $window=SettingsTop
         (Control HotkeyTab).GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Select()
@@ -5273,7 +5389,7 @@ function Test-LaunchReadiness {
                     $roots=[Windows.Automation.AutomationElement]::RootElement
                     function StartupError {
                         foreach ($dialog in $roots.FindAll([Windows.Automation.TreeScope]::Children,[Windows.Automation.Condition]::TrueCondition)) {
-                            if ($dialog.Current.ProcessId -eq $second.Id -and $dialog.Current.Name -ceq 'E_Search 启动失败') { return $dialog }
+                            if ($dialog.Current.ProcessId -eq $second.Id -and $dialog.Current.Name -ceq 'SearchBar_Edwin 启动失败') { return $dialog }
                         }
                     }
                     Wait-Desktop { StartupError } '首启退出后未向二次启动报告失败'
@@ -5289,7 +5405,7 @@ function Test-LaunchReadiness {
                     $roots=[Windows.Automation.AutomationElement]::RootElement
                     $pidFilter=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty,$second.Id)
                     foreach ($dialog in $roots.FindAll([Windows.Automation.TreeScope]::Children,$pidFilter)) {
-                        if ($dialog.Current.Name -eq 'E_Search 启动失败') { throw '慢首启期间二次 EXE 弹出了启动失败提示' }
+                        if ($dialog.Current.Name -eq 'SearchBar_Edwin 启动失败') { throw '慢首启期间二次 EXE 弹出了启动失败提示' }
                     }
                     $server=[IO.Pipes.NamedPipeServerStream]::new($endpoint,[IO.Pipes.PipeDirection]::InOut,1,
                         [IO.Pipes.PipeTransmissionMode]::Byte,[IO.Pipes.PipeOptions]'Asynchronous,CurrentUserOnly')
@@ -5335,7 +5451,7 @@ function Test-WindowInteractions {
     $invoke=[Windows.Automation.InvokePattern]::Pattern
     $roots=[Windows.Automation.AutomationElement]::RootElement
     $byProcess=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty,$appProcess.Id)
-    function SettingsWindows { $roots.FindAll([Windows.Automation.TreeScope]::Children,$byProcess) | Where-Object { $_.Current.Name -ceq 'E_Search 设置' } }
+    function SettingsWindows { $roots.FindAll([Windows.Automation.TreeScope]::Children,$byProcess) | Where-Object { $_.Current.Name -ceq 'SearchBar_Edwin 设置' } }
     function Launch-Again {
         $second=Start-Process -FilePath $gui -PassThru
         try {
@@ -5541,7 +5657,7 @@ public static class ESearchDesktop {
         EnumWindows((h,p)=>{ uint owner; GetWindowThreadProcessId(h,out owner);
             if(owner!=process || !IsWindowVisible(h)) return true;
             var title=new System.Text.StringBuilder(64); GetWindowText(h,title,64);
-            if(title.ToString()!="E_Search") return true;
+            if(title.ToString()!="SearchBar_Edwin") return true;
             matched=h;return false;
         },IntPtr.Zero);
         return matched;
@@ -5600,7 +5716,7 @@ public static class ESearchDesktop {
         }
     }
     $form=[Windows.Forms.Form]::new()
-    $form.Text="E_Search 键盘焦点验收 $PID"
+    $form.Text="SearchBar_Edwin 键盘焦点验收 $PID"
     $box=[Windows.Forms.TextBox]::new()
     $box.Dock='Fill'
     $form.Controls.Add($box)
@@ -5614,7 +5730,7 @@ public static class ESearchDesktop {
         $env:E_SEARCH_DB=$Database
         # 含 Launch-Again 在内的所有子进程继承同一 GUID，只能连接本轮常驻端点。
         $env:E_SEARCH_TEST_INSTANCE=[guid]::NewGuid().ToString('N')
-        $gui=if ($GuiExecutable) { (Resolve-Path -LiteralPath $GuiExecutable).Path } else { Join-Path $PSScriptRoot 'bin/Release/net10.0-windows/E_Search.exe' }
+        $gui=if ($GuiExecutable) { (Resolve-Path -LiteralPath $GuiExecutable).Path } else { Join-Path $PSScriptRoot 'bin/Release/net10.0-windows/SearchBar_Edwin.exe' }
         # 旧发布包会忽略实例变量。用只打印帮助的入口确认支持后，才能启动任何桌面窗口。
         $helpText=(& $gui --help 2>&1 | Out-String)
         if ($LASTEXITCODE -ne 0 -or !$helpText.Contains('E_SEARCH_TEST_INSTANCE')) {
@@ -5994,7 +6110,7 @@ function Test-ReleaseDataLocation {
     # TEMP 可以被调用者重定向到仓库内；那样程序会选中真正的开发库。复制测试程序前先排除这类路径。
     $outside = foreach ($candidate in @([IO.Path]::GetTempPath(), (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Temp'))) {
         $dir = [IO.DirectoryInfo]::new([IO.Path]::GetFullPath($candidate))
-        while ($dir -and !(Test-Path -LiteralPath (Join-Path $dir.FullName 'E_Search.csproj'))) { $dir = $dir.Parent }
+        while ($dir -and !(Test-Path -LiteralPath (Join-Path $dir.FullName 'SearchBar_Edwin.csproj'))) { $dir = $dir.Parent }
         if (!$dir) { $candidate; break }
     }
     if (!$outside) { throw '无种子发布测试需要项目树外的临时目录。' }
@@ -6005,7 +6121,7 @@ function Test-ReleaseDataLocation {
     foreach ($file in Get-ChildItem -LiteralPath $source -File | Where-Object Extension -in '.dll','.json') {
         [IO.File]::Copy($file.FullName, (Join-Path $install $file.Name))
     }
-    $app = Join-Path $install 'E_Search.dll'
+    $app = Join-Path $install 'SearchBar_Edwin.dll'
     $fixture = Join-Path $root 'sample.mdx'
     Write-Mdx $fixture ([ordered]@{example='verified definition'})
     $oldDb = $env:E_SEARCH_DB
@@ -6017,8 +6133,16 @@ function Test-ReleaseDataLocation {
         Invoke-Search @('import','oxford',$fixture) | Out-Null
         Set-Location -LiteralPath $second
         Assert-Equal @(Invoke-Search @('query','example','oxford')).Count 1 '更换工作目录后仍能使用个人词库'
-        $personal = Join-Path $env:LOCALAPPDATA 'E_Search/dictionaries.db'
+        $personal = Join-Path $env:LOCALAPPDATA 'SearchBar_Edwin/dictionaries.db'
         Assert-Equal (Test-Path -LiteralPath $personal) $true '无种子包的用户数据库'
+        # 已有旧名个人库时，新程序应直接命中它，不额外创建词库。
+        $newProfile = $env:LOCALAPPDATA
+        $env:LOCALAPPDATA = Join-Path $root 'legacy-profile'
+        $oldData = [IO.Directory]::CreateDirectory((Join-Path $env:LOCALAPPDATA 'E_Search')).FullName
+        [IO.File]::Copy($personal,(Join-Path $oldData 'dictionaries.db'))
+        Assert-Equal @(Invoke-Search @('query','example','oxford')).Count 1 '新程序沿用旧个人词库'
+        Assert-Equal (Test-Path (Join-Path $env:LOCALAPPDATA 'SearchBar_Edwin/dictionaries.db')) $false '读取旧词库不会新建副本'
+        $env:LOCALAPPDATA = $newProfile
         $seedDir = [IO.Directory]::CreateDirectory((Join-Path $install 'Data'))
         $seed = Join-Path $seedDir.FullName 'dictionaries.db'
         [IO.File]::Copy($personal,$seed)
@@ -6034,7 +6158,7 @@ function Test-ReleaseDataLocation {
         $other = Join-Path $root 'added.mdx'
         Write-Mdx $other ([ordered]@{'たべる'='たべる<br>【食べる】<br>吃'})
         Invoke-Search @('import','shogakukan',$other) | Out-Null
-        $personalDirectory = Join-Path $env:LOCALAPPDATA 'E_Search'
+        $personalDirectory = Join-Path $env:LOCALAPPDATA 'SearchBar_Edwin'
         Assert-Equal @(Get-ChildItem -LiteralPath $personalDirectory -Filter '*.tmp-*' -File).Count 0 '首装不得留下临时快照的 SQLite 旁文件'
         [IO.Directory]::Move($seedDir.FullName,(Join-Path $install 'previous-seed'))
         Assert-Equal (@(Invoke-Search @('entry','oxford','1'))[-1]) 'verified definition' '首次写入携带不可变源，安装种子移开后个人库仍可查原书'
@@ -6690,15 +6814,16 @@ if ($WpfRenderDirectory) {
         return
     }
     $uiDir = if ($GuiExecutable) { Split-Path -Parent (Resolve-Path -LiteralPath $GuiExecutable).Path } else { Join-Path $PSScriptRoot 'bin/Release/net10.0-windows' }
-    $appSha256 = (Get-FileHash -LiteralPath (Join-Path $uiDir 'E_Search.dll')).Hash
+    $readerName = if ($GuiExecutable) { [IO.Path]::GetFileNameWithoutExtension($GuiExecutable) } else { 'SearchBar_Edwin' }
+    $appSha256 = (Get-FileHash -LiteralPath (Join-Path $uiDir ($readerName + '.dll'))).Hash
     Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
-    foreach ($name in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search') {
+    foreach ($name in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite',$readerName) {
         $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $uiDir "$name.dll"))
     }
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
     Add-Type -Namespace ESearchBench -Name Desktop -MemberDefinition '[System.Runtime.InteropServices.DllImport("dwmapi.dll")] public static extern int DwmFlush();'
     if ($WpfRenderMode -ne 'Warm' -and (Test-Path -LiteralPath (Join-Path $uiDir 'Microsoft.Web.WebView2.Core.dll'))) {
-        # PowerShell 宿主不读取 E_Search.deps.json，显式使用同一桌面构建的架构匹配加载器。
+        # PowerShell 宿主不读取 SearchBar_Edwin.deps.json，显式使用同一桌面构建的架构匹配加载器。
         $null = [Reflection.Assembly]::LoadFrom((Join-Path $uiDir 'Microsoft.Web.WebView2.Core.dll'))
         $arch = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
         $loaderDirectory = if (Test-Path -LiteralPath (Join-Path $uiDir 'WebView2Loader.dll')) { $uiDir } else { Join-Path $uiDir "runtimes/win-$arch/native" }
@@ -7205,7 +7330,7 @@ if ($WpfRenderDirectory) {
 
 if ($BackendTestDirectory -or $IndexedMdxTestDirectory) {
     $uiDir = Join-Path $PSScriptRoot 'bin/Release/net10.0-windows'
-    foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search') {
+    foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','SearchBar_Edwin') {
         $assembly = [Reflection.Assembly]::LoadFrom((Join-Path $uiDir "$lib.dll"))
     }
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
@@ -7281,7 +7406,7 @@ if ($BackendTestDirectory -or $IndexedMdxTestDirectory) {
 function Test-RealIndexedComparison([string]$Baseline, [string]$Indexed) {
     # 两个路径都由调用者显式提供。只用当前 Release 后端和只读连接，不通过默认个人词库。
     if ([StringComparer]::OrdinalIgnoreCase.Equals($Baseline,$Indexed)) { throw '请分别指定普通库与索引库。' }
-    foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','E_Search') {
+    foreach ($lib in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','SearchBar_Edwin') {
         $assembly = [Reflection.Assembly]::LoadFrom((Join-Path (Split-Path $app) "$lib.dll"))
     }
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
@@ -7465,7 +7590,7 @@ try {
     Write-Output 'PASS 查询路径、候选排序、别名、未命中和失败重导回滚'
     # 单独宿主运行接口回归，避免覆盖桌面验收实际加载的发布版程序集。
     $psDll = Get-PowerShellHost 'pwsh.dll'
-    $config = Join-Path $PSScriptRoot 'bin/Release/net10.0-windows/E_Search.runtimeconfig.json'
+    $config = Join-Path $PSScriptRoot 'bin/Release/net10.0-windows/SearchBar_Edwin.runtimeconfig.json'
     if (($Desktop -or $FileDesktop) -and !$RealDatabase) { $RealDatabase=(Resolve-Path (Join-Path $PSScriptRoot '.data/dictionaries.db')).Path }
     $prepareArgs=@()
     $desktopData=Join-Path $scratch 'desktop-data.db'
@@ -7544,7 +7669,7 @@ public sealed class HeldSearchCallbacks : SynchronizationContext {
 '@
     try {
         [AppContext]::SetData('APP_CONTEXT_BASE_DIRECTORY', $assemblyDir)
-        foreach ($library in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','Microsoft.Web.WebView2.Core','Microsoft.Web.WebView2.Wpf','E_Search') {
+        foreach ($library in 'SQLitePCLRaw.core','SQLitePCLRaw.provider.winsqlite3','Microsoft.Data.Sqlite','Microsoft.Web.WebView2.Core','Microsoft.Web.WebView2.Wpf','SearchBar_Edwin') {
             [void][Reflection.Assembly]::LoadFrom((Join-Path $assemblyDir "$library.dll"))
         }
         [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())

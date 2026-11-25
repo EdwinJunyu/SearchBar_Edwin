@@ -8,6 +8,24 @@ using Microsoft.Win32;
 
 namespace ESearch;
 
+internal sealed class CatalogVolume(string? id, int count, int enabled, string? displayName)
+{
+    public string? Id => id;
+    public string Name => displayName ?? DefaultName;
+    public string DefaultName => id switch { "zh-en" => "中英卷", "zh-ja" => "日语卷", null => "独立词典", _ => id };
+    public string Filename => id == null ? "" : $"E_search-{id}.mdx";
+    public string Summary => id == null ? $"{enabled}/{count} 本已启用" : $"{enabled}/{count} 个来源已启用";
+    public bool IsExpanded { get; set; }
+}
+
+internal sealed record CatalogRow(DictionaryInfo Book, int Position, CatalogVolume Volume)
+{
+    public string Name => Book.DisplayName;
+    public string Filename => Book.DisplayName;
+    public string State => Book.Enabled ? "已启用" : "已停用";
+    public string Summary => $"{SettingsWindow.LanguageName(Book.Language)} · {Book.Records:N0} 条" + (Book.MissingSource ? " · 原档缺失" : "");
+}
+
 public partial class SettingsWindow : Window
 {
     private readonly string databasePath;
@@ -42,16 +60,11 @@ public partial class SettingsWindow : Window
         Closed += (_, _) => { closed = true; ++previewVersion; currentOperation?.Cancel(); };
     }
 
-    private sealed record CatalogRow(DictionaryInfo Book, int Position)
-    {
-        public string Filename => Book.Filename;
-        public string State => Book.Enabled ? "已启用" : "已停用";
-        public string Summary => $"{LanguageName(Book.Language)} · {Book.Records:N0} 条" + (Book.MissingSource ? " · 原档缺失" : "");
-    }
+    private CatalogRow[] catalogRows = [];
 
     private sealed record Target(string Name, DictionaryInfo? Book);
 
-    private static string LanguageName(string language) => language switch
+    internal static string LanguageName(string language) => language switch
     {
         "en" => "英语", "zh" => "中文", "ja" => "日语", _ => language
     };
@@ -133,15 +146,27 @@ public partial class SettingsWindow : Window
     private void BindCatalog(IReadOnlyList<DictionaryInfo> books, string? selectedId)
     {
         var importId = (ImportTarget.SelectedItem as Target)?.Book?.Id;
-        var rows = books.Select((book, index) => new CatalogRow(book, index + 1)).ToArray();
-        DictionaryList.ItemsSource = rows;
-        DictionaryList.SelectedItem = rows.FirstOrDefault(x => x.Book.Id == selectedId) ?? rows.FirstOrDefault();
-        if (DictionaryList.SelectedItem is { } selected) DictionaryList.ScrollIntoView(selected);
+        var expanded = catalogRows.Where(row => row.Volume.IsExpanded).Select(row => row.Volume.Id).ToHashSet();
+        var volumes = books.ToLookup(book => book.MergedVolume).Select(group =>
+            new CatalogVolume(group.Key, group.Count(), group.Count(book => book.Enabled), group.First().VolumeDisplayName) {
+                IsExpanded = group.Key == null || expanded.Contains(group.Key)
+            }).ToDictionary(volume => volume.Id ?? "");
+        catalogRows = books.Select((book, index) => new CatalogRow(book, index + 1, volumes[book.MergedVolume ?? ""])).ToArray();
+        bool grouped = books.Any(book => book.MergedVolume != null);
+        var previousVolume = DictionaryList.SelectedItem as CatalogVolume;
+        CatalogHint.Text = grouped ? "展开词卷查看来源。来源旁的数字是全库优先级，同级匹配时数字小的优先。" :
+            "同级匹配优先显示靠前的词典。选中词典后可以移动或停用。";
+        CatalogHeading.Text = grouped ? "已安装词书" : "词典优先级";
+        var preferred = catalogRows.FirstOrDefault(row => row.Book.Id == selectedId);
+        object? selection = preferred;
+        if (selection == null && previousVolume != null)
+            selection = volumes.GetValueOrDefault(previousVolume.Id ?? "");
+        ShowCatalogRows(selection ?? (grouped ? null : catalogRows.FirstOrDefault()));
         var targets = new List<Target> { new("按文件来源导入（再次导入会更新原词典）", null) };
-        targets.AddRange(books.Select(book => new Target("替换：" + book.Filename, book)));
+        targets.AddRange(books.Select(book => new Target("替换：" + book.DisplayName, book)));
         ImportTarget.ItemsSource = targets;
         ImportTarget.SelectedItem = targets.FirstOrDefault(x => x.Book?.Id == importId) ?? targets[0];
-        if (rows.Length == 0) Message(CatalogStatus, "尚无词典。可在“导入词库”中添加词典。");
+        if (catalogRows.Length == 0) Message(CatalogStatus, "尚无词典。可在“导入词库”中添加词典。");
     }
 
     private static void Message(TextBlock block, string text, bool error = false)
@@ -153,6 +178,8 @@ public partial class SettingsWindow : Window
     private void Busy(bool value)
     {
         busy = value;
+        NameEditor.IsEnabled = !busy;
+        DictionaryList.IsEnabled = !busy && NameEditor.Visibility != Visibility.Visible;
         ImportForm.IsEnabled = !busy && ready;
         SaveHotkeyButton.IsEnabled = HotkeyCapture.IsEnabled = !busy && ready;
         ImportButton.IsEnabled = !busy && ready && preparedPath != null;
@@ -161,13 +188,61 @@ public partial class SettingsWindow : Window
 
     private void CatalogSelected(object sender, SelectionChangedEventArgs e) => UpdateCatalogActions();
 
+    private void ShowCatalogRows(object? selection)
+    {
+        // 卷标题也是可选行。列表只投影可见来源，全库优先级仍由 catalogRows 保存。
+        var visible = new List<object>();
+        if (catalogRows.Any(row => row.Book.MergedVolume != null))
+        {
+            foreach (var group in catalogRows.GroupBy(row => row.Volume))
+            {
+                visible.Add(group.Key);
+                if (group.Key.IsExpanded) visible.AddRange(group);
+            }
+        }
+        else visible.AddRange(catalogRows);
+        DictionaryList.ItemsSource = visible;
+        DictionaryList.SelectedItem = selection;
+        if (DictionaryList.SelectedItem != null) DictionaryList.ScrollIntoView(selection);
+    }
+
+    private void VolumeToggled(object sender, RoutedEventArgs e)
+    {
+        // 鼠标和辅助功能都通过选中状态触发；模板初始化到已有状态时无需重建列表。
+        if (sender is System.Windows.Controls.Primitives.ToggleButton { DataContext: CatalogVolume volume, IsChecked: bool expanded }
+            && volume.IsExpanded != expanded)
+            ExpandVolume(volume, expanded);
+    }
+
+    private void ExpandVolume(CatalogVolume volume, bool expand)
+    {
+        volume.IsExpanded = expand;
+        ShowCatalogRows(volume);
+        if (DictionaryList.ItemContainerGenerator.ContainerFromItem(volume) is ListBoxItem item) item.Focus();
+    }
+
+    private void CatalogKeyDown(object sender, KeyEventArgs e)
+    {
+        if (DictionaryList.SelectedItem is CatalogVolume volume && e.Key is Key.Left or Key.Right or Key.Space)
+        {
+            ExpandVolume(volume, e.Key == Key.Space ? !volume.IsExpanded : e.Key == Key.Right);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Left && DictionaryList.SelectedItem is CatalogRow { Book.MergedVolume: not null } row)
+        {
+            ExpandVolume(row.Volume, false);
+            e.Handled = true;
+        }
+    }
+
     private void UpdateCatalogActions()
     {
         if (MoveUpButton == null) return;
         var row = DictionaryList.SelectedItem as CatalogRow;
-        MoveUpButton.IsEnabled = !busy && row != null && DictionaryList.SelectedIndex > 0;
-        MoveDownButton.IsEnabled = !busy && row != null && DictionaryList.SelectedIndex < DictionaryList.Items.Count - 1;
+        MoveUpButton.IsEnabled = !busy && row != null && row.Position > 1;
+        MoveDownButton.IsEnabled = !busy && row != null && row.Position < catalogRows.Length;
         ToggleEnabledButton.IsEnabled = !busy && row != null;
+        RenameButton.IsEnabled = !busy && (row != null || DictionaryList.SelectedItem is CatalogVolume { Id: not null });
         ToggleEnabledButton.Content = row?.Book.Enabled == false ? "启用词典" : "停用词典";
         RestoreSourceButton.Visibility = row?.Book.IndexedSource == true ? Visibility.Visible : Visibility.Collapsed;
         RestoreSourceButton.IsEnabled = !busy;
@@ -254,23 +329,78 @@ public partial class SettingsWindow : Window
 
     private void Move(int direction)
     {
-        var rows = DictionaryList.Items.Cast<CatalogRow>().ToArray();
-        int index = DictionaryList.SelectedIndex, next = index + direction;
-        if (busy || index < 0 || next < 0 || next >= rows.Length) return;
+        if (busy || DictionaryList.SelectedItem is not CatalogRow selected) return;
+        // 分组会改变屏幕上的行序；移动仍按查词实际使用的全库优先级计算。
+        var rows = catalogRows.ToArray();
+        int index = selected.Position - 1, next = index + direction;
+        if (next < 0 || next >= rows.Length) return;
         var id = rows[index].Book.Id;
         (rows[index], rows[next]) = (rows[next], rows[index]);
-        UpdateCatalog(store => store.SaveDictionaryOrder(rows.Select(row => row.Book.Id).ToArray()), id, "已保存词典顺序。");
+        _ = UpdateCatalog(store => store.SaveDictionaryOrder(rows.Select(row => row.Book.Id).ToArray()), id, "已保存词典顺序。");
     }
 
     private void ToggleEnabled(object sender, RoutedEventArgs e)
     {
         if (busy || DictionaryList.SelectedItem is not CatalogRow row) return;
         bool enabled = !row.Book.Enabled;
-        UpdateCatalog(store => store.SetDictionaryEnabled(row.Book.Id, enabled), row.Book.Id,
+        _ = UpdateCatalog(store => store.SetDictionaryEnabled(row.Book.Id, enabled), row.Book.Id,
             enabled ? "已启用所选词典。" : "已停用所选词典。");
     }
 
-    private async void UpdateCatalog(Action<DictionaryStore> save, string selectedId, string success)
+    private (bool Volume, string Id, string DefaultName)? editingName;
+
+    private void RenameSelected(object sender, RoutedEventArgs e)
+    {
+        if (DictionaryList.SelectedItem is CatalogVolume { Id: string id } volume)
+            BeginNameEdit(true, id, volume.Name, volume.DefaultName);
+        else if (DictionaryList.SelectedItem is CatalogRow row)
+            BeginNameEdit(false, row.Book.Id, row.Book.DisplayName, row.Book.Filename);
+    }
+
+    private void BeginNameEdit(bool volume, string id, string name, string defaultName)
+    {
+        if (busy || !ready) return;
+        editingName = (volume, id, defaultName);
+        NameLabel.Content = volume ? "卷名（留空恢复默认名称）" : "词典来源名（留空恢复默认名称）";
+        CatalogNameBox.Text = name;
+        CatalogButtons.Visibility = Visibility.Collapsed;
+        NameEditor.Visibility = Visibility.Visible;
+        DictionaryList.IsEnabled = false;
+        CatalogNameBox.Focus();
+        CatalogNameBox.SelectAll();
+    }
+
+    private void EndNameEdit()
+    {
+        editingName = null;
+        NameEditor.Visibility = Visibility.Collapsed;
+        CatalogButtons.Visibility = Visibility.Visible;
+        DictionaryList.IsEnabled = !busy;
+        DictionaryList.Focus();
+    }
+
+    private void CancelName(object sender, RoutedEventArgs e) => EndNameEdit();
+
+    private void NameKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key is not (Key.Enter or Key.Escape)) return;
+        e.Handled = true;
+        if (e.Key == Key.Escape) EndNameEdit();
+        else SaveName(sender, e);
+    }
+
+    private async void SaveName(object sender, RoutedEventArgs e)
+    {
+        if (busy || editingName is not { } target) return;
+        string name = CatalogNameBox.Text.Trim();
+        if (name == target.DefaultName) name = "";
+        string? selectedId = (DictionaryList.SelectedItem as CatalogRow)?.Book.Id;
+        if (await UpdateCatalog(store => store.SetCatalogName(target.Volume, target.Id, name), selectedId,
+            name.Length == 0 ? "已恢复默认名称。" : "已保存显示名称。"))
+            EndNameEdit();
+    }
+
+    private async Task<bool> UpdateCatalog(Action<DictionaryStore> save, string? selectedId, string success)
     {
         catalogWritePending = true;
         Busy(true);
@@ -284,8 +414,9 @@ public partial class SettingsWindow : Window
             });
             onCatalogChanged();
             if (!closed) { BindCatalog(books, selectedId); Message(CatalogStatus, success); }
+            return !closed;
         }
-        catch (Exception ex) { if (!closed) Message(CatalogStatus, $"未能更新词库。{ex.Message}", true); }
+        catch (Exception ex) { if (!closed) Message(CatalogStatus, $"未能更新词库。{ex.Message}", true); return false; }
         finally { catalogWritePending = false; Busy(false); }
     }
 
@@ -462,7 +593,7 @@ public partial class SettingsWindow : Window
                     store.ImportMergedWithProgress(Path.GetDirectoryName(path)!, report, operation.Token);
                 });
                 if (closed) return;
-                // 开发构建可由 dotnet E_Search.dll 承载，发布构建则直接由 apphost 启动。
+                // 开发构建可由 dotnet SearchBar_Edwin.dll 承载，发布构建则直接由 apphost 启动。
                 var launch = new System.Diagnostics.ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false };
                 if (Path.GetFileNameWithoutExtension(launch.FileName).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
                     launch.ArgumentList.Add(typeof(SettingsWindow).Assembly.Location);

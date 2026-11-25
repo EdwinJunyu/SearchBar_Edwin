@@ -183,7 +183,7 @@ public partial class SearchWindow : Window
         });
         tray = new Forms.NotifyIcon
         {
-            Text = "E_Search · 词典搜索", Icon = System.Drawing.SystemIcons.Application,
+            Text = "SearchBar_Edwin · 词典搜索", Icon = System.Drawing.SystemIcons.Application,
             ContextMenuStrip = menu, Visible = true
         };
         tray.MouseClick += (_, e) =>
@@ -1777,7 +1777,7 @@ public partial class SearchWindow : Window
         MarkDetail(request, "assets-ready");
         string path = "/page-" + request;
         // 大页的链接重写和 UTF-8 编码不占用窗口线程，用户仍可阅读、关闭或切换。
-        var document = await Task.Run(() => EncodeMergedDocument(article.Html, path));
+        var document = await Task.Run(() => EncodeMergedDocument(article.Html, path, article.SourceNames));
         var failure = await ready;
         if (request != detailRevision || !DetailsPanel.IsVisible) return;
         if (failure != null) throw new InvalidOperationException(failure.Message, failure);
@@ -1890,11 +1890,31 @@ public partial class SearchWindow : Window
         }
     }
 
-    private static byte[] EncodeMergedDocument(string source, string path)
+    [GeneratedRegex("""(?<prefix>(?:<a name="es-(?<source>[a-z-]+)-(?<ordinal>[0-9]+)"></a>)+<div class="es-label"><b>)(?<names>[^<>]*)</b>""")]
+    private static partial Regex MergedSourceLabel();
+
+    private static string DisplayArticleNames(string body, IReadOnlyDictionary<string,string> aliases)
+    {
+        // 共享正文的小节可列出多个来源。按同一标题前的锚点配对，仅替换显示文字。
+        return MergedSourceLabel().Replace(body, match => {
+            var sources = match.Groups["source"].Captures;
+            var ordinals = match.Groups["ordinal"].Captures;
+            var names = match.Groups["names"].Value.Split(" · ", StringSplitOptions.None);
+            if (names.Length != sources.Count) return match.Value;
+            for (int i = 0; i < names.Length; i++)
+                if (aliases.TryGetValue(sources[i].Value, out var name))
+                    names[i] = WebUtility.HtmlEncode(name) + " #" + ordinals[i].Value;
+            return match.Groups["prefix"].Value + string.Join(" · ", names) + "</b>";
+        });
+    }
+
+    private static byte[] EncodeMergedDocument(string source, string path, IReadOnlyDictionary<string,string>? aliases)
     {
         string body = RewriteMergedLinks(source, path);
         if (body.Contains("&+{", StringComparison.Ordinal))
             body = SangoMergedHeader().Replace(body, "${section}${line}〔${number}〕");
+        // 原书版式和链接处理完成后再呈现自定义名称，名称不会参与词条解析。
+        if (aliases is { Count: > 0 }) body = DisplayArticleNames(body, aliases);
         // 现代汉英的 CK 模板引用了缺失的样式表。用低优先级样式恢复义项和双语例句的分行。
         string html = """<!doctype html><html lang="zh"><meta charset="utf-8"><base href="https://dictionary.invalid/"><style>body{font:15px/1.55 "Segoe UI","Yu Gothic UI",sans-serif;margin:4px 8px;color:#172c39;overflow-wrap:anywhere}.es-source+.es-source{margin-top:14px}.es-label{font-size:12px;color:#24646b;margin:0 0 5px}:where(.es-hanying .CK) :where(span.JS,span.JX,span.LY,span.LS,span.section_title,span.DX){display:block}</style><body>"""
             + body + "</body></html>";
@@ -2008,7 +2028,7 @@ public partial class SearchWindow : Window
                 }
             html = string.Join(boundary, sections);
         }
-        // 三类跨词条链接共享当前文档的版本前缀，包括按 E_Search 原书索引补充的落点。
+        // 三类跨词条链接共享当前文档的版本前缀，包括按 SearchBar_Edwin 原书索引补充的落点。
         string body = Regex.Replace(html, @"(?i)(\bhref\s*=\s*[""'])entry://(?=es(?:ref|appref|missing)-)",
             "$1" + documentPath + "/lookup/");
         body = Regex.Replace(body, @"(?i)(\bhref\s*=\s*[""'])sound://(?:/)?(?=es/)", "$1" + documentPath + "/sound/");

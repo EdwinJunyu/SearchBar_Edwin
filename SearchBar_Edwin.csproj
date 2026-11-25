@@ -4,8 +4,10 @@
     <TargetFrameworks>net10.0;net10.0-windows</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>0.2.0</Version>
-    <DefaultItemExcludes>$(DefaultItemExcludes);.tools/**;.data/**</DefaultItemExcludes>
+    <Product>SearchBar_Edwin</Product>
+    <Version>0.2.1</Version>
+    <!-- 归档含旧项目与测试构建副本，避免 SDK 自动收集其中的源码和 XAML。 -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);.tools/**;.data/**;归档/**</DefaultItemExcludes>
     <ReverseModelDirectory Condition="'$(ReverseModelDirectory)' == ''">$(E_SEARCH_REVERSE_MODEL)</ReverseModelDirectory>
   </PropertyGroup>
   <!-- 发行时及首次安装时需要相同的 DEFLATE 编码器，才能逐字节还原 MDX。

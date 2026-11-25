@@ -697,7 +697,7 @@ class DeliveryTests(unittest.TestCase):
         root = Path(__file__).resolve().parent
         host = root / ".tools/dotnet/dotnet.exe"
         exported = json.loads(subprocess.check_output([
-            str(host) if host.is_file() else "dotnet", str(root / "bin/Release/net10.0/E_Search.dll"),
+            str(host) if host.is_file() else "dotnet", str(root / "bin/Release/net10.0/SearchBar_Edwin.dll"),
             "export-display-rules"]))["layout"]
         self.assertEqual(exported, merge_render.HISTORICAL_LAYOUT)
         old = 'B<sub><</sub>sup>12'
@@ -714,7 +714,7 @@ class DeliveryTests(unittest.TestCase):
         root = Path(__file__).resolve().parent
         host = root / ".tools/dotnet/dotnet.exe"
         command = [str(host) if host.is_file() else shutil.which("dotnet") or "dotnet",
-                   str(root / "bin/Release/net10.0/E_Search.dll"), "--version"]
+                   str(root / "bin/Release/net10.0/SearchBar_Edwin.dll"), "--version"]
         version = json.loads(subprocess.check_output(command))
         self.assertEqual(version.get("mergeSources"), {
             source: {"filename": SOURCES[source], "volume": volume}
@@ -725,7 +725,7 @@ class DeliveryTests(unittest.TestCase):
 
         root = Path(__file__).resolve().parent
         host = root / ".tools/dotnet/dotnet.exe"
-        app = root / "bin/Release/net10.0/E_Search.dll"
+        app = root / "bin/Release/net10.0/SearchBar_Edwin.dll"
 
         def run(*args, success=True):
             result = subprocess.run([str(host) if host.is_file() else shutil.which("dotnet") or "dotnet",

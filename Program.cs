@@ -15,6 +15,19 @@ if (args is ["--everything-worker", var parent] && int.TryParse(parent, out int 
 // WinExe 默认从托盘浮窗进入；独立的 net10.0 入口继续承载原命令行操作。
 if (args.Length == 0 || args[0] is "gui" or "gui-merged")
 {
+    // 升级目录里供旧快捷方式使用的同版 apphost 将桌面启动交给新文件名。
+    // 命令行仍在原进程执行，以保留标准输出与退出码。
+    if (string.Equals(Path.GetFileName(Environment.ProcessPath), "E_Search.exe", StringComparison.OrdinalIgnoreCase))
+    {
+        string renamed = Path.Combine(AppContext.BaseDirectory, "SearchBar_Edwin.exe");
+        if (File.Exists(renamed))
+        {
+            var launch = new System.Diagnostics.ProcessStartInfo(renamed) { UseShellExecute = false };
+            foreach (string argument in args) launch.ArgumentList.Add(argument);
+            using var successor = System.Diagnostics.Process.Start(launch);
+            return successor == null ? 1 : 0;
+        }
+    }
     int result = 0;
     var ui = new Thread(() =>
     {
@@ -34,7 +47,7 @@ if (args.Length == 0 || args[0] is "gui" or "gui-merged")
         }
         catch (Exception ex)
         {
-            System.Windows.MessageBox.Show(ex.Message, "E_Search 启动失败");
+            System.Windows.MessageBox.Show(ex.Message, "SearchBar_Edwin 启动失败");
             result = 1;
         }
     });
@@ -186,12 +199,10 @@ static string FindDatabase(bool readOnly = false, bool resolveOnly = false, bool
     {
         // 工程内的开发输出沿用项目词库；独立安装的位置与启动时的工作目录无关。
         for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
-            if (File.Exists(Path.Combine(dir.FullName, "E_Search.csproj")))
+            if (File.Exists(Path.Combine(dir.FullName, "SearchBar_Edwin.csproj")))
                 return Path.Combine(dir.FullName, ".data", "dictionaries.db");
     }
-    string profile = Environment.GetEnvironmentVariable("LOCALAPPDATA") ??
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-    string directory = Path.Combine(profile, "E_Search");
+    string directory = DictionaryStore.PersonalDirectory();
     string database = Path.Combine(directory, "dictionaries.db");
     if (resolveOnly || !hasSeed || File.Exists(database)) return database;
     // 只读查询直接读随包索引。只有真正打开压缩卷的正文时才使用个人缓存。
@@ -248,7 +259,7 @@ if (args is ["--version"] or ["version"])
 if (args is [] or ["help"] or ["--help"])
 {
     Console.WriteLine("""
-        发布版使用当前用户的 E_Search 词库；开发版使用项目 .data/dictionaries.db。可用 E_SEARCH_DB 指定。
+        发布版使用当前用户的 SearchBar_Edwin 词库；开发版使用项目 .data/dictionaries.db。可用 E_SEARCH_DB 指定。
         import <辞书根目录>          导入四本基础词典及目录中已有的扩展词典
         import <词典ID> <MDX路径>    单独导入或替换
         import --language <ja|en|zh> <MDX路径>  内联导入自选词典，或在原路径切回内联正文
