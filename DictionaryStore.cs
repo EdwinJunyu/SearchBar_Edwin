@@ -39,7 +39,7 @@ internal sealed record TableMapping(int Headword, int Gloss, int? Reading, bool 
         return true;
     }
 }
-internal sealed class DictionaryStore : IDisposable
+internal sealed partial class DictionaryStore : IDisposable
 {
     internal static string PersonalDirectory()
     {
@@ -1332,18 +1332,10 @@ internal sealed class DictionaryStore : IDisposable
             UNION ALL SELECT dict,ordinal,NULL,1 FROM terms WHERE kind=0 AND {ScopeSql(only,"dict")}
                 AND ((term >= $startSpace AND term < $endSpace) OR (term >= $startTag AND term < $endTag))
             """;
-        var hanyingParser = $"""
-            d.language='zh' AND d.filename LIKE '%.mdx' AND
-            COALESCE({(schema.HasParser ? "m.parser_id" : "NULL")},
-                CASE WHEN d.id='hanying' OR d.filename=$hanyingName THEN 'hanying' END)='hanying'
-            """;
+        var summary = new SummaryPolicy(schema, phrasalSenses);
         // 假名重定向也是读音证据。旧库没有这些读音键时，从词头索引补查两种假名书写。
         // 非假名直接从 terms_lookup 出发，无需为了读音查询词典和正文。
         bool kana = Lookup.IsKana(key);
-        string currentSummary = schema.IsCurrent ? "COALESCE(m.summary_stamp = ($summaryFormat || m.revision),0)" : "0";
-        // 三省堂旧戳既可能保留属性残片，也可能只保留词性或词头。按来源版本刷新实际命中项。
-        string JapanesePrefix(string format) => schema.IsCurrent && (schema.HasMdxRecords || schema.HasMergedRanges)
-            ? $"AND ({schema.RangeColumn("record_start")} IS NULL OR NOT COALESCE(m.summary_stamp=('{format}' || m.revision),0))" : "";
         string physicalKeys = !reading && Lookup.HasLatinJoiner(key)
             ? $"IN (SELECT $key UNION ALL {LegacyLatinTerms("$key")})" : "=$key";
         string readingKeys = reading && kana && Lookup.LegacyReadingPrefixes(key).Length != 0
@@ -1363,34 +1355,20 @@ internal sealed class DictionaryStore : IDisposable
                 JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
                 JOIN terms t INDEXED BY terms_lookup ON t.dict=f.dict AND t.term IN (SELECT e.link UNION ALL {LegacyLatinTerms("e.link")}) AND t.kind=0
             )
-            SELECT e.dict,e.ordinal,d.language,d.priority,e.head,COALESCE(f.aliasReading,e.reading),e.gloss,d.filename,{schema.Revision},
-                CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasParser ? "m.parser_id" : "NULL")},
-                    CASE WHEN e.dict='shogakukan' OR e.evidence='MDX 正文首行假名' THEN 'shogakukan' END)='shogakukan'
-                    AND (({(schema.HasRevision ? "m.revision IS NULL AND" : "")}
-                        (e.reading IS NULL OR replace(replace(e.gloss,'・',''),'－','')=e.reading))
-                        OR substr(e.gloss,-1)='〕' OR e.gloss GLOB '〈*〉' OR e.gloss GLOB '《*》')
-                    {JapanesePrefix(JapaneseSummaryFormat)} THEN substr(e.raw,1,4096) END,
-                CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasParser ? "m.parser_id" : "NULL")},
-                    CASE WHEN d.id='oxford' OR d.filename=$oxfordName THEN 'oxford' END)='oxford'
-                    AND {(phrasalSenses ? "1" : $"NOT ({currentSummary})")} THEN e.raw END,
-                CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasParser ? "m.parser_id" : "NULL")},
-                    CASE WHEN d.id='sanseido' OR d.filename=$sanseidoName THEN 'sanseido' END)='sanseido'
-                    {JapanesePrefix(SanseidoSummaryFormat)} THEN substr(e.raw,1,2048) END
-                ,CASE WHEN {hanyingParser} AND (instr(e.head,' ')>0 OR instr(e.head,'　')>0 OR instr(e.head,char(123))>0)
-                    THEN e.raw END, f.legacyChinese, {currentSummary}, d.sha256, {schema.RecordRange},
-                CASE WHEN d.filename LIKE '%.mdx' THEN {(schema.HasParser ? "m.parser_id" : "NULL")} ELSE '' END,
-                CASE WHEN d.filename LIKE '%.mdx' AND COALESCE({(schema.HasParser ? "m.parser_id" : "NULL")},
-                    CASE WHEN d.id='shinseiki' OR d.filename=$shinseikiName THEN 'shinseiki' END)='shinseiki'
-                    AND {(schema.IsCurrent ? $"NOT COALESCE(m.summary_stamp=('{ShinseikiSummaryFormat}' || m.revision),0)" : "1")}
-                    AND e.gloss GLOB '*[A-Za-z0-9０-９]*'
-                    AND ({schema.RangeColumn("record_start")} IS NOT NULL OR instr(e.raw,'<su')>0)
-                    THEN e.raw END, {schema.SourceName}
+            SELECT e.dict AS DictionaryId,e.ordinal AS EntryId,d.language AS Language,d.priority AS Priority,
+                e.head AS Headword,COALESCE(f.aliasReading,e.reading) AS Reading,e.gloss AS Gloss,
+                d.filename AS Filename,{schema.Revision} AS Revision,
+                {summary.Projection}, f.legacyChinese AS LegacyChinese, {summary.CurrentSummary} AS CurrentSummary,
+                d.sha256 AS SourceHash, {schema.RangeColumn("record_start")} AS RecordStart,
+                {schema.RangeColumn("record_end")} AS RecordEnd, {(schema.HasMergedRanges ? "mp.page" : "NULL")} AS MergedPage,
+                CASE WHEN d.filename LIKE '%.mdx' THEN {(schema.HasParser ? "m.parser_id" : "NULL")} ELSE '' END AS ParserId,
+                {schema.SourceName} AS SourceName
             FROM (SELECT dict,ordinal,aliasReading,0 AS legacyChinese FROM found
                 {(legacyChinese ? legacyCandidates : "")}) f
             -- 先取得少量命中，再按词典和序号读取正文，避免优化器反过来扫描全部 entries。
             CROSS JOIN entries e ON e.dict=f.dict AND e.ordinal=f.ordinal
             JOIN dictionaries d ON d.id=e.dict {schema.Join} {schema.RecordJoin} WHERE e.link IS NULL
-            {(legacyChinese ? $"AND (f.legacyChinese=0 OR ({hanyingParser}))" : "")}
+            {(legacyChinese ? $"AND (f.legacyChinese=0 OR ({summary.HanyingParser}))" : "")}
             {(schema.HasMetadata ? "AND COALESCE(m.enabled,1)<>0" : "")}
             """, snapshot);
         cmd.Parameters.AddWithValue("$key",key);
@@ -1410,25 +1388,26 @@ internal sealed class DictionaryStore : IDisposable
         cmd.Parameters.AddWithValue("$only",(object?)only ?? DBNull.Value);
         if (reading && kana) cmd.Parameters.AddWithValue("$katakana", Lookup.ToKatakana(key));
         using var r = cmd.ExecuteReader();
+        var columns = Enumerable.Range(0, r.FieldCount).ToDictionary(r.GetName, i => i, StringComparer.Ordinal);
         while (r.Read())
         {
             token.ThrowIfCancellationRequested();
             // 旧索引可能把读音存成首义。只检查本次命中且符合旧版回退特征的正文前缀。
-            var entry = new LookupEntry(r.GetString(0), r.GetInt64(1), r.GetString(2), r.GetInt32(3),
-                r.GetString(4), r.IsDBNull(5) ? null : r.GetString(5), r.GetString(6))
+            var entry = new LookupEntry(r.GetString(columns["DictionaryId"]), r.GetInt64(columns["EntryId"]), r.GetString(columns["Language"]), r.GetInt32(columns["Priority"]),
+                r.GetString(columns["Headword"]), r.IsDBNull(columns["Reading"]) ? null : r.GetString(columns["Reading"]), r.GetString(columns["Gloss"]))
                 {
-                    DictionaryName = r.GetString(21), DictionaryRevision = r.GetString(8), HasIndexedMergedPage = !r.IsDBNull(18),
+                    DictionaryName = r.GetString(columns["SourceName"]), DictionaryRevision = r.GetString(columns["Revision"]), HasIndexedMergedPage = !r.IsDBNull(columns["MergedPage"]),
                     // 同一本书在不同目录导入可有独立 GUID；显示跟随已识别的原书版式。
-                    DisplaySourceId = r.IsDBNull(19) ? SourceForFilename(r.GetString(7))?.Id ?? r.GetString(0) : r.GetString(19)
+                    DisplaySourceId = r.IsDBNull(columns["ParserId"]) ? SourceForFilename(r.GetString(columns["Filename"]))?.Id ?? r.GetString(columns["DictionaryId"]) : r.GetString(columns["ParserId"])
                 };
-            bool indexed = !r.IsDBNull(16);
+            bool indexed = !r.IsDBNull(columns["RecordStart"]);
             bool triedBody = false;
             string? managedBody = null;
             string? ExternalBody()
             {
                 if (triedBody) return managedBody;
                 triedBody = true;
-                try { managedBody = ReadSourceBody(r.GetString(15), r.GetInt64(16), r.GetInt64(17), !r.IsDBNull(18), entry.DictionaryId, entry.EntryId); }
+                try { managedBody = ReadSourceBody(r.GetString(columns["SourceHash"]), r.GetInt64(columns["RecordStart"]), r.GetInt64(columns["RecordEnd"]), !r.IsDBNull(columns["MergedPage"]), entry.DictionaryId, entry.EntryId); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or NotSupportedException)
                 {
                     // 单本源文件缺失或损坏时，仍显示已存首义及其他词典命中；详情读取会报告文件错误。
@@ -1436,49 +1415,20 @@ internal sealed class DictionaryStore : IDisposable
                 return managedBody;
             }
 
-            string? MatchedBody(int column, int prefixLength = 0)
+            string? MatchedBody(SummaryBody kind)
             {
+                int column = columns[kind.ToString()];
+                int prefixLength = SummaryPolicy.PrefixLength(kind);
                 if (r.IsDBNull(column)) return null;
                 if (!indexed) return r.GetString(column);
                 var body = ExternalBody();
                 return body == null || prefixLength == 0 ? body : EntryParser.SqliteTextPrefix(body, prefixLength);
             }
 
-            if (phrasalSenses)
-            {
-                // 第 10 列只给已识别的牛津 MDX 原文；继续保留父词条的词典、序号及版本以打开详情。
-                if (entry.Language == "en" && Lookup.Normalize(entry.Headword) == key && MatchedBody(10) is { } phraseBody)
-                    foreach (var phrase in EntryParser.OxfordPhrasalSenses(phraseBody, key))
-                        yield return entry with { Headword = phrase.Headword, Gloss = phrase.Gloss, Anchor = phrase.Anchor };
-                continue;
-            }
-            var gloss = entry.Gloss;
-            var child = MatchedBody(12) is { } childBody ? EntryParser.HanyingReference(entry.Headword, childBody) : null;
-            if (r.GetBoolean(13) && (child == null || Lookup.Normalize(child.Value.Headword) != key)) continue;
-            if (child is { } subentry)
-            {
-                yield return entry with { Headword = subentry.Headword, Gloss = subentry.Gloss };
-                continue;
-            }
-            if (MatchedBody(9, 4096) is { } japanesePrefix) gloss = EntryParser.RefreshShogakukanGloss(gloss, japanesePrefix);
-            if (MatchedBody(11, 2048) is { } sanseidoPrefix) gloss = EntryParser.RefreshSanseidoGloss(gloss, sanseidoPrefix);
-            // 旧新世纪索引只为本次命中的可疑摘要取正文。原模板和原摘要同时验证成功才恢复上下标。
-            if (MatchedBody(20) is { } shinBody) gloss = EntryParser.RefreshShinseikiScriptGloss(entry.Headword, gloss, shinBody);
-            // 无版本或旧格式索引需要重算。新索引的普通释义直接来自 gloss 列。
-            (string Headword, string? Form)? reference = null;
-            if (MatchedBody(10) is { } body)
-            {
-                gloss = EntryParser.OxfordGloss(body);
-                if (Lookup.Normalize(gloss) == Lookup.Normalize(r.GetString(4)))
-                    reference = EntryParser.OxfordReferenceHeadword(body);
-            }
-            else if (r.GetBoolean(14) && Lookup.Normalize(gloss) == Lookup.Normalize(entry.Headword))
-            {
-                // 参见词条可能只存有词头。仅在这种情况下按主键读取正文中的目标和词形。
-                var original = indexed ? ExternalBody() : FindBody(entry.DictionaryId, entry.EntryId, null, snapshot, schema)?.Raw;
-                if (original != null) reference = EntryParser.OxfordReferenceHeadword(original);
-            }
-            yield return entry with { Gloss = gloss, Reference = reference };
+            foreach (var hit in summary.Apply(entry, key, r.GetBoolean(columns["LegacyChinese"]),
+                r.GetBoolean(columns["CurrentSummary"]), MatchedBody,
+                () => indexed ? ExternalBody() : FindBody(entry.DictionaryId, entry.EntryId, null, snapshot, schema)?.Raw))
+                yield return hit;
         }
         token.ThrowIfCancellationRequested();
     }

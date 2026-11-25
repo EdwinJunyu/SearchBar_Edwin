@@ -1,13 +1,11 @@
+using static ESearch.Calculator;
+using static ESearch.EntryDetailFormatter;
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
-using System.Net;
-using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -19,7 +17,6 @@ using System.Windows.Interop;
 using System.Windows.Threading;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
-using Microsoft.Data.Sqlite;
 using Forms = System.Windows.Forms;
 
 namespace ESearch;
@@ -969,155 +966,20 @@ public partial class SearchWindow : Window
         return true;
     }
 
-    internal static bool TryCalculate(string input, out string result)
-    {
-        result = "";
-        if (input.AsSpan().IndexOfAny("+-*/×÷()^") < 0) return false;
-        input = input.Trim();
-        // 普通四则保留 decimal 精度。含幂、科学函数、常量或科学计数法时使用 double。
-        bool scientific = input.Any(c => c == '^' || char.IsAsciiLetter(c) || c is 'π' or 'Π');
-        return scientific
-            ? TryEvaluate<double>(input, "G15", out result)
-            : TryEvaluate<decimal>(input, "0.############################", out result);
-    }
+    private bool IsCurrent(SearchRequestContext context) => context.IsCurrent(revision, IsVisible);
 
-    private static bool TryEvaluate<T>(string input, string format, out string result) where T : struct, INumber<T>
-    {
-        result = "";
-        int position = 0;
-        char Peek()
-        {
-            while (position < input.Length && char.IsWhiteSpace(input[position])) position++;
-            return position < input.Length ? input[position] : '\0';
-        }
+    private bool IsCatalogCurrent(SearchRequestContext context) =>
+        context.IsCatalogCurrent(revision, catalogRevision, IsVisible);
 
-        // 逐步拒绝非有限中间值，避免后续运算将无效结果变回普通数字。
-        static T? Finite(T? value) => value.HasValue && T.IsFinite(value.Value) ? value : null;
-
-        // 每层先读乘除项，再从左至右合并加减，保证同级运算的结合顺序。
-        T? ReadSum(int depth)
-        {
-            T? value = ReadProduct(depth);
-            while (value.HasValue && Peek() is ('+' or '-'))
-            {
-                char op = input[position++];
-                T? right = ReadProduct(depth);
-                value = Finite(op == '+' ? value + right : value - right);
-            }
-            return value;
-        }
-
-        T? ReadProduct(int depth)
-        {
-            T? value = ReadOperand(depth);
-            while (value.HasValue && Peek() is ('*' or '/' or '×' or '÷'))
-            {
-                char op = input[position++];
-                T? right = ReadOperand(depth);
-                value = Finite(op is '*' or '×' ? value * right : value / right);
-            }
-            return value;
-        }
-
-        T? ReadOperand(int depth)
-        {
-            // 括号、函数嵌套和右结合的幂链共用深度上限，保护 UI 线程栈。
-            if (depth > 64) return null;
-            bool negative = false;
-            while (Peek() is '+' or '-')
-                if (input[position++] == '-') negative = !negative;
-
-            T? value = ReadAtom(depth);
-            // 先算幂再应用前缀符号。指数递归读取，允许 2^-3 和 2^3^2。
-            if (value.HasValue && Peek() == '^')
-            {
-                position++;
-                T? exponent = ReadOperand(depth + 1);
-                if (!exponent.HasValue) return null;
-                value = Finite(T.CreateChecked(Math.Pow(double.CreateChecked(value.Value), double.CreateChecked(exponent.Value))));
-            }
-            return negative ? -value : value;
-        }
-
-        T? ReadAtom(int depth)
-        {
-            char first = Peek();
-            if (first == '(') return ReadGroup(depth);
-            if (char.IsAsciiLetter(first) || first is 'π' or 'Π')
-            {
-                int start = position++;
-                while (position < input.Length && char.IsAsciiLetterOrDigit(input[position])) position++;
-                string name = input[start..position].ToLowerInvariant();
-                if (name is "pi" or "π") return T.CreateChecked(Math.PI);
-                if (name == "e") return T.CreateChecked(Math.E);
-                if (Peek() != '(') return null;
-                T? argument = ReadGroup(depth);
-                if (!argument.HasValue) return null;
-                double x = double.CreateChecked(argument.Value);
-                // 角度先归约再计算，整象限能得到精确的零；正切在奇数个直角处无定义。
-                double angle = (x % 360) / 180;
-                double answer = name switch
-                {
-                    "sin" => double.SinPi(angle),
-                    "cos" => double.CosPi(angle),
-                    "tan" when Math.Abs(x % 180) != 90 => double.TanPi(angle),
-                    "sqrt" => Math.Sqrt(x),
-                    "abs" => Math.Abs(x),
-                    "log" or "log10" => Math.Log10(x),
-                    "ln" => Math.Log(x),
-                    "exp" => Math.Exp(x),
-                    _ => double.NaN
-                };
-                return Finite(T.CreateChecked(answer));
-            }
-
-            int numberStart = position;
-            while (position < input.Length && char.IsAsciiDigit(input[position])) position++;
-            if (position < input.Length && input[position] == '.')
-            {
-                position++;
-                while (position < input.Length && char.IsAsciiDigit(input[position])) position++;
-            }
-            if (position < input.Length && input[position] is 'e' or 'E')
-            {
-                position++;
-                if (position < input.Length && input[position] is '+' or '-') position++;
-                while (position < input.Length && char.IsAsciiDigit(input[position])) position++;
-            }
-            // 单独的数值（含 1e-3）仍可作为文件名或词条搜索。
-            if (numberStart == 0 && position == input.Length) return null;
-            var token = input.AsSpan(numberStart, position - numberStart);
-            return T.TryParse(token, NumberStyles.AllowDecimalPoint | NumberStyles.AllowExponent,
-                CultureInfo.InvariantCulture, out T number) ? Finite(number) : null;
-        }
-
-        T? ReadGroup(int depth)
-        {
-            position++; // 调用者已确认左括号。
-            T? value = ReadSum(depth + 1);
-            if (Peek() != ')') return null;
-            position++;
-            return value;
-        }
-
-        try
-        {
-            T? value = ReadSum(0);
-            if (!value.HasValue || Peek() != '\0' || position != input.Length) return false;
-            result = T.IsZero(value.Value) ? "0" : value.Value.ToString(format, CultureInfo.InvariantCulture);
-            return true;
-        }
-        catch (ArithmeticException) // 十进制除零或溢出时，沿用普通搜索。
-        {
-            return false;
-        }
-    }
+    private bool CanPublishSuggestions(SearchRequestContext context) =>
+        context.CanPublishSuggestions(revision, catalogRevision, IsVisible, composing);
 
     private async Task SearchCatalogAsync(string text, long request, CancellationToken token)
     {
         catalogPending?.Cancel();
         using var cancel = CancellationTokenSource.CreateLinkedTokenSource(token);
         catalogPending = cancel;
+        var context = new SearchRequestContext(request, catalogRevision, cancel.Token);
         try
         {
             if (TryReverseInput(text, out string description, out _))
@@ -1125,16 +987,15 @@ public partial class SearchWindow : Window
                 if (description.Length > 0)
                 {
                     SetStatus("正在查找词典释义…");
-                    await SearchDictionaryAsync(text, request, cancel.Token);
+                    await SearchDictionaryAsync(text, context);
                 }
             }
             else
             {
                 // 先提交本轮首义或拼写，把已排队的布局和绘制交还给 WPF，再查询和创建联想按钮。
-                long catalog = catalogRevision;
                 string? only = dictionaryId;
-                await SearchDictionaryAsync(text, request, cancel.Token);
-                if (cancel.IsCancellationRequested || request != revision || catalog != catalogRevision) return;
+                await SearchDictionaryAsync(text, context);
+                if (!IsCatalogCurrent(context)) return;
                 if (DetailsButton.IsVisible || SpellingChoices.HasItems)
                 {
                     // 输入已有可选结果时复用输入防抖间隔，连续键入不会反复创建、清空两排联想控件。
@@ -1142,20 +1003,19 @@ public partial class SearchWindow : Window
                     catch (OperationCanceledException) when (cancel.IsCancellationRequested) { return; }
                 }
                 await System.Windows.Threading.Dispatcher.Yield(DispatcherPriority.Background);
-                if (cancel.IsCancellationRequested || request != revision || catalog != catalogRevision || !IsVisible) return;
-                await SearchPrefixesAsync(text, only, request, catalog, cancel.Token);
-                if (cancel.IsCancellationRequested || request != revision || catalog != catalogRevision || !IsVisible
-                    || composing || SpellingChoices.HasItems || PrefixChoices.HasItems || !LooksLikeChineseDescription(text)) return;
+                if (!IsCatalogCurrent(context)) return;
+                await SearchPrefixesAsync(text, only, context);
+                if (!CanPublishSuggestions(context) || SpellingChoices.HasItems || PrefixChoices.HasItems || !LooksLikeChineseDescription(text)) return;
                 // 直接词义优先。混有外语片段的描述可同时显示句中词和释义候选，正文选择由用户决定。
                 if (CandidatePicker.SelectedItem is Candidate hit
                     && (hit.Hit.Method != "phrase" || hit.Hit.Term.Length >= text.Trim().Length)) return;
                 await Task.Delay(400, cancel.Token);
-                if (!cancel.IsCancellationRequested && request == revision && catalog == catalogRevision && IsVisible && !composing)
+                if (CanPublishSuggestions(context))
                 {
                     AutomaticReverseLabel.Text = "正在按意思联想…";
                     AutomaticReverseLabel.Visibility = Visibility.Visible;
-                    await SearchDictionaryAsync(ReversePrefix + " " + text, request, cancel.Token);
-                    if (ReferenceEquals(catalogPending, cancel) && request == revision && catalog == catalogRevision && !ReverseChoices.HasItems)
+                    await SearchDictionaryAsync(ReversePrefix + " " + text, context);
+                    if (ReferenceEquals(catalogPending, cancel) && IsCatalogCurrent(context) && !ReverseChoices.HasItems)
                         AutomaticReverseLabel.Visibility = Visibility.Collapsed;
                 }
             }
@@ -1189,8 +1049,9 @@ public partial class SearchWindow : Window
         return Regex.IsMatch(text[..linker], @"[用能靠把被从從给給让讓放戴穿藏裝装]|[显顯]示|表[示明]|[测測]量|[记記][录錄]|[保維维][护護持存]|提供|[帮幫]助|代替|[发發]出|[传傳][递遞]|提醒|控制|判[断斷]");
     }
 
-    private async Task SearchPrefixesAsync(string text, string? only, long request, long catalog, CancellationToken token)
+    private async Task SearchPrefixesAsync(string text, string? only, SearchRequestContext context)
     {
+        var token = context.Token;
         try
         {
             var choices = await Task.Run(() =>
@@ -1198,7 +1059,7 @@ public partial class SearchWindow : Window
                 using var store = new DictionaryStore(databasePath, readOnly: true);
                 return store.PrefixChoices(text, only, token);
             }, token);
-            if (request == revision && catalog == catalogRevision && IsVisible && !composing)
+            if (CanPublishSuggestions(context))
             {
                 string typed = Lookup.Normalize(text);
                 PrefixChoices.ItemsSource = choices.Where(choice => Lookup.Normalize(choice.Key) != typed).ToArray();
@@ -1209,9 +1070,9 @@ public partial class SearchWindow : Window
         catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException) { }
     }
 
-    private async Task SearchDictionaryAsync(string text, long request, CancellationToken token)
+    private async Task SearchDictionaryAsync(string text, SearchRequestContext context)
     {
-        long catalog = catalogRevision;
+        var token = context.Token;
         string? only = dictionaryId;
         bool reverse = TryReverseInput(text, out string description, out string? targetLanguage);
         bool automatic = reverse && !IsReverseInput(QueryBox.Text);
@@ -1239,7 +1100,7 @@ public partial class SearchWindow : Window
                                 // 本机推理环境初始化可能持续数秒。先在当前请求发布可操作的状态，再进入原生调用。
                                 Dispatcher.Invoke(() =>
                                 {
-                                    if (token.IsCancellationRequested || request != revision || catalog != catalogRevision || !IsVisible
+                                    if (!IsCatalogCurrent(context)
                                         || only != dictionaryId || folder != CurrentModelDirectory || !useReverseModel || preparingReverse != null) return;
                                     reverseModelReady = true;
                                     UpdateReverseModelButton();
@@ -1267,7 +1128,7 @@ public partial class SearchWindow : Window
                 }
                 return store.ReverseByLanguage(description, only, targetLanguage, token);
             }, token);
-            if (token.IsCancellationRequested || request != revision || catalog != catalogRevision || !IsVisible) return;
+            if (!IsCatalogCurrent(context)) return;
             if (automatic)
             {
                 // 另行展示真实义项。文件选择、输入框和普通查出的句中词均不被后台反查覆盖。
@@ -1324,7 +1185,7 @@ public partial class SearchWindow : Window
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException)
         {
-            if (!automatic && IsVisible && request == revision && catalog == catalogRevision) SetStatus("词库读取失败：" + ex.Message);
+            if (!automatic && IsCatalogCurrent(context)) SetStatus("词库读取失败：" + ex.Message);
         }
     }
 
@@ -1398,13 +1259,14 @@ public partial class SearchWindow : Window
         FilePanel.Visibility = Visibility.Visible;
         SetFileStatus("正在搜索文件和文件夹…");
         bool finished = false;
+        var context = new SearchRequestContext(request, catalogRevision, token);
         try
         {
             var files = await everything.SearchAsync(GetFileQuery(text), message => Dispatcher.BeginInvoke(new Action(() =>
             {
-                if (!finished && !token.IsCancellationRequested && request == revision && IsVisible) SetFileStatus(message);
+                if (!finished && IsCurrent(context)) SetFileStatus(message);
             })), token);
-            if (token.IsCancellationRequested || request != revision || !IsVisible) return;
+            if (!IsCurrent(context)) return;
             fileRevision = request;
             // 补全取自当前 SDK 页；历史排序和同名目录缩写只用于呈现这一页。
             UpdateFileCompletions(text, files);
@@ -1416,7 +1278,7 @@ public partial class SearchWindow : Window
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception or InvalidOperationException)
         {
-            if (token.IsCancellationRequested || request != revision || !IsVisible) return;
+            if (!IsCurrent(context)) return;
             SetFileStatus(ex.Message);
             if (ex is FileNotFoundException) InstallEverythingButton.Visibility = Visibility.Visible;
         }
@@ -1556,7 +1418,7 @@ public partial class SearchWindow : Window
             // 重新排序当前查询并保留详情选择；用户已切换查询时不触碰新的候选。
             var selected = CandidatePicker.SelectedItem as Candidate;
             long refreshed = ++catalogRevision;
-            await SearchDictionaryAsync(QueryBox.Text, request, CancellationToken.None);
+            await SearchDictionaryAsync(QueryBox.Text, new SearchRequestContext(request, catalogRevision, CancellationToken.None));
             if (request == revision && refreshed == catalogRevision && selected != null && DetailsPanel.IsVisible)
             {
                 var same = CandidatePicker.Items.OfType<Candidate>().FirstOrDefault(item =>
@@ -1574,8 +1436,6 @@ public partial class SearchWindow : Window
         }
         finally { ReadingPreferencePanel.IsEnabled = true; }
     }
-
-    private sealed record DetailBody(string Text, EntryAnchor? Anchor);
 
     private const string DictionaryOrigin = "https://dictionary.invalid";
 
@@ -1890,305 +1750,6 @@ public partial class SearchWindow : Window
         }
     }
 
-    [GeneratedRegex("""(?<prefix>(?:<a name="es-(?<source>[a-z-]+)-(?<ordinal>[0-9]+)"></a>)+<div class="es-label"><b>)(?<names>[^<>]*)</b>""")]
-    private static partial Regex MergedSourceLabel();
-
-    private static string DisplayArticleNames(string body, IReadOnlyDictionary<string,string> aliases)
-    {
-        // 共享正文的小节可列出多个来源。按同一标题前的锚点配对，仅替换显示文字。
-        return MergedSourceLabel().Replace(body, match => {
-            var sources = match.Groups["source"].Captures;
-            var ordinals = match.Groups["ordinal"].Captures;
-            var names = match.Groups["names"].Value.Split(" · ", StringSplitOptions.None);
-            if (names.Length != sources.Count) return match.Value;
-            for (int i = 0; i < names.Length; i++)
-                if (aliases.TryGetValue(sources[i].Value, out var name))
-                    names[i] = WebUtility.HtmlEncode(name) + " #" + ordinals[i].Value;
-            return match.Groups["prefix"].Value + string.Join(" · ", names) + "</b>";
-        });
-    }
-
-    private static byte[] EncodeMergedDocument(string source, string path, IReadOnlyDictionary<string,string>? aliases)
-    {
-        string body = RewriteMergedLinks(source, path);
-        if (body.Contains("&+{", StringComparison.Ordinal))
-            body = SangoMergedHeader().Replace(body, "${section}${line}〔${number}〕");
-        // 原书版式和链接处理完成后再呈现自定义名称，名称不会参与词条解析。
-        if (aliases is { Count: > 0 }) body = DisplayArticleNames(body, aliases);
-        // 现代汉英的 CK 模板引用了缺失的样式表。用低优先级样式恢复义项和双语例句的分行。
-        string html = """<!doctype html><html lang="zh"><meta charset="utf-8"><base href="https://dictionary.invalid/"><style>body{font:15px/1.55 "Segoe UI","Yu Gothic UI",sans-serif;margin:4px 8px;color:#172c39;overflow-wrap:anywhere}.es-source+.es-source{margin-top:14px}.es-label{font-size:12px;color:#24646b;margin:0 0 5px}:where(.es-hanying .CK) :where(span.JS,span.JX,span.LY,span.LS,span.section_title,span.DX){display:block}</style><body>"""
-            + body + "</body></html>";
-        // 相对资源从站点根目录加载；页内跳转须保留当前文章的路径。
-        if (body.Contains("href=\"#", StringComparison.OrdinalIgnoreCase) || body.Contains("href='#", StringComparison.OrdinalIgnoreCase))
-            html = html.Replace("<base href=\"https://dictionary.invalid/\">", "", StringComparison.Ordinal);
-        return Encoding.UTF8.GetBytes(html);
-    }
-
-    // 三合一的同形条目在首行词头后编码序号。只认物理条目起点或同一编号的合并来源标题。
-    private const string SangoHeaderPattern = @"(?<line><br><font color=black>[^<>\r\n]+?)&\+\{(?<number>[1-9][0-9]?)\}(?=\r?\n<br><font color=)";
-    [GeneratedRegex(@"\A" + SangoHeaderPattern)]
-    private static partial Regex SangoHeader();
-    [GeneratedRegex("""(?<section><div class="es-source es-sango"><a name="es-sango-(?<ordinal>[0-9]+)"></a><div class="es-label"><b>三合一日语辞典 #\k<ordinal></b></div>)""" + SangoHeaderPattern)]
-    private static partial Regex SangoMergedHeader();
-
-    [GeneratedRegex("""<span class="(?:JS|JX|LY|LS|section_title|DX)">""")]
-    private static partial Regex HanyingBlockStart();
-
-    [GeneratedRegex("""<span class="example-source">(?:[^<>]|<(?!/?span\b)[^<>]*>)*</span>(?=<span>)""")]
-    private static partial Regex ShinseikiExampleSource();
-
-    private const string ShogakukanEmptyExample = "<p><font color=green>例：</font></>";
-    [GeneratedRegex(ShogakukanEmptyExample + """(?=\r?\n(?<second>[^<>\s]+)  \r?\n<br>(?<reading>[^<>\s]+)<font color=red>【\k<second>】</font>)""")]
-    private static partial Regex ShogakukanJoinedHeading();
-
-    private static string SeparateShogakukanArticles(string html, string? original = null, int offset = 0)
-    {
-        if (!html.Contains(ShogakukanEmptyExample, StringComparison.Ordinal)) return html;
-        original ??= html;
-        var visible = EntryParser.VisibleMarkupPositions(original);
-        int PreviousVisible(string prefix, int before)
-        {
-            while (before > 0)
-            {
-                int pos = original.AsSpan(0, before).LastIndexOf(prefix, StringComparison.Ordinal);
-                if (pos < 0 || visible[pos]) return pos;
-                before = pos;
-            }
-            return -1;
-        }
-        // 以真正相邻的可见红色词头为准；同形的隐藏例句、属性或注释不能开启或切断词条。
-        return ShogakukanJoinedHeading().Replace(html, match =>
-        {
-            int pos = offset + match.Index;
-            if (!visible[pos] || !EntryParser.ShogakukanJoinedHeads.TryGetValue(match.Groups["second"].Value, out var previous)
-                || match.Groups["reading"].Value != previous.Reading) return match.Value;
-            int heading = PreviousVisible("<font color=red>【", pos);
-            int target = PreviousVisible("<div class=\"es-target\">", pos);
-            // 承修、软炸两页在词头间以这个完整段落标注补充说明。带读音的同名词头仍是篇界。
-            const string supplement = "<p><font color=red>【補足】</font>";
-            while (heading >= 3 && heading >= target && visible[heading - 3] &&
-                   original.AsSpan(heading - 3).StartsWith(supplement, StringComparison.Ordinal))
-                heading = PreviousVisible("<font color=red>【", heading);
-            return heading >= 0 && heading >= target && original.AsSpan(heading).StartsWith(
-                $"<font color=red>【{previous.First}】</font>", StringComparison.Ordinal) ? "<p>" : match.Value;
-        });
-    }
-
-    private static string RewriteMergedLinks(string html, string documentPath)
-    {
-        // 旧合并页已保存实际链接目标；恢复损坏的开标签，使浏览器只创建一个链接。
-        // 只有来源和绿色标签残片都能与可见标签对上，才能确认多出来的文字属于原 href。
-        if (html.Contains("\"#008000\">", StringComparison.Ordinal) || html.Contains("FONT-FAMILY: <FONT", StringComparison.Ordinal)
-            || html.Contains(ShogakukanEmptyExample, StringComparison.Ordinal) || html.Contains(OxfordCollocationTail, StringComparison.Ordinal)
-            || html.Contains(EntryParser.ShinseikiBrokenSub, StringComparison.Ordinal)
-            || html.Contains(EntryParser.ShinseikiAngstromHeading, StringComparison.Ordinal) || html.Contains("⇒?的古名。", StringComparison.Ordinal)
-            || html.Contains("<su", StringComparison.OrdinalIgnoreCase)
-            || html.Contains("\"font-weight:", StringComparison.Ordinal) && html.Contains("entry://esmissing-oxford-", StringComparison.Ordinal))
-        {
-            const string boundary = "<div class=\"es-source ";
-            // 同页原书可能在注释或属性中引用另一来源的包装标签，只有真实可见的开标签才切换来源。
-            var visible = EntryParser.VisibleMarkupPositions(html);
-            var sections = new List<string>();
-            int from = 0;
-            for (int pos = html.IndexOf(boundary, StringComparison.Ordinal); pos >= 0;
-                 pos = html.IndexOf(boundary, pos + boundary.Length, StringComparison.Ordinal))
-            {
-                if (!visible[pos]) continue;
-                sections.Add(html[from..pos]);
-                from = pos + boundary.Length;
-            }
-            sections.Add(html[from..]);
-            for (int i = 1; i < sections.Count; i++)
-                if (sections[i].StartsWith("es-shogakukan-zhja\"><a name=\"es-shogakukan-zhja-", StringComparison.Ordinal))
-                    sections[i] = SeparateShogakukanArticles(sections[i]);
-                else if (sections[i].StartsWith("es-shinseiki\"><a name=\"es-shinseiki-", StringComparison.Ordinal))
-                {
-                    sections[i] = EntryParser.RestoreShinseikiQuestionMarkup(sections[i]);
-                    sections[i] = EntryParser.NormalizeShinseikiFormulas(sections[i]);
-                }
-                else if (sections[i].StartsWith("es-sanseido\">", StringComparison.Ordinal))
-                    sections[i] = SanseidoMergedLink().Replace(sections[i], m =>
-                    {
-                        string label = m.Groups["label"].Value;
-                        string tail = "<font color=\"#008000\">" + m.Groups["tail"].Value;
-                        if (!label.EndsWith(tail, StringComparison.Ordinal)) return m.Value;
-                        return RestoreHashedLink(m, label[..(label.Length - tail.Length)] + "<font color=");
-                    });
-                else if (sections[i].StartsWith("es-oxford\">", StringComparison.Ordinal))
-                {
-                    sections[i] = NormalizeOxfordDisplayMarkup(sections[i]);
-                    sections[i] = OxfordMergedLink().Replace(sections[i], m =>
-                    {
-                        // 合并器已将截断的 href 前缀替换为 SHA-256。可见标签必须同时匹配摘要和属性尾部。
-                        string label = m.Groups["label"].Value;
-                        int quote = label.IndexOf("\"font-weight:", StringComparison.Ordinal);
-                        if (!label.AsSpan(quote + 1).SequenceEqual(m.Groups["tail"].ValueSpan)) return m.Value;
-                        return RestoreHashedLink(m, label[..quote]);
-                    });
-                }
-            html = string.Join(boundary, sections);
-        }
-        // 三类跨词条链接共享当前文档的版本前缀，包括按 SearchBar_Edwin 原书索引补充的落点。
-        string body = Regex.Replace(html, @"(?i)(\bhref\s*=\s*[""'])entry://(?=es(?:ref|appref|missing)-)",
-            "$1" + documentPath + "/lookup/");
-        body = Regex.Replace(body, @"(?i)(\bhref\s*=\s*[""'])sound://(?:/)?(?=es/)", "$1" + documentPath + "/sound/");
-        return Regex.Replace(body, @"(?i)(\bhref\s*=\s*[""'])entry://#", "$1#");
-    }
-
-    private static string RestoreHashedLink(Match link, string originalPrefix)
-    {
-        // 旧卷目标保存的是损坏 href 截断前的 UTF-8 摘要，必须与可见标签重建的前缀一致。
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(originalPrefix));
-        return Convert.ToHexStringLower(hash) == link.Groups["hash"].Value
-            ? link.Groups["link"].Value + ">" + link.Groups["label"].Value + "</a>" : link.Value;
-    }
-
-    [GeneratedRegex("""(?<link><a href="entry://es(?:missing|ref)-sanseido-(?<hash>[a-f0-9]{64})")#008000">(?<tail>[^"<>]*</font>(?:[^"<>]|<font color="#008000">[^"<>]*</font>)*)">(?<label>(?:[^"<>]|<font color="#008000">[^"<>]*</font>)+)</a>""")]
-    private static partial Regex SanseidoMergedLink();
-
-    // 原书只在这两种字体标记上把排版后的可见词头完整复制进 href。
-    private const string OxfordLinkFont = """(?:<FONT style="font-weight:normal">'</FONT>|<font style="font-weight:lighter">∙</font>)""";
-    private const string OxfordLinkRest = """(?:[^"<>\r\n]|""" + OxfordLinkFont + ")*";
-    private const string OxfordLinkLabel = """[^"<>\r\n]+""" + OxfordLinkFont + OxfordLinkRest;
-
-    [GeneratedRegex("""<a href="entry://(?<label>""" + OxfordLinkLabel + """)">\k<label></a>""")]
-    private static partial Regex OxfordCopiedLink();
-
-    private const string OxfordCollocationTail = """(</SPAN>COLLOC)"&gt;</SPAN""";
-
-    private static string NormalizeOxfordDisplayMarkup(string html)
-    {
-        html = EntryParser.NormalizeOxfordFormulas(html);
-        // 原书四处商标把左尖括号写成了左括号；pint 的分数误把 sup 闭合为 up。
-        html = EntryParser.RepairOxfordPrintedSigns(html);
-        // 六个词条的末尾都在译文闭标签后留下同一残片。保留 (COLLOC) 与原标签，只拿掉多余的引号和尖括号。
-        return html.Contains(OxfordCollocationTail, StringComparison.Ordinal)
-            ? OxfordCollocationAttributeEnd().Replace(html, "${mark}") : html;
-    }
-
-    [GeneratedRegex("""(?<mark></font>(?:</SPAN>)?\(</SPAN>COLLOC\))"&gt;(?=</SPAN(?: |>))""")]
-    private static partial Regex OxfordCollocationAttributeEnd();
-
-    [GeneratedRegex("""(?<link><a href="entry://esmissing-oxford-(?<hash>[a-f0-9]{64})")(?<tail>(?:font-weight:normal">'</FONT>|font-weight:lighter">∙</font>)""" + OxfordLinkRest + """)">(?<label>""" + OxfordLinkLabel + """)</a>""")]
-    private static partial Regex OxfordMergedLink();
-
-    private const string SelectedPhraseId = "es-selected-phrase";
-
-    private static MergedArticle? HighlightMergedPhrase(MergedArticle article, LookupEntry hit, string raw)
-    {
-        // 合并器会改写原书链接和标签位置。先按来源与物理序号限定小节，再按同标题义项的原书顺序映射。
-        const string sectionTag = "<div class=\"es-source es-";
-        string sectionStart = $"{sectionTag}{hit.DictionaryId}\"><a name=\"es-{hit.DictionaryId}-{hit.EntryId}\"></a>";
-        string html = article.Html;
-        int section = html.IndexOf(sectionStart, StringComparison.Ordinal);
-        int separator = hit.Headword.IndexOf(' ');
-        if (section < 0 || separator < 1 || html.Contains(SelectedPhraseId, StringComparison.Ordinal)) return null;
-        int start = section + sectionStart.Length;
-        int end = html.IndexOf(sectionTag, start, StringComparison.Ordinal);
-        var parent = hit.Headword[..separator];
-        var from = EntryParser.OxfordPhrasalSenses(raw, parent).Where(p => p.Headword == hit.Headword).ToArray();
-        string sectionBody = html[start..(end < 0 ? html.Length : end)];
-        var to = EntryParser.OxfordPhrasalSenses(sectionBody, parent)
-            .Where(p => p.Headword == hit.Headword).ToArray();
-        int index = Array.FindIndex(from, p => p.Anchor == hit.Anchor);
-        if (index < 0 || !from.Select(p => (EntryParser.OxfordPrintedPhraseTitle(raw[p.Anchor.Title]), p.Gloss))
-                .SequenceEqual(to.Select(p => (EntryParser.OxfordPrintedPhraseTitle(sectionBody[p.Anchor.Title]), p.Gloss)))) return null;
-        var anchor = to[index].Anchor;
-        int title = start + anchor.Title.Start.Value, titleEnd = start + anchor.Title.End.Value;
-        int sense = start + anchor.Sense.Start.Value, senseEnd = start + anchor.Sense.End.Value;
-        var marked = new StringBuilder(html.Length + 80)
-            .Append(html, 0, title).Append("<mark id=\"").Append(SelectedPhraseId).Append("\">")
-            .Append(html, title, titleEnd - title).Append("</mark>").Append(html, titleEnd, sense - titleEnd)
-            .Append("<mark data-es-sense>").Append(html, sense, senseEnd - sense).Append("</mark>")
-            .Append(html, senseEnd, html.Length - senseEnd);
-        return article with { Html = marked.ToString() };
-    }
-
-    // 新世纪某些物理正文在标签中间截断，随后直接拼入包裹层的闭标签。先处理原始标记，
-    // 否则换行和普通去标签会打断这个边界，也无法区分真正的标记与释义中转义过的示例。
-    private const string ShinseikiTornImage = """<img alt="(?:" (?:s|src="data:(?:ima|image/png;base64,[A-Za-z0-9+/=]*(?:"/)?)))?""";
-    private const string ShinseikiTornStructure = """<(?:div|p|span|strong|ul) (?:cl|cla|clas|class(?:="[a-z-]+)?)|<spa|</(?:s|spa|span)?|<!--(?: -)?""";
-
-    [GeneratedRegex("""(?:(?<image>""" + ShinseikiTornImage + """)|""" + ShinseikiTornStructure + """)(?=</(?:div|span|p|li|strong)>)""")]
-    private static partial Regex ShinseikiTruncatedToken();
-
-    private static DetailBody FormatDetail(string raw, EntryAnchor? anchor, string sourceId)
-    {
-        if (sourceId == "shinseiki") raw = EntryParser.RestoreShinseikiQuestionMarkup(raw);
-        bool hanyingCk = sourceId == "hanying" && raw.Contains("<span class=\"CK\">", StringComparison.Ordinal);
-        // 坐标分界均在完整标签之间，先分段解码再映射。实体、嵌套标签和重复文字都不靠文本搜索定位。
-        string Decode(string html, int rawOffset = 0)
-        {
-            if (hanyingCk) html = HanyingBlockStart().Replace(html, "\n");
-            if (sourceId == "sango" && html.Contains("&+{", StringComparison.Ordinal))
-                html = SangoHeader().Replace(html, "${line}〔${number}〕");
-            if (sourceId == "sanseido") html = EntryParser.SanseidoLinkText(EntryParser.DecodePrintedScripts(html, sourceId));
-            if (sourceId == "shogakukan-zhja" && html.Contains(ShogakukanEmptyExample, StringComparison.Ordinal))
-                html = SeparateShogakukanArticles(html, raw, rawOffset);
-            // 新世纪以空 HTML 注释隔开标题等字段。先去掉模板标记，实体转义的字面示例仍会保留。
-            if (sourceId == "shinseiki")
-            {
-                html = EntryParser.DecodePrintedScripts(EntryParser.NormalizeShinseikiFormulas(html, raw, rawOffset), sourceId);
-                html = ShinseikiTruncatedToken().Replace(html, match =>
-                    match.Groups["image"].Success ? "[原书图片标签截断]" : "");
-                html = html.Replace("<!-- -->", "", StringComparison.Ordinal);
-                // 原书用图片分隔日中释义。例句各有独立标记，纯文本也要保留两种语言的边界。
-                html = html.Replace("<span class=\"divide-imgs\"><img", "\n<img", StringComparison.Ordinal)
-                    .Replace("<div class=\"unit-example\">", "\n", StringComparison.Ordinal);
-                if (html.Contains("class=\"example-source\"", StringComparison.Ordinal))
-                    html = ShinseikiExampleSource().Replace(html, "$0\n");
-                html = Regex.Replace(html, @"</h[1-6]\s*>", "\n", RegexOptions.IgnoreCase);
-            }
-            if (sourceId == "oxford")
-            {
-                html = EntryParser.DecodePrintedScripts(NormalizeOxfordDisplayMarkup(html), sourceId);
-                if (html.Contains("<a href=\"entry://", StringComparison.Ordinal))
-                    html = OxfordCopiedLink().Replace(html, "${label}");
-                html = EntryParser.DecodeOxfordFont(html);
-                // 牛津以蓝色横线分开词头、读音栏和分节；去掉标签前先保留行界。
-                html = html.Replace("<hr color=blue noshade>", "\n", StringComparison.Ordinal);
-            }
-            var lines = Regex.Replace(html, @"<(?:br\b[^>]*|/p\s*|/div\s*|/li\s*|/tr\s*)>", "\n", RegexOptions.IgnoreCase);
-            return EntryParser.DisplayText(sourceId, WebUtility.HtmlDecode(Regex.Replace(lines, @"</?[a-zA-Z][^>]*>", "")));
-        }
-        if (anchor == null)
-        {
-            var lines = Decode(raw).Split(['\r','\n'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-            return new(string.Join(Environment.NewLine, lines), null);
-        }
-
-        var rawOffsets = new[] { anchor.Title.Start.Value, anchor.Title.End.Value, anchor.Sense.Start.Value, anchor.Sense.End.Value };
-        var offsets = new int[4];
-        var decoded = new StringBuilder();
-        int previous = 0;
-        for (int i = 0; i < offsets.Length; i++)
-        {
-            decoded.Append(Decode(raw[previous..rawOffsets[i]], previous));
-            offsets[i] = decoded.Length;
-            previous = rawOffsets[i];
-        }
-        decoded.Append(Decode(raw[previous..], previous));
-
-        // 与普通正文同样逐行裁切并省略空行，同时将四个解码后的边界换算为最终文本的位置。
-        var text = new StringBuilder();
-        int mapped = 0;
-        foreach (Match line in Regex.Matches(decoded.ToString(), @"[^\r\n]+"))
-        {
-            var trimmed = line.ValueSpan.Trim();
-            if (trimmed.IsEmpty) continue;
-            int start = line.Index + line.Length - line.ValueSpan.TrimStart().Length;
-            if (text.Length > 0) text.AppendLine();
-            while (mapped < offsets.Length && offsets[mapped] <= line.Index + line.Length)
-            {
-                offsets[mapped] = text.Length + Math.Clamp(offsets[mapped] - start, 0, trimmed.Length);
-                mapped++;
-            }
-            text.Append(trimmed);
-        }
-        while (mapped < offsets.Length) offsets[mapped++] = text.Length;
-        return new(text.ToString(), new EntryAnchor(offsets[0]..offsets[1], offsets[2]..offsets[3]));
-    }
-
     private void DisplayDetail(DetailBody body)
     {
         DetailScroll.ScrollToTop();
@@ -2379,500 +1940,4 @@ public partial class SearchWindow : Window
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(nint hwnd);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(nint hwnd, out uint pid);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(nint hwnd, StringBuilder name, int capacity);
-}
-
-internal sealed record FileHit(string Name, string Parent, string FullPath)
-{
-    public bool IsFolder { get; init; }
-    [System.Text.Json.Serialization.JsonIgnore]
-    public string DisplayParent => distinguishingParent ?? Parent;
-    [System.Text.Json.Serialization.JsonIgnore]
-    public bool WrapDisplayParent => distinguishingParent is not null;
-    private string? distinguishingParent;
-
-    // 只比较当前结果页的同名项。完整路径仍是打开、预览和定位所用的原始标识。
-    internal static IReadOnlyList<FileHit> WithDisplayPaths(IReadOnlyList<FileHit> files)
-    {
-        var result = files.ToArray();
-        var comparer = StringComparer.OrdinalIgnoreCase;
-        foreach (var group in Enumerable.Range(0, files.Count).GroupBy(i => files[i].Name, comparer))
-        {
-            var parents = group.GroupBy(i => Path.TrimEndingDirectorySeparator(files[i].Parent), comparer).ToArray();
-            if (parents.Length == 1)
-            {
-                foreach (var i in group)
-                    if (result[i].distinguishingParent is not null) result[i] = result[i] with { distinguishingParent = null };
-                continue;
-            }
-
-            // 倒序按目录组件计数。每条真实目录仅计一次，即使同一文件在结果中出现多次。
-            var root = new DirectorySuffix();
-            foreach (var parent in parents)
-            {
-                var node = root;
-                foreach (var (part, _) in DirectoryParts(parent.Key))
-                {
-                    if (!node.Children.TryGetValue(part, out var child))
-                        node.Children[part] = child = new DirectorySuffix();
-                    child.Count++;
-                    node = child;
-                }
-            }
-            foreach (var parent in parents)
-            {
-                var node = root;
-                foreach (var (part, offset) in DirectoryParts(parent.Key))
-                {
-                    node = node.Children[part];
-                    if (node.Count != 1) continue;
-                    foreach (var i in parent)
-                        result[i] = files[i] with { distinguishingParent = Path.TrimEndingDirectorySeparator(files[i].Parent)[offset..] };
-                    break;
-                }
-            }
-        }
-        return result;
-    }
-
-    private sealed class DirectorySuffix
-    {
-        public readonly Dictionary<string, DirectorySuffix> Children = new(StringComparer.OrdinalIgnoreCase);
-        public int Count;
-    }
-
-    private static IEnumerable<(string Part, int Offset)> DirectoryParts(string parent)
-    {
-        // 路径根作为整体参与比较，UNC 服务器和共享名始终一起显示。
-        int rootLength = Path.GetPathRoot(parent)?.Length ?? 0;
-        int end = parent.Length;
-        while (end > rootLength)
-        {
-            int start = end;
-            while (start > rootLength && parent[start - 1] is not ('\\' or '/')) start--;
-            if (start < end) yield return (parent[start..end], start);
-            end = start - 1;
-        }
-        yield return (parent[..rootLength], 0);
-    }
-}
-
-// 单独存放在当前词库旁，随 E_SEARCH_DB 隔离；发布种子与导入导出都不含个人打开记录。
-internal sealed class FileRefindHistory(string databasePath)
-{
-    private readonly string path = databasePath + ".file-refind.sqlite";
-    private const long Day = 86_400_000;
-    private const long Lifetime = 90 * Day;
-    private const int MaxFiles = 256;
-    private const int Recent = 1, Frequent = 2;
-
-    internal static bool IsStorageFailure(Exception ex) => ex is SqliteException or IOException or UnauthorizedAccessException;
-
-    private SqliteConnection Open(bool create = false, bool readOnly = false)
-    {
-        var db = new SqliteConnection(new SqliteConnectionStringBuilder {
-            DataSource = path, Mode = readOnly ? SqliteOpenMode.ReadOnly : create ? SqliteOpenMode.ReadWriteCreate : SqliteOpenMode.ReadWrite,
-            Pooling = false, DefaultTimeout = 1
-        }.ToString());
-        try { db.Open(); return db; }
-        catch { db.Dispose(); throw; }
-    }
-
-    private static void Prune(SqliteConnection db, SqliteTransaction tx, long now)
-    {
-        using var prune = db.CreateCommand();
-        prune.Transaction = tx;
-        prune.CommandText = """
-            DELETE FROM opens WHERE opened < $cutoff;
-            DELETE FROM opens WHERE rowid IN
-                (SELECT rowid FROM opens ORDER BY opened DESC, rowid DESC LIMIT -1 OFFSET $limit);
-            """;
-        prune.Parameters.AddWithValue("$cutoff", now - Lifetime);
-        prune.Parameters.AddWithValue("$limit", MaxFiles);
-        prune.ExecuteNonQuery();
-    }
-
-    public (int Mode, long Epoch) GetPreferences() => ReadPreferences(readOnly: false);
-
-    internal (int Mode, long Epoch) ReadPreferences(bool readOnly)
-    {
-        if (!File.Exists(path)) return default;
-        using var db = Open(readOnly: readOnly);
-        using var cmd = db.CreateCommand();
-        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        cmd.CommandText = "SELECT mode,epoch,EXISTS(SELECT 1 FROM opens WHERE opened < $cutoff) FROM settings WHERE id=1";
-        cmd.Parameters.AddWithValue("$cutoff", now - Lifetime);
-        using var row = cmd.ExecuteReader();
-        if (!row.Read()) return default;
-        var result = (row.GetInt32(0), row.GetInt64(1));
-        bool expired = row.GetBoolean(2);
-        row.Close();
-        if (expired && !readOnly)
-        {
-            using var tx = db.BeginTransaction();
-            Prune(db, tx, now);
-            tx.Commit();
-        }
-        return result;
-    }
-
-    public (int Mode, long Epoch) SetMode(int mode)
-    {
-        if (mode is < 0 or > Frequent) throw new ArgumentOutOfRangeException(nameof(mode));
-        if (mode == 0 && !File.Exists(path)) return default;
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
-        using var db = Open(create: true);
-        using var tx = db.BeginTransaction();
-        using var cmd = db.CreateCommand();
-        cmd.Transaction = tx;
-        cmd.CommandText = """
-            CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY CHECK(id=1), mode INTEGER NOT NULL, salt BLOB NOT NULL, epoch INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS opens(file_key TEXT PRIMARY KEY, opened INTEGER NOT NULL, weight REAL NOT NULL);
-            INSERT INTO settings(id,mode,salt,epoch) VALUES(1,$mode,randomblob(32),1)
-                ON CONFLICT(id) DO UPDATE SET mode=excluded.mode, epoch=settings.epoch+(excluded.mode=0 OR settings.mode=0);
-            """;
-        cmd.Parameters.AddWithValue("$mode", mode);
-        cmd.ExecuteNonQuery();
-        Prune(db, tx, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-        cmd.CommandText = "SELECT epoch FROM settings WHERE id=1";
-        long epoch = (long)cmd.ExecuteScalar()!;
-        tx.Commit();
-        return (mode, epoch);
-    }
-
-    public (int Mode, long Epoch) Clear()
-    {
-        if (!File.Exists(path)) return default;
-        using var db = Open();
-        using var tx = db.BeginTransaction();
-        using var cmd = db.CreateCommand();
-        cmd.Transaction = tx;
-        cmd.CommandText = "PRAGMA secure_delete=ON; DELETE FROM opens; UPDATE settings SET salt=randomblob(32),epoch=epoch+1 WHERE id=1";
-        cmd.ExecuteNonQuery();
-        cmd.CommandText = "SELECT mode,epoch FROM settings WHERE id=1";
-        using var row = cmd.ExecuteReader();
-        row.Read();
-        var state = (row.GetInt32(0), row.GetInt64(1));
-        row.Close();
-        tx.Commit();
-        return state;
-    }
-
-    // 同一份本地库中，Windows 大小写变体共享记录；库内仅保存带随机密钥的路径摘要。
-    private static string FileKey(byte[] salt, string fullPath) =>
-        Convert.ToHexString(HMACSHA256.HashData(salt, Encoding.UTF8.GetBytes(fullPath.ToUpperInvariant())));
-
-    private static double Decay(double weight, long from, long to) =>
-        weight * Math.Pow(0.5, Math.Max(0d, (double)to - from) / (14 * Day));
-
-    public void RecordShellOpen(string fullPath, long now, long? expectedEpoch = null, CancellationToken consent = default)
-    {
-        if (!File.Exists(path)) return;
-        using var db = Open();
-        using var tx = db.BeginTransaction();
-        using var cmd = db.CreateCommand();
-        cmd.Transaction = tx;
-        // 在写事务中复核同意状态，即使另一进程刚关闭实验，也不能再积累打开次数。
-        cmd.CommandText = "SELECT salt FROM settings WHERE id=1 AND mode IN (1,2) AND ($epoch IS NULL OR epoch=$epoch)";
-        cmd.Parameters.AddWithValue("$epoch", (object?)expectedEpoch ?? DBNull.Value);
-        if (cmd.ExecuteScalar() is not byte[] salt || consent.IsCancellationRequested) return;
-        db.CreateFunction("decayed_weight", (double weight, long from, long to) => Decay(weight, from, to));
-        cmd.CommandText = """
-            INSERT INTO opens(file_key,opened,weight) VALUES($key,$now,1)
-            ON CONFLICT(file_key) DO UPDATE SET
-                weight=(CASE WHEN opens.opened < $cutoff THEN 0 ELSE decayed_weight(opens.weight,opens.opened,$now) END)
-                    + decayed_weight(1,$now,opens.opened),
-                opened=MAX(opens.opened,$now)
-            """;
-        cmd.Parameters.AddWithValue("$key", FileKey(salt, fullPath));
-        cmd.Parameters.AddWithValue("$now", now);
-        cmd.Parameters.AddWithValue("$cutoff", now - Lifetime);
-        cmd.ExecuteNonQuery();
-        Prune(db, tx, now);
-        tx.Commit();
-    }
-
-    public IReadOnlyList<FileHit> Rank(string query, IReadOnlyList<FileHit> files, long now)
-    {
-        if (files.Count < 2 || !EverythingSearch.IsPlainFileQuery(query) || !File.Exists(path)) return files;
-        using var db = Open();
-        using var cmd = db.CreateCommand();
-        cmd.CommandText = """
-            SELECT mode,salt,file_key,opened,weight FROM settings JOIN opens ON opened >= $cutoff
-            WHERE id=1 AND mode IN (1,2)
-            """;
-        cmd.Parameters.AddWithValue("$cutoff", now - Lifetime);
-        using var rows = cmd.ExecuteReader();
-        if (!rows.Read()) return files;
-        int mode = rows.GetInt32(0);
-        var salt = (byte[])rows[1];
-        var scores = new Dictionary<string,double>(StringComparer.Ordinal);
-        do {
-            long opened = rows.GetInt64(3);
-            scores.Add(rows.GetString(2), mode == Recent ? opened : Decay(rows.GetDouble(4), opened, now));
-        } while (rows.Read());
-        // 只在 SDK 已返回的集合中重排。整名精确组优先；同分沿用 LINQ 稳定排序的原始次序。
-        return files.OrderByDescending(file => string.Equals(file.Name, query, StringComparison.OrdinalIgnoreCase))
-            .ThenByDescending(file => scores.GetValueOrDefault(FileKey(salt, file.FullPath))).ToArray();
-    }
-}
-
-internal sealed class EverythingSearch
-{
-    internal const int ResultLimit = 100;
-    private const uint PageSize = 256;
-    private readonly SemaphoreSlim gate = new(1);
-    private readonly ProcessStartInfo workerCommand;
-    private readonly TimeSpan replyTimeout;
-    private Process? worker;
-    private long? lastStartupTick;
-
-    // Files 为空表示引擎尚未就绪；就绪且零命中则返回空数组。
-    private sealed record WorkerReply(IReadOnlyList<FileHit>? Files = null, bool Running = false, string? Error = null);
-
-    internal EverythingSearch() : this(CreateWorkerCommand(), TimeSpan.FromSeconds(15)) { }
-
-    internal EverythingSearch(ProcessStartInfo workerCommand, TimeSpan replyTimeout)
-    {
-        this.workerCommand = workerCommand;
-        this.replyTimeout = replyTimeout;
-        workerCommand.UseShellExecute = false;
-        workerCommand.CreateNoWindow = true;
-        workerCommand.RedirectStandardInput = workerCommand.RedirectStandardOutput = true;
-        workerCommand.StandardInputEncoding = workerCommand.StandardOutputEncoding = new UTF8Encoding(false);
-    }
-
-    private static ProcessStartInfo CreateWorkerCommand()
-    {
-        var assembly = typeof(EverythingSearch).Assembly;
-        // DLL 由 dotnet 启动时复用相同的宿主；独立发布版直接启动自身。
-        var host = System.Reflection.Assembly.GetEntryAssembly() == assembly ? Environment.ProcessPath : null;
-        var command = new ProcessStartInfo(host ?? Path.ChangeExtension(assembly.Location, ".exe"));
-        if (string.Equals(Path.GetFileNameWithoutExtension(host), "dotnet", StringComparison.OrdinalIgnoreCase))
-            command.ArgumentList.Add(assembly.Location);
-        command.ArgumentList.Add("--everything-worker");
-        command.ArgumentList.Add(Environment.ProcessId.ToString());
-        return command;
-    }
-
-    internal async Task<IReadOnlyList<FileHit>> SearchAsync(string input, Action<string> status, CancellationToken token)
-    {
-        await gate.WaitAsync(token).ConfigureAwait(false);
-        try
-        {
-            return await Task.Run(() => SearchWhenReadyAsync(input, status, token), token).ConfigureAwait(false);
-        }
-        finally { gate.Release(); }
-    }
-
-    private async Task<IReadOnlyList<FileHit>> SearchWhenReadyAsync(string input, Action<string> status, CancellationToken token)
-    {
-        string request = JsonSerializer.Serialize(input);
-        var watch = Stopwatch.StartNew();
-        bool waiting = false;
-        while (true)
-        {
-            var reply = await RequestAsync(request, token).ConfigureAwait(false);
-            if (reply.Error != null) throw new IOException(reply.Error);
-            if (reply.Files != null)
-            {
-                lastStartupTick = null;
-                return reply.Files;
-            }
-            // 大型个人索引可能加载数分钟。能连接到引擎时继续等待，输入变化仍可取消。
-            if (!reply.Running && watch.Elapsed >= TimeSpan.FromSeconds(35))
-            {
-                lastStartupTick = null;
-                throw new IOException("Everything 尚未就绪。请确认普通版已运行且索引可用，然后重新查询。");
-            }
-            if (!reply.Running && (lastStartupTick is not long previous || Environment.TickCount64 - previous >= 60_000))
-            {
-                var executable = LocateEverything() ?? throw new FileNotFoundException("尚未找到 Everything。");
-                try
-                {
-                    using var process = Process.Start(new ProcessStartInfo(executable, "-startup") {
-                        UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden
-                    });
-                    // 已有启动请求才需要抑制重复启动；同步失败后允许下次输入立即重试。
-                    if (process != null) lastStartupTick = Environment.TickCount64;
-                }
-                catch (Win32Exception ex) { throw new IOException("无法在后台启动 Everything。请先手动启动普通版后重试。" + ex.Message, ex); }
-            }
-            if (!waiting) { status("正在等待 Everything 索引就绪…"); waiting = true; }
-            await Task.Delay(200, token).ConfigureAwait(false);
-        }
-    }
-
-    private async Task<WorkerReply> RequestAsync(string request, CancellationToken token)
-    {
-        token.ThrowIfCancellationRequested();
-        if (worker is { HasExited: true } exited) { ClosePipes(exited); worker = null; }
-        worker ??= Process.Start(workerCommand) ?? throw new IOException("无法启动文件查询工作进程。");
-        var process = worker;
-        async Task<WorkerReply> Exchange()
-        {
-            await process.StandardInput.WriteLineAsync(request).ConfigureAwait(false);
-            var line = await process.StandardOutput.ReadLineAsync().ConfigureAwait(false);
-            if (line == null) throw new IOException("文件查询工作进程已退出，请重新查询。");
-            return JsonSerializer.Deserialize<WorkerReply>(line) ?? throw new IOException("文件查询响应为空。");
-        }
-
-        var exchange = Exchange();
-        try { return await exchange.WaitAsync(replyTimeout, token).ConfigureAwait(false); }
-        catch (Exception error)
-        {
-            // 同步 SDK 即使在就绪探测中也可能永久阻塞。先终止独立进程，再让下一次查询使用新管道。
-            worker = null;
-            try { if (!process.HasExited) process.Kill(); }
-            catch (InvalidOperationException) when (process.HasExited) { }
-            finally { ClosePipes(process); }
-            _ = exchange.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
-            if (error is not OperationCanceledException) lastStartupTick = null;
-            if (error is TimeoutException) throw new IOException("Everything 查询未在时限内响应，请重新查询。", error);
-            if (error is JsonException) throw new IOException("无法读取文件查询响应。", error);
-            throw;
-        }
-    }
-
-    private static void ClosePipes(Process process)
-    {
-        // 取消时可能仍有异步读写。直接关闭旧管道，不尝试刷新已经作废的查询。
-        process.StandardInput.BaseStream.Dispose();
-        process.StandardOutput.Dispose();
-        process.Dispose();
-    }
-
-    internal static int RunWorker(int parentId)
-    {
-        try
-        {
-            // 父进程意外退出时，即使 SDK 正在等待回包，工作进程也能自行结束。
-            using var parent = Process.GetProcessById(parentId);
-            parent.Exited += (_, _) => Environment.Exit(0);
-            parent.EnableRaisingEvents = true;
-            using var input = new StreamReader(Console.OpenStandardInput(), Encoding.UTF8);
-            using var output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
-            while (input.ReadLine() is string line)
-            {
-                var query = JsonSerializer.Deserialize<string>(line);
-                if (query == null) return 1;
-                WorkerReply reply;
-                try
-                {
-                    reply = Native.Everything_IsDBLoaded()
-                        ? new WorkerReply(Search(query))
-                        : new WorkerReply(Running: Native.Everything_GetMajorVersion() != 0);
-                }
-                catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
-                { reply = new WorkerReply(Error: "无法加载与当前进程匹配的 Everything SDK。请检查程序目录中的官方 DLL。"); }
-                catch (IOException ex) { reply = new WorkerReply(Error: ex.Message); }
-                output.WriteLine(JsonSerializer.Serialize(reply));
-            }
-            return 0;
-        }
-        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or Win32Exception or IOException or JsonException) { return 1; }
-    }
-
-    private static string? LocateEverything()
-    {
-        var configured = Environment.GetEnvironmentVariable("E_SEARCH_EVERYTHING_EXE");
-        if (!string.IsNullOrWhiteSpace(configured))
-            return Path.IsPathFullyQualified(configured) && File.Exists(configured) ? configured : null;
-        const string appPaths = @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Everything.exe";
-        foreach (var hive in new[] { Microsoft.Win32.Registry.CurrentUser, Microsoft.Win32.Registry.LocalMachine })
-        {
-            using var key = hive.OpenSubKey(appPaths);
-            if (key?.GetValue(null) is string exe && Path.IsPathFullyQualified(exe) && File.Exists(exe)) return exe;
-        }
-        foreach (var folder in new[] { Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86,
-                     Environment.SpecialFolder.LocalApplicationData })
-        {
-            var exe = Path.Combine(Environment.GetFolderPath(folder), "Everything", "Everything.exe");
-            if (File.Exists(exe)) return exe;
-        }
-        return null;
-    }
-
-    internal static bool IsPlainFileQuery(string input) =>
-        input.IndexOfAny(Path.GetInvalidFileNameChars()) < 0 &&
-        !input.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Any(word => word.StartsWith('!'));
-
-    private static IReadOnlyList<FileHit> Search(string input)
-    {
-        // 先在整个索引中匹配文件名和文件夹名，避免精确匹配被普通查询的数量上限截掉。
-        // 原查询始终原样发送；原生表达式只走原查询。两批内部均保留 SDK 的原始顺序。
-        bool plain = IsPlainFileQuery(input);
-        var output = new List<FileHit>(ResultLimit);
-        try
-        {
-            if (plain) AppendResults($"wfn:\"{input}\"", input, true, output);
-            if (output.Count < ResultLimit) AppendResults(input, plain ? input : null, false, output);
-            return output;
-        }
-        finally
-        {
-            Native.Everything_Reset();
-        }
-    }
-
-    private static void AppendResults(string query, string? exactName, bool exactPass, List<FileHit> output)
-    {
-        Native.Everything_SetSearchW(query);
-        Native.Everything_SetRequestFlags(3); // EVERYTHING_REQUEST_FILE_NAME | EVERYTHING_REQUEST_PATH
-        Native.Everything_SetMax(PageSize);
-        for (uint offset = 0; ; offset += PageSize)
-        {
-            Native.Everything_SetOffset(offset);
-            if (!Native.Everything_QueryW(true))
-                throw new IOException($"Everything 查询失败（SDK 错误 {Native.Everything_GetLastError()}）。");
-            uint count = Native.Everything_GetNumResults();
-            for (uint i = 0; i < count && output.Count < ResultLimit; i++)
-            {
-                bool isFolder = Native.Everything_IsFolderResult(i);
-                if (!isFolder && !Native.Everything_IsFileResult(i)) continue;
-                var name = Marshal.PtrToStringUni(Native.Everything_GetResultFileNameW(i));
-                if (string.IsNullOrEmpty(name)) continue;
-                if (exactName != null && string.Equals(name, exactName, StringComparison.OrdinalIgnoreCase) != exactPass) continue;
-                var parent = Marshal.PtrToStringUni(Native.Everything_GetResultPathW(i));
-                if (string.IsNullOrEmpty(parent)) continue;
-                // SDK 对卷根目录可能返回 "C:"；只向 Shell 交付可独立解析的绝对路径。
-                if (parent.Length == 2 && char.IsAsciiLetter(parent[0]) && parent[1] == ':') parent += "\\";
-                if (Path.IsPathFullyQualified(parent))
-                    output.Add(new FileHit(name, parent, Path.Combine(parent, name)) { IsFolder = isFolder });
-            }
-            if (output.Count >= ResultLimit || count < PageSize || offset > uint.MaxValue - PageSize) break;
-        }
-    }
-
-    private static class Native
-    {
-        private const string Library = "ESearch.EverythingSDK";
-
-        static Native()
-        {
-            NativeLibrary.SetDllImportResolver(typeof(Native).Assembly, (name, assembly, searchPath) =>
-            {
-                if (name != Library) return IntPtr.Zero;
-                var file = RuntimeInformation.ProcessArchitecture switch {
-                    Architecture.X64 => "Everything64.dll", Architecture.X86 => "Everything32.dll",
-                    Architecture.Arm64 => "EverythingARM64.dll", _ => throw new BadImageFormatException("不支持的进程架构")
-                };
-                return NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, file));
-            });
-        }
-
-        [DllImport(Library)] internal static extern bool Everything_IsDBLoaded();
-        [DllImport(Library)] internal static extern uint Everything_GetMajorVersion();
-        [DllImport(Library, CharSet=CharSet.Unicode, ExactSpelling=true)] internal static extern void Everything_SetSearchW(string search);
-        [DllImport(Library)] internal static extern void Everything_SetRequestFlags(uint flags);
-        [DllImport(Library)] internal static extern void Everything_SetMax(uint max);
-        [DllImport(Library)] internal static extern void Everything_SetOffset(uint offset);
-        [DllImport(Library, ExactSpelling=true)] internal static extern bool Everything_QueryW(bool wait);
-        [DllImport(Library)] internal static extern uint Everything_GetNumResults();
-        [DllImport(Library)] internal static extern uint Everything_GetLastError();
-        [DllImport(Library)] internal static extern bool Everything_IsFileResult(uint index);
-        [DllImport(Library)] internal static extern bool Everything_IsFolderResult(uint index);
-        [DllImport(Library, ExactSpelling=true)] internal static extern IntPtr Everything_GetResultFileNameW(uint index);
-        [DllImport(Library, ExactSpelling=true)] internal static extern IntPtr Everything_GetResultPathW(uint index);
-        [DllImport(Library)] internal static extern void Everything_Reset();
-    }
 }

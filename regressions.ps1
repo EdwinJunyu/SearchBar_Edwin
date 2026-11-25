@@ -1230,7 +1230,7 @@ function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, 
         Assert-Equal (@(Invoke-Search @('article','zh-en','helper')) -join ' ') '<p>指定来源</p>' '辅助页可按卷内精确键打开'
         if ($Assembly) {
             # 使用实际详情窗的 URL 改写入口，再用改写后的卷内键读取合成原生实体补救页。
-            $rewrite = $Assembly.GetType('ESearch.SearchWindow',$true).GetMethod('RewriteMergedLinks',[Reflection.BindingFlags]'Static,NonPublic')
+            $rewrite = $Assembly.GetType('ESearch.EntryDetailFormatter',$true).GetMethod('RewriteMergedLinks',[Reflection.BindingFlags]'Static,NonPublic')
             Assert-Equal ($null -ne $rewrite) $true '详情窗包含同源补充跳转绑定'
             $sourceHtml = @(Invoke-Search @('article','zh-ja','alias')) -join ' '
             $navigation = $rewrite.Invoke($null,@($sourceHtml,'/page-2'))
@@ -1280,7 +1280,7 @@ function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, 
                     Assert-Equal $article.Html $articleBefore.Html '正文和卷内链接保持原值'
                     Assert-Equal $article.SourceNames['oxford'] '牛津 <主书>' '正文取得同一来源名'
                     $header = '<a name="es-oxford-1"></a><a name="es-hanying-2"></a><div class="es-label"><b>牛津 #1 · 汉英 #2</b></div>'
-                    $render = $Assembly.GetType('ESearch.SearchWindow').GetMethod('EncodeMergedDocument',[Reflection.BindingFlags]'Static,NonPublic')
+                    $render = $Assembly.GetType('ESearch.EntryDetailFormatter').GetMethod('EncodeMergedDocument',[Reflection.BindingFlags]'Static,NonPublic')
                     $document = [Text.Encoding]::UTF8.GetString($render.Invoke($null,@($header,'/test',$article.SourceNames)))
                     Assert-Equal ($document.Contains($header.Replace('牛津 #1','牛津 &lt;主书&gt; #1'))) $true '共用正文只改指定来源并转义名称'
                 } finally { $reader.Dispose() }
@@ -1829,7 +1829,7 @@ function Test-ImportRecovery([string]$Directory,[Reflection.Assembly]$Assembly) 
 }
 
 function Test-Calculation([Reflection.Assembly]$Assembly) {
-    $calculator = $Assembly.GetType('ESearch.SearchWindow', $true).GetMethod('TryCalculate', [Reflection.BindingFlags]'Static,NonPublic')
+    $calculator = $Assembly.GetType('ESearch.Calculator', $true).GetMethod('TryCalculate', [Reflection.BindingFlags]'Static,NonPublic')
     foreach ($case in ([ordered]@{
         '2+3*4' = '14'
         '(2+3)*4' = '20'
@@ -3463,7 +3463,7 @@ function Test-SanseidoSummary([string]$Scratch, [Reflection.Assembly]$Assembly) 
                 Assert-Equal ($reader.CurrentBody($hit.Entry)) $words[$key] "三省堂详情原文 $key"
             }
         } finally { $reader.Dispose() }
-        if ($window = $Assembly.GetType('ESearch.SearchWindow')) {
+        if ($window = $Assembly.GetType('ESearch.EntryDetailFormatter')) {
             $static=[Reflection.BindingFlags]'Static,NonPublic'
             $plain=$window.GetMethod('FormatDetail',$static).Invoke($null,@($words.accelerator,$null,'sanseido'))
             Assert-Equal ($plain.Text -split '\r?\n')[-1].EndsWith('アクセル(1)') $true '三省堂详情保留可见的义项号'
@@ -4174,7 +4174,7 @@ function Test-HanyingReferences([string]$Scratch) {
 }
 
 function Test-SecondPassDisplay([Reflection.Assembly]$Assembly) {
-    $window = $Assembly.GetType('ESearch.SearchWindow')
+    $window = $Assembly.GetType('ESearch.EntryDetailFormatter')
     $static = [Reflection.BindingFlags]'Static,NonPublic'
     $detail = $window.GetMethod('FormatDetail',$static)
     $shownHead = [LookupEntry].GetProperty('DisplayHeadword',[Reflection.BindingFlags]'Instance,NonPublic')
@@ -4251,7 +4251,7 @@ function Test-SecondPassDisplay([Reflection.Assembly]$Assembly) {
 }
 
 function Test-ShogakukanJoinedDetail([Reflection.Assembly]$Assembly) {
-    $window = $Assembly.GetType('ESearch.SearchWindow')
+    $window = $Assembly.GetType('ESearch.EntryDetailFormatter')
     $flags = [Reflection.BindingFlags]'Static,NonPublic'
     $detail = $window.GetMethod('FormatDetail',$flags)
     $encode = $window.GetMethod('EncodeMergedDocument',$flags)
@@ -4294,7 +4294,7 @@ function Test-ShogakukanJoinedDetail([Reflection.Assembly]$Assembly) {
 }
 
 function Test-ShinseikiTruncatedDetail([Reflection.Assembly]$Assembly) {
-    $detail = $Assembly.GetType('ESearch.SearchWindow').GetMethod('FormatDetail',[Reflection.BindingFlags]'Static,NonPublic')
+    $detail = $Assembly.GetType('ESearch.EntryDetailFormatter').GetMethod('FormatDetail',[Reflection.BindingFlags]'Static,NonPublic')
     # “口”和“迦葉”的原书在标签中间截断，后面仍可能另起义项。保留前后正文及转义后的字面示例。
     foreach ($row in @(
         @('<p>へらず口をきく。</span><span class="divide-imgs</p></div></div>', 'へらず口をきく。'),
@@ -4328,10 +4328,10 @@ function Test-ShinseikiTruncatedDetail([Reflection.Assembly]$Assembly) {
     $power = $powerTitle + '<span>对于a<sup><sub><</sub>/sup>n而言的n。</sup></span>'
     $section = '<div class="es-source es-shinseiki"><a name="es-shinseiki-195342"></a>'
     $foreign = '<div class="es-source es-sango">' + $power + '</div>'
-    $encoder = $Assembly.GetType('ESearch.SearchWindow').GetMethod('EncodeMergedDocument',[Reflection.BindingFlags]'Static,NonPublic')
+    $encoder = $Assembly.GetType('ESearch.EntryDetailFormatter').GetMethod('EncodeMergedDocument',[Reflection.BindingFlags]'Static,NonPublic')
     $page = [Text.Encoding]::UTF8.GetString($encoder.Invoke($null,@(($section + $power + '</div>' + $foreign),'/local/1',$null)))
     Assert-Equal ($page.Contains($section + $powerTitle + '<span>对于aⁿ而言的n。</span></div>' + $foreign)) $true '复原幂指数后普通句子脱离上标'
-    $rewrite = $Assembly.GetType('ESearch.SearchWindow').GetMethod('RewriteMergedLinks',[Reflection.BindingFlags]'Static,NonPublic')
+    $rewrite = $Assembly.GetType('ESearch.EntryDetailFormatter').GetMethod('RewriteMergedLinks',[Reflection.BindingFlags]'Static,NonPublic')
     $bad = 'B<sub><</sub>sup>12'
     $rawText = $section + '<h1><span class="word">造血薬</span></h1><script>let x="<!--";</script><p>' + $bad + '</p></div>'
     $fakeSource = $rawText.Replace('<script>let x="<!--";</script>','<!--<div class="es-source es-oxford">-->')
@@ -4378,7 +4378,7 @@ function Test-ShinseikiTruncatedDetail([Reflection.Assembly]$Assembly) {
 function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
     $flags = [Reflection.BindingFlags]'Static,NonPublic'
     $format = [Lookup].GetMethod('Format',$flags)
-    $detail = $Assembly.GetType('ESearch.SearchWindow').GetMethod('FormatDetail',$flags)
+    $detail = $Assembly.GetType('ESearch.EntryDetailFormatter').GetMethod('FormatDetail',$flags)
     # 样例来自实际词头和正文；同时覆盖同码异书、正常标点和原始索引身份。
     foreach ($row in @(
         @('shinseiki',"表現`u{E003}式",'表現様式'),
@@ -4460,7 +4460,7 @@ function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
     Assert-Equal ($detail.Invoke($null,@(($unitTitle.Replace('angstrom','other')),$null,'shinseiki')).Text.StartsWith('⇒')) $true '其它标题里的箭头保持原形'
     Assert-Equal ($detail.Invoke($null,@($bird,$null,'shinseiki')).Text.EndsWith('䴙䴘的古名。')) $true '同一义项日文明确指出鸟属'
     Assert-Equal ($detail.Invoke($null,@(($bird.Replace('カイツブリ','別の鳥')),$null,'shinseiki')).Text.EndsWith('⇒?的古名。')) $true '不同鸟名不套用该译文'
-    $retained=$Assembly.GetType('ESearch.SearchWindow').GetMethod('RewriteMergedLinks',$flags)
+    $retained=$Assembly.GetType('ESearch.EntryDetailFormatter').GetMethod('RewriteMergedLinks',$flags)
     $section='<div class="es-source es-shinseiki"><a name="es-shinseiki-1"></a>'
     $other=$section.Replace('shinseiki','sango')
     $rich=$retained.Invoke($null,@("$section$unitTitle$bird</div>$other$unitTitle$bird</div>",'/test'))
@@ -4481,7 +4481,7 @@ function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
     $hashed = 'esmissing-oxford-cbc379a6a271353b888d0c37b264542e925bf595480ce7a1c31ef9fa83080cd7'
     $brokenLink = '<a href="entry://' + $hashed + '"font-weight:normal">''</FONT>s apple">' + $label + '</a>'
     $section = '<div class="es-source es-oxford">'
-    $rewrite = $Assembly.GetType('ESearch.SearchWindow').GetMethod('RewriteMergedLinks',$flags)
+    $rewrite = $Assembly.GetType('ESearch.EntryDetailFormatter').GetMethod('RewriteMergedLinks',$flags)
     $path = '/page-1'
     # 六条牛津例句都在译文闭标签后留下同一属性尾。COLLOC 与普通词条中举例的尖括号仍属可见正文。
     $colloc = '<font>皮革护理油 </font>(</SPAN>COLLOC)"&gt;</SPAN eid="21" n-g n="3"></SPAN>'
@@ -4550,7 +4550,7 @@ function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly
             Assert-Equal $raw.Substring($senseRange.Item1,$senseRange.Item2) '用完 &amp; 耗尽' '定位义项而非父词条同文'
             Assert-Equal ($senseRange.Item1 -gt $raw.IndexOf('definition')) $true '重复译文锚点指向真实小节'
             # 将同一父正文经过窗口使用的文本转换，核对去标签、实体解码及换行后的高亮位置。
-            $format=$Assembly.GetType('ESearch.SearchWindow').GetMethod('FormatDetail',[Reflection.BindingFlags]'Static,NonPublic')
+            $format=$Assembly.GetType('ESearch.EntryDetailFormatter').GetMethod('FormatDetail',[Reflection.BindingFlags]'Static,NonPublic')
             $view=$format.Invoke($null,@($raw,$anchor,'oxford'))
             Assert-Equal $view.Text ($format.Invoke($null,@($raw,$null,'oxford'))).Text '高亮不会删减父词条内容'
             $titleRange=$view.Anchor.Title.GetOffsetAndLength($view.Text.Length)
@@ -4559,7 +4559,7 @@ function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly
             Assert-Equal $view.Text.Substring($senseRange.Item1,$senseRange.Item2) '用完 & 耗尽' '窗口义项高亮包含解码后的实体'
             Assert-Equal ($titleRange.Item1 -gt $view.Text.IndexOf('【PHR V】')) $true '同文只突出短语动词区对应小节'
             # 另一来源含相同正文，只有物理序号对应的小节可以提供排版锚点。
-            $highlight=$Assembly.GetType('ESearch.SearchWindow').GetMethod('HighlightMergedPhrase',[Reflection.BindingFlags]'Static,NonPublic')
+            $highlight=$Assembly.GetType('ESearch.EntryDetailFormatter').GetMethod('HighlightMergedPhrase',[Reflection.BindingFlags]'Static,NonPublic')
             $article=$Assembly.GetType('MergedArticle').GetConstructor([type[]]@([string],[string],[string],[string]))
             $prefix='<div class="es-source es-hanying"><a name="es-hanying-1"></a>'+$raw+'</div>'
             $source='<div class="es-source es-oxford"><a name="es-oxford-1"></a>'
@@ -4848,8 +4848,12 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
             $refresh.Invoke($window,$null)
             Wait-ModeUi { $gloss.Text -ceq '收到' }
             # 模拟旧拼写请求在新结果显示后才完成，即使取消未抢先中止，界面也必须保留新结果。
+            $contextConstructor = $type.Assembly.GetType('ESearch.SearchRequestContext',$true).GetConstructor(
+                [type[]]@([long],[long],[Threading.CancellationToken]))
+            $oldContext = $contextConstructor.Invoke(@($priorRevision,
+                $type.GetField('catalogRevision',$flags).GetValue($window),[Threading.CancellationToken]::None))
             $oldResult = $type.GetMethod('SearchDictionaryAsync',$flags).Invoke($window,
-                @('recieve',$priorRevision,[Threading.CancellationToken]::None))
+                @('recieve',$oldContext))
             Wait-ModeUi { $oldResult.IsCompleted }
             [void]$oldResult.GetAwaiter().GetResult()
             Assert-Equal $choices.Items.Count 0 '迟到的旧拼写结果不重新显示建议'
@@ -4930,8 +4934,9 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
             $refresh.Invoke($window,$null)
             $query.Text='反查英语收到'
             Wait-ModeUi { $gloss.Text.Contains('receive') -and $status.Text.Contains('牛津英语词典') }
+            $prefixContext=$contextConstructor.Invoke(@($prefixRevision,$prefixCatalog,[Threading.CancellationToken]::None))
             $stale=$type.GetMethod('SearchPrefixesAsync',$flags).Invoke($window,
-                @('book','oxford',$prefixRevision,$prefixCatalog,[Threading.CancellationToken]::None))
+                @('book','oxford',$prefixContext))
             Wait-ModeUi { $stale.IsCompleted }
             [void]$stale.GetAwaiter().GetResult()
             Assert-Equal $prefixes.Items.Count 0 '反查期间清空前缀候选'
