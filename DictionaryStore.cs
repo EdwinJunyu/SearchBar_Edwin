@@ -555,12 +555,14 @@ internal sealed partial class DictionaryStore : IDisposable
     }
 
     // 每次读取在一个快照内核对来源版本；旧应用数据库没有双卷表也可以打开。
-    public MergedArticle? MergedArticleFor(LookupEntry hit) => ReadArticle(hit, null, null, null);
-    public MergedArticle? MergedArticleByKey(string group, string key, string? expectedRevision = null) => ReadArticle(null, group, key, expectedRevision);
+    public MergedArticle? MergedArticleFor(LookupEntry hit, CancellationToken token = default) => ReadArticle(hit, null, null, null, token);
+    public MergedArticle? MergedArticleByKey(string group, string key, string? expectedRevision = null, CancellationToken token = default) =>
+        ReadArticle(null, group, key, expectedRevision, token);
 
     private const string MergePrefix = "<!--ESMERGE1:", HelperPrefix = "<!--ESHELP1-->";
 
-    private MergedArticle? ReadArticle(LookupEntry? hit, string? group, string? key, string? expectedRevision)
+    private MergedArticle? ReadArticle(LookupEntry? hit, string? group, string? key, string? expectedRevision, CancellationToken token) =>
+        SqliteCancellation.Run<MergedArticle?>(db, token, "词条详情已取消", () =>
     {
         using var tx = db.BeginTransaction(deferred: true);
         if (!HasMergedCatalog(tx)) return null;
@@ -601,17 +603,23 @@ internal sealed partial class DictionaryStore : IDisposable
             names.Parameters.AddWithValue("$volume", article.Group);
             using var labels = names.ExecuteReader();
             var aliases = new Dictionary<string,string>(StringComparer.Ordinal);
-            while (labels.Read()) aliases.Add(labels.GetString(0), labels.GetString(1));
+            while (labels.Read())
+            {
+                token.ThrowIfCancellationRequested();
+                aliases.Add(labels.GetString(0), labels.GetString(1));
+            }
             article = article with { SourceNames = aliases };
         }
+        token.ThrowIfCancellationRequested();
         if (!external) return article;
         tx.Commit();
-        string page = ReadIndexedBody(hash, start, end, exact: true);
+        string page = ReadIndexedBody(hash, start, end, exact: true, token);
+        token.ThrowIfCancellationRequested();
         int prefixEnd = page.IndexOf("-->", StringComparison.Ordinal);
         if (prefixEnd < 0 || !(page.StartsWith(MergePrefix, StringComparison.Ordinal) || page.StartsWith(HelperPrefix, StringComparison.Ordinal)))
             throw new InvalidDataException("合并词页缺少来源标记。");
         return article with { Html = page[(prefixEnd + 3)..] };
-    }
+    });
 
     public void ImportMerged(string directory, Action<string,int>? progress = null) =>
         ImportMergedWithProgress(directory, progress == null ? null : (stage,done,total) => {
@@ -1137,8 +1145,7 @@ internal sealed partial class DictionaryStore : IDisposable
     {
         token.ThrowIfCancellationRequested();
         // 同一连接只处理本轮查询。SQLite 在递归查别名期间也能响应取消，无须等到返回第一行。
-        using var registration = token.Register(() => SQLitePCL.raw.sqlite3_interrupt(db.Handle));
-        try
+        return SqliteCancellation.Run<IReadOnlyList<LookupHit>>(db, token, "词典查询已取消", () =>
         {
             using var snapshot = db.BeginTransaction(deferred: true);
             var schema = SchemaIn(snapshot);
@@ -1156,11 +1163,7 @@ internal sealed partial class DictionaryStore : IDisposable
             token.ThrowIfCancellationRequested();
             snapshot.Commit();
             return hits;
-        }
-        catch (SqliteException ex) when (ex.SqliteErrorCode == SQLitePCL.raw.SQLITE_INTERRUPT && token.IsCancellationRequested)
-        {
-            throw new OperationCanceledException("词典查询已取消", ex, token);
-        }
+        });
     }
 
     // 查询键和 MDX 的递归链接均从同一索引取旧拼写。单连接符是几个精确点，多连接符是几个前缀区间。
@@ -1251,11 +1254,14 @@ internal sealed partial class DictionaryStore : IDisposable
         return cmd.ExecuteScalar() as string;
     }
 
-    internal string? ReadReadingPreference(string reading)
+    internal string? ReadReadingPreference(string reading, CancellationToken token = default) =>
+        SqliteCancellation.Run<string?>(db, token, "词条首选读音查询已取消", () =>
     {
         using var snapshot = db.BeginTransaction(deferred: true);
-        return HasReadingPreferences(snapshot) ? PreferredHeadword(reading, snapshot) : null;
-    }
+        var preferred = HasReadingPreferences(snapshot) ? PreferredHeadword(reading, snapshot) : null;
+        token.ThrowIfCancellationRequested();
+        return preferred;
+    });
 
     private IReadOnlyList<LookupHit> ApplyReadingPreferences(IReadOnlyList<LookupHit> hits,
         SqliteTransaction snapshot, CancellationToken token)
@@ -1407,7 +1413,7 @@ internal sealed partial class DictionaryStore : IDisposable
             {
                 if (triedBody) return managedBody;
                 triedBody = true;
-                try { managedBody = ReadSourceBody(r.GetString(columns["SourceHash"]), r.GetInt64(columns["RecordStart"]), r.GetInt64(columns["RecordEnd"]), !r.IsDBNull(columns["MergedPage"]), entry.DictionaryId, entry.EntryId); }
+                try { managedBody = ReadSourceBody(r.GetString(columns["SourceHash"]), r.GetInt64(columns["RecordStart"]), r.GetInt64(columns["RecordEnd"]), !r.IsDBNull(columns["MergedPage"]), entry.DictionaryId, entry.EntryId, token); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or NotSupportedException)
                 {
                     // 单本源文件缺失或损坏时，仍显示已存首义及其他词典命中；详情读取会报告文件错误。
@@ -1481,8 +1487,7 @@ internal sealed partial class DictionaryStore : IDisposable
         if (prefix.Length == 0) return [];
         // 连接符右边的字母尚未打出时，仍按词内连接符查旧键和新键。
         prefix = Lookup.Normalize(prefix + "a")[..^1];
-        using var registration = token.Register(() => SQLitePCL.raw.sqlite3_interrupt(db.Handle));
-        try
+        return SqliteCancellation.Run<IReadOnlyList<PrefixChoice>>(db, token, "词典联想已取消", () =>
         {
             using var snapshot = db.BeginTransaction(deferred: true);
             var schema = SchemaIn(snapshot);
@@ -1592,11 +1597,7 @@ internal sealed partial class DictionaryStore : IDisposable
                 // 不足上限表示字面区间已读尽。不同旧键可能归一为同一显示项，不能用 found.Count 判断是否补查。
                 return rawKeys == limit;
             }
-        }
-        catch (SqliteException ex) when (ex.SqliteErrorCode == SQLitePCL.raw.SQLITE_INTERRUPT && token.IsCancellationRequested)
-        {
-            throw new OperationCanceledException("词典联想已取消", ex, token);
-        }
+        });
     }
 
     private static string? PrefixUpperBound(string prefix)
@@ -1678,27 +1679,32 @@ internal sealed partial class DictionaryStore : IDisposable
         }
     }
 
-    public string? CurrentBody(LookupEntry candidate) =>
-        candidate.DictionaryRevision == null ? null : GetBody(candidate.DictionaryId, candidate.EntryId,
-            candidate.DictionaryRevision, candidate.ReverseSourceHash)?.Raw;
+    public string? CurrentBody(LookupEntry candidate, CancellationToken token = default) =>
+        SqliteCancellation.Run<string?>(db, token, "词条详情已取消", () =>
+            candidate.DictionaryRevision == null ? null : GetBody(candidate.DictionaryId, candidate.EntryId,
+                candidate.DictionaryRevision, candidate.ReverseSourceHash, token: token)?.Raw);
 
     public (string? Evidence, string Raw) Detail(string id, long ordinal) =>
         GetBody(id, ordinal, null) ?? throw new InvalidOperationException("找不到指定词条");
 
-    private (string? Evidence, string Raw)? GetBody(string id, long ordinal, string? revision, string? expectedHash = null, string? physicalHead = null)
+    private (string? Evidence, string Raw)? GetBody(string id, long ordinal, string? revision, string? expectedHash = null,
+        string? physicalHead = null, CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         // 同一快照核对版本并取得对应散列及范围。托管文件不可变，读取它时无须占用 WAL 快照。
         using var snapshot = db.BeginTransaction(deferred: true);
         var result = FindBody(id, ordinal, revision, snapshot, SchemaIn(snapshot),expectedHash,physicalHead);
+        token.ThrowIfCancellationRequested();
         snapshot.Commit();
         if (result == null) return null;
         var row = result.Value;
-        return (row.Evidence, row.Hash == null ? row.Raw : ReadSourceBody(row.Hash, row.Start, row.End, row.Merged, id, ordinal));
+        return (row.Evidence, row.Hash == null ? row.Raw : ReadSourceBody(row.Hash, row.Start, row.End, row.Merged, id, ordinal, token));
     }
 
-    private string ReadSourceBody(string hash, long start, long end, bool merged, string source, long ordinal)
+    private string ReadSourceBody(string hash, long start, long end, bool merged, string source, long ordinal, CancellationToken token = default)
     {
-        string body = ReadIndexedBody(hash, start, end, merged);
+        string body = ReadIndexedBody(hash, start, end, merged, token);
+        token.ThrowIfCancellationRequested();
         if (!merged) return body;
         // 一页可含多个同名来源或同一来源的多个义项，用原物理序号还原调用者选中的原文。
         int endHeader = body.IndexOf("-->", StringComparison.Ordinal);
@@ -1706,30 +1712,39 @@ internal sealed partial class DictionaryStore : IDisposable
         {
             using var records = JsonDocument.Parse(Convert.FromBase64String(body[MergePrefix.Length..endHeader]));
             foreach (var row in records.RootElement.EnumerateArray())
+            {
+                token.ThrowIfCancellationRequested();
                 if (row[0].GetString() == source && row[1].GetInt64() == ordinal)
                     return row[3].GetString()!;
+            }
         }
         throw new InvalidDataException($"合并页缺少来源记录 {source}/{ordinal}。");
     }
 
-    private string ReadIndexedBody(string hash, long start, long end, bool exact) =>
-        ManagedMdx.Body(db.DataSource, hash, start, end, () => ReadVerifiedDirectory(db.DataSource, hash), exact);
+    private string ReadIndexedBody(string hash, long start, long end, bool exact, CancellationToken token = default) =>
+        ManagedMdx.Body(db.DataSource, hash, start, end, () => ReadVerifiedDirectory(db.DataSource, hash, token), exact, token);
 
-    private static byte[]? ReadVerifiedDirectory(string databasePath, string hash)
+    private static byte[]? ReadVerifiedDirectory(string databasePath, string hash, CancellationToken token)
     {
         // 冷打开才取块目录。回调只持路径及哈希，独立的短读快照可在其他线程或旧查询结束后使用。
         using var connection = new SqliteConnection(new SqliteConnectionStringBuilder {
             DataSource = databasePath, Mode = SqliteOpenMode.ReadOnly
         }.ToString());
+        token.ThrowIfCancellationRequested();
         connection.Open();
-        using var snapshot = connection.BeginTransaction(deferred: true);
-        using var cmd = connection.CreateCommand();
-        cmd.Transaction = snapshot;
-        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mdx_layouts'";
-        if (cmd.ExecuteScalar() == null) return null; // 旧索引仍按整文件 SHA 校验。
-        cmd.CommandText = "SELECT directory FROM mdx_layouts WHERE sha256=$hash";
-        cmd.Parameters.AddWithValue("$hash", hash);
-        return cmd.ExecuteScalar() as byte[];
+        return SqliteCancellation.Run<byte[]?>(connection, token, "词条正文目录查询已取消", () =>
+        {
+            using var snapshot = connection.BeginTransaction(deferred: true);
+            using var cmd = connection.CreateCommand();
+            cmd.Transaction = snapshot;
+            cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mdx_layouts'";
+            if (cmd.ExecuteScalar() == null) return null; // 旧索引仍按整文件 SHA 校验。
+            cmd.CommandText = "SELECT directory FROM mdx_layouts WHERE sha256=$hash";
+            cmd.Parameters.AddWithValue("$hash", hash);
+            var directory = cmd.ExecuteScalar() as byte[];
+            token.ThrowIfCancellationRequested();
+            return directory;
+        });
     }
 
     private (string? Evidence, string Raw, string? Hash, long Start, long End, bool Merged)? FindBody(string id, long ordinal, string? revision,
@@ -2009,8 +2024,7 @@ internal sealed partial class DictionaryStore : IDisposable
         if (description.Length is < 2 or > 256) return [];
         var query = ReverseGrams(description);
         if (query.Count < 2) return [];
-        using var registration = token.Register(() => SQLitePCL.raw.sqlite3_interrupt(db.Handle));
-        try
+        return SqliteCancellation.Run<IReadOnlyList<LookupHit>>(db, token, "释义反查已取消", () =>
         {
             using var snapshot = db.BeginTransaction(deferred: true);
             var schema = SchemaIn(snapshot);
@@ -2060,7 +2074,7 @@ internal sealed partial class DictionaryStore : IDisposable
                     // 目录可跨进程复用。只回读入围日语词的同一版本物理正文，核对选中义项与原文位置。
                     if (book.Language == "ja")
                     {
-                        string? body = GetBody(book.Id,item.Ordinal,book.Revision,book.Hash,item.Head)?.Raw;
+                        string? body = GetBody(book.Id,item.Ordinal,book.Revision,book.Hash,item.Head,token)?.Raw;
                         if (body == null || !EntryParser.ShinseikiReverseSenses(body,item.Head)
                             .Any(sense => sense.Span.Equals(item.Span) && sense.Gloss == item.Gloss)) continue;
                         string? reading = EntryParser.Parse("shinseiki",item.Head,body,"ja").Reading;
@@ -2083,11 +2097,7 @@ internal sealed partial class DictionaryStore : IDisposable
             // 词片得分与余弦分数不可跨语言直接比较；逐层交错，范围内的两种语言都能被看到。
             return groups.SelectMany(g => g).OrderBy(item => item.rank)
                 .ThenBy(item => item.Hit.Entry.Language == "ja" ? 0 : 1).Take(5).Select(item => item.Hit).ToArray();
-        }
-        catch (SqliteException ex) when (ex.SqliteErrorCode == SQLitePCL.raw.SQLITE_INTERRUPT && token.IsCancellationRequested)
-        {
-            throw new OperationCanceledException("释义反查已取消",ex,token);
-        }
+        });
     }
 
     private static string VectorPath(string directory, ReverseBook book)
@@ -2542,7 +2552,7 @@ internal sealed partial class DictionaryStore : IDisposable
             string head = rows.GetString(1);
             bool merged = !rows.IsDBNull(5);
             string body = rows.IsDBNull(3) ? rows.GetString(2)
-                : ReadSourceBody(book.Hash,rows.GetInt64(3),rows.GetInt64(4),merged,book.Id,ordinal);
+                : ReadSourceBody(book.Hash,rows.GetInt64(3),rows.GetInt64(4),merged,book.Id,ordinal,token);
             var senses = book.Language == "ja" ? EntryParser.ShinseikiReverseSenses(body,head) : EntryParser.OxfordReverseSenses(body);
             foreach (var (gloss,span,examples,definition) in senses)
             {
@@ -2865,7 +2875,7 @@ internal static class ManagedMdx
     {
         string path = PublishVerified(destinationPath, hash, token, temporary =>
         {
-            if (packedDelivery) MdxReader.RestoreDelivery(inputPath, temporary, hash);
+            if (packedDelivery) MdxReader.RestoreDelivery(inputPath, temporary, hash, token);
             else
             {
                 using var input = File.OpenRead(inputPath);
@@ -2933,36 +2943,41 @@ internal static class ManagedMdx
         public MdxReader.IndexedReader? Reader;
         public int Users;
 
-        public MdxReader.IndexedReader GetReader(Func<byte[]?>? loadDirectory)
+        public MdxReader.IndexedReader GetReader(Func<byte[]?>? loadDirectory, CancellationToken token)
         {
-            lock (this)
+            token.ThrowIfCancellationRequested();
+            while (!Monitor.TryEnter(this, 100)) token.ThrowIfCancellationRequested();
+            try
             {
+                token.ThrowIfCancellationRequested();
                 if (Reader != null) return Reader;
                 // 新索引在读取块时校验其 SHA；旧索引首次打开时校验全书。目录只在缓存缺失时查询一次。
                 var directory = loadDirectory?.Invoke();
-                MdxReader.IndexedReader Open(string path) => directory == null ? MdxReader.OpenRecords(path, hash)
-                    : MdxReader.OpenRecords(path, hash, directory);
+                MdxReader.IndexedReader Open(string path) => directory == null ? MdxReader.OpenRecords(path, hash, token: token)
+                    : MdxReader.OpenRecords(path, hash, directory, token);
                 // 已打开的句柄允许改名。较迟才展开的旧快照在同一卷上原子改名之后可用同一散列读归档。
                 try { return Reader = Open(CheckedSource(Path)); }
                 catch (FileNotFoundException) when (File.Exists(ArchivedPath(Path))) { return Reader = Open(ArchivedPath(Path)); }
                 catch (FileNotFoundException) when (File.Exists(CheckedSource(System.IO.Path.ChangeExtension(Path, ".mdxp"))))
                 {
                     // 独立数据库可以位于只读介质。只缓存它按哈希引用的原书，继续使用当前调用者的 SQLite 索引。
-                    return Reader = Open(CachedDelivery(System.IO.Path.ChangeExtension(Path, ".mdxp"), hash));
+                    return Reader = Open(CachedDelivery(System.IO.Path.ChangeExtension(Path, ".mdxp"), hash, token));
                 }
             }
+            finally { Monitor.Exit(this); }
         }
     }
 
-    private static string CachedDelivery(string payload, string hash)
+    private static string CachedDelivery(string payload, string hash, CancellationToken token)
     {
         string directory = CheckedPath(Path.Combine(CheckedPath(DictionaryStore.PersonalDirectory()), "packed-source-cache"));
         string path = CheckedSource(Path.Combine(directory, hash.ToUpperInvariant() + ".mdx"));
         // 同一进程复用打开的 Reader；并发首读按散列互斥，缓存损坏时用分发件原子修复。
         using var cacheLock = new Mutex(false, "E_Search.PackedSource." + hash.ToUpperInvariant());
-        try { cacheLock.WaitOne(); }
+        token.ThrowIfCancellationRequested();
+        try { while (!cacheLock.WaitOne(100)) token.ThrowIfCancellationRequested(); }
         catch (AbandonedMutexException) { }
-        try { return MaterializeSource(path, payload, hash, CancellationToken.None, packedDelivery: true); }
+        try { return MaterializeSource(path, payload, hash, token, packedDelivery: true); }
         finally { cacheLock.ReleaseMutex(); }
     }
 
@@ -2983,8 +2998,10 @@ internal static class ManagedMdx
         if (node.Value.Users == 0) node.Value.Reader?.Dispose();
     }
 
-    internal static string Body(string databasePath, string hash, long start, long end, Func<byte[]?>? loadDirectory = null, bool exact = false)
+    internal static string Body(string databasePath, string hash, long start, long end, Func<byte[]?>? loadDirectory = null,
+        bool exact = false, CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         string path = SourcePath(databasePath, hash);
         LinkedListNode<OpenSource> node;
         lock (sources)
@@ -2998,8 +3015,8 @@ internal static class ManagedMdx
         try
         {
             // 校验文件、定位及解压都在锁外进行，读者持有租约期间不会关闭其句柄。
-            var reader = node.Value.GetReader(loadDirectory);
-            return exact ? reader.ReadExactBody(start, end, importing: false) : reader.ReadBody(start, end);
+            var reader = node.Value.GetReader(loadDirectory, token);
+            return exact ? reader.ReadExactBody(start, end, importing: false, token) : reader.ReadBody(start, end, token);
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
         {

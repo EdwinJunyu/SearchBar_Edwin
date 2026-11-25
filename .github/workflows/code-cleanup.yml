@@ -1,0 +1,34 @@
+name: Code cleanup verification
+
+on:
+  push:
+    branches: [refactor/code-cleanup]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build CLI and Windows desktop
+        run: dotnet build -c Release
+      - name: Calculator and request context checks
+        run: dotnet run --project tests/RefactorChecks/RefactorChecks.csproj -c Release
+      - name: Reverse search policy checks
+        run: dotnet run --project tests/ReverseSearchChecks/ReverseSearchChecks.csproj -c Release
+      - name: SQLite cancellation checks
+        run: dotnet run --project tests/SqliteCancellationChecks/SqliteCancellationChecks.csproj -c Release
+      - name: Japanese lookup and display rule checks
+        run: dotnet run --project tests/LookupDisplayChecks/LookupDisplayChecks.csproj -c Release
+      - name: Detail cancellation and shared-resource checks
+        run: dotnet run --project tests/DetailTaskChecks/DetailTaskChecks.csproj -c Release
+      - name: Existing regression suite
+        shell: pwsh
+        run: ./regressions.ps1

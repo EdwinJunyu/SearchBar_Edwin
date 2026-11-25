@@ -12,10 +12,11 @@ internal static partial class EntryDetailFormatter
     [GeneratedRegex("""(?<prefix>(?:<a name="es-(?<source>[a-z-]+)-(?<ordinal>[0-9]+)"></a>)+<div class="es-label"><b>)(?<names>[^<>]*)</b>""")]
     private static partial Regex MergedSourceLabel();
 
-    private static string DisplayArticleNames(string body, IReadOnlyDictionary<string,string> aliases)
+    private static string DisplayArticleNames(string body, IReadOnlyDictionary<string,string> aliases, CancellationToken token)
     {
         // 共享正文的小节可列出多个来源。按同一标题前的锚点配对，仅替换显示文字。
         return MergedSourceLabel().Replace(body, match => {
+            token.ThrowIfCancellationRequested();
             var sources = match.Groups["source"].Captures;
             var ordinals = match.Groups["ordinal"].Captures;
             var names = match.Groups["names"].Value.Split(" · ", StringSplitOptions.None);
@@ -27,20 +28,30 @@ internal static partial class EntryDetailFormatter
         });
     }
 
-    internal static byte[] EncodeMergedDocument(string source, string path, IReadOnlyDictionary<string,string>? aliases)
+    internal static byte[] EncodeMergedDocument(string source, string path, IReadOnlyDictionary<string,string>? aliases) =>
+        EncodeMergedDocumentCancellable(source, path, aliases, CancellationToken.None);
+
+    internal static byte[] EncodeMergedDocumentCancellable(string source, string path, IReadOnlyDictionary<string,string>? aliases,
+        CancellationToken token)
     {
-        string body = RewriteMergedLinks(source, path);
+        token.ThrowIfCancellationRequested();
+        string body = RewriteMergedLinksCancellable(source, path, token);
         if (body.Contains("&+{", StringComparison.Ordinal))
             body = SangoMergedHeader().Replace(body, "${section}${line}〔${number}〕");
+        token.ThrowIfCancellationRequested();
         // 原书版式和链接处理完成后再呈现自定义名称，名称不会参与词条解析。
-        if (aliases is { Count: > 0 }) body = DisplayArticleNames(body, aliases);
+        if (aliases is { Count: > 0 }) body = DisplayArticleNames(body, aliases, token);
+        token.ThrowIfCancellationRequested();
         // 现代汉英的 CK 模板引用了缺失的样式表。用低优先级样式恢复义项和双语例句的分行。
         string html = """<!doctype html><html lang="zh"><meta charset="utf-8"><base href="https://dictionary.invalid/"><style>body{font:15px/1.55 "Segoe UI","Yu Gothic UI",sans-serif;margin:4px 8px;color:#172c39;overflow-wrap:anywhere}.es-source+.es-source{margin-top:14px}.es-label{font-size:12px;color:#24646b;margin:0 0 5px}:where(.es-hanying .CK) :where(span.JS,span.JX,span.LY,span.LS,span.section_title,span.DX){display:block}</style><body>"""
             + body + "</body></html>";
         // 相对资源从站点根目录加载；页内跳转须保留当前文章的路径。
         if (body.Contains("href=\"#", StringComparison.OrdinalIgnoreCase) || body.Contains("href='#", StringComparison.OrdinalIgnoreCase))
             html = html.Replace("<base href=\"https://dictionary.invalid/\">", "", StringComparison.Ordinal);
-        return Encoding.UTF8.GetBytes(html);
+        token.ThrowIfCancellationRequested();
+        byte[] document = Encoding.UTF8.GetBytes(html);
+        token.ThrowIfCancellationRequested();
+        return document;
     }
 
     // 三合一的同形条目在首行词头后编码序号。只认物理条目起点或同一编号的合并来源标题。
@@ -60,8 +71,9 @@ internal static partial class EntryDetailFormatter
     [GeneratedRegex(ShogakukanEmptyExample + """(?=\r?\n(?<second>[^<>\s]+)  \r?\n<br>(?<reading>[^<>\s]+)<font color=red>【\k<second>】</font>)""")]
     private static partial Regex ShogakukanJoinedHeading();
 
-    private static string SeparateShogakukanArticles(string html, string? original = null, int offset = 0)
+    private static string SeparateShogakukanArticles(string html, string? original = null, int offset = 0, CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         if (!html.Contains(ShogakukanEmptyExample, StringComparison.Ordinal)) return html;
         original ??= html;
         var visible = EntryParser.VisibleMarkupPositions(original);
@@ -69,6 +81,7 @@ internal static partial class EntryDetailFormatter
         {
             while (before > 0)
             {
+                token.ThrowIfCancellationRequested();
                 int pos = original.AsSpan(0, before).LastIndexOf(prefix, StringComparison.Ordinal);
                 if (pos < 0 || visible[pos]) return pos;
                 before = pos;
@@ -78,6 +91,7 @@ internal static partial class EntryDetailFormatter
         // 以真正相邻的可见红色词头为准；同形的隐藏例句、属性或注释不能开启或切断词条。
         return ShogakukanJoinedHeading().Replace(html, match =>
         {
+            token.ThrowIfCancellationRequested();
             int pos = offset + match.Index;
             if (!visible[pos] || !EntryParser.ShogakukanJoinedHeads.TryGetValue(match.Groups["second"].Value, out var previous)
                 || match.Groups["reading"].Value != previous.Reading) return match.Value;
@@ -93,8 +107,13 @@ internal static partial class EntryDetailFormatter
         });
     }
 
-    internal static string RewriteMergedLinks(string html, string documentPath)
+    internal static string RewriteMergedLinks(string html, string documentPath) =>
+        RewriteMergedLinksCancellable(html, documentPath, CancellationToken.None);
+
+    internal static string RewriteMergedLinksCancellable(string html, string documentPath, CancellationToken token)
     {
+        // Regex/原书解析器的单次同步调用不能中断；在每个来源分区及转换阶段检查取消。
+        token.ThrowIfCancellationRequested();
         // 旧合并页已保存实际链接目标；恢复损坏的开标签，使浏览器只创建一个链接。
         // 只有来源和绿色标签残片都能与可见标签对上，才能确认多出来的文字属于原 href。
         if (html.Contains("\"#008000\">", StringComparison.Ordinal) || html.Contains("FONT-FAMILY: <FONT", StringComparison.Ordinal)
@@ -112,22 +131,27 @@ internal static partial class EntryDetailFormatter
             for (int pos = html.IndexOf(boundary, StringComparison.Ordinal); pos >= 0;
                  pos = html.IndexOf(boundary, pos + boundary.Length, StringComparison.Ordinal))
             {
+                token.ThrowIfCancellationRequested();
                 if (!visible[pos]) continue;
                 sections.Add(html[from..pos]);
                 from = pos + boundary.Length;
             }
             sections.Add(html[from..]);
             for (int i = 1; i < sections.Count; i++)
+            {
+                token.ThrowIfCancellationRequested();
                 if (sections[i].StartsWith("es-shogakukan-zhja\"><a name=\"es-shogakukan-zhja-", StringComparison.Ordinal))
-                    sections[i] = SeparateShogakukanArticles(sections[i]);
+                    sections[i] = SeparateShogakukanArticles(sections[i], token: token);
                 else if (sections[i].StartsWith("es-shinseiki\"><a name=\"es-shinseiki-", StringComparison.Ordinal))
                 {
                     sections[i] = EntryParser.RestoreShinseikiQuestionMarkup(sections[i]);
+                    token.ThrowIfCancellationRequested();
                     sections[i] = EntryParser.NormalizeShinseikiFormulas(sections[i]);
                 }
                 else if (sections[i].StartsWith("es-sanseido\">", StringComparison.Ordinal))
                     sections[i] = SanseidoMergedLink().Replace(sections[i], m =>
                     {
+                        token.ThrowIfCancellationRequested();
                         string label = m.Groups["label"].Value;
                         string tail = "<font color=\"#008000\">" + m.Groups["tail"].Value;
                         if (!label.EndsWith(tail, StringComparison.Ordinal)) return m.Value;
@@ -138,6 +162,7 @@ internal static partial class EntryDetailFormatter
                     sections[i] = NormalizeOxfordDisplayMarkup(sections[i]);
                     sections[i] = OxfordMergedLink().Replace(sections[i], m =>
                     {
+                        token.ThrowIfCancellationRequested();
                         // 合并器已将截断的 href 前缀替换为 SHA-256。可见标签必须同时匹配摘要和属性尾部。
                         string label = m.Groups["label"].Value;
                         int quote = label.IndexOf("\"font-weight:", StringComparison.Ordinal);
@@ -145,13 +170,19 @@ internal static partial class EntryDetailFormatter
                         return RestoreHashedLink(m, label[..quote]);
                     });
                 }
+            }
+            token.ThrowIfCancellationRequested();
             html = string.Join(boundary, sections);
         }
         // 三类跨词条链接共享当前文档的版本前缀，包括按 SearchBar_Edwin 原书索引补充的落点。
         string body = Regex.Replace(html, @"(?i)(\bhref\s*=\s*[""'])entry://(?=es(?:ref|appref|missing)-)",
             "$1" + documentPath + "/lookup/");
+        token.ThrowIfCancellationRequested();
         body = Regex.Replace(body, @"(?i)(\bhref\s*=\s*[""'])sound://(?:/)?(?=es/)", "$1" + documentPath + "/sound/");
-        return Regex.Replace(body, @"(?i)(\bhref\s*=\s*[""'])entry://#", "$1#");
+        token.ThrowIfCancellationRequested();
+        body = Regex.Replace(body, @"(?i)(\bhref\s*=\s*[""'])entry://#", "$1#");
+        token.ThrowIfCancellationRequested();
+        return body;
     }
 
     private static string RestoreHashedLink(Match link, string originalPrefix)
@@ -193,8 +224,12 @@ internal static partial class EntryDetailFormatter
 
     internal const string SelectedPhraseId = "es-selected-phrase";
 
-    internal static MergedArticle? HighlightMergedPhrase(MergedArticle article, LookupEntry hit, string raw)
+    internal static MergedArticle? HighlightMergedPhrase(MergedArticle article, LookupEntry hit, string raw) =>
+        HighlightMergedPhraseCancellable(article, hit, raw, CancellationToken.None);
+
+    internal static MergedArticle? HighlightMergedPhraseCancellable(MergedArticle article, LookupEntry hit, string raw, CancellationToken token)
     {
+        token.ThrowIfCancellationRequested();
         // 合并器会改写原书链接和标签位置。先按来源与物理序号限定小节，再按同标题义项的原书顺序映射。
         const string sectionTag = "<div class=\"es-source es-";
         string sectionStart = $"{sectionTag}{hit.DictionaryId}\"><a name=\"es-{hit.DictionaryId}-{hit.EntryId}\"></a>";
@@ -205,10 +240,18 @@ internal static partial class EntryDetailFormatter
         int start = section + sectionStart.Length;
         int end = html.IndexOf(sectionTag, start, StringComparison.Ordinal);
         var parent = hit.Headword[..separator];
-        var from = EntryParser.OxfordPhrasalSenses(raw, parent).Where(p => p.Headword == hit.Headword).ToArray();
+        var from = EntryParser.OxfordPhrasalSenses(raw, parent).Where(p => {
+            token.ThrowIfCancellationRequested();
+            return p.Headword == hit.Headword;
+        }).ToArray();
+        token.ThrowIfCancellationRequested();
         string sectionBody = html[start..(end < 0 ? html.Length : end)];
         var to = EntryParser.OxfordPhrasalSenses(sectionBody, parent)
-            .Where(p => p.Headword == hit.Headword).ToArray();
+            .Where(p => {
+                token.ThrowIfCancellationRequested();
+                return p.Headword == hit.Headword;
+            }).ToArray();
+        token.ThrowIfCancellationRequested();
         int index = Array.FindIndex(from, p => p.Anchor == hit.Anchor);
         if (index < 0 || !from.Select(p => (EntryParser.OxfordPrintedPhraseTitle(raw[p.Anchor.Title]), p.Gloss))
                 .SequenceEqual(to.Select(p => (EntryParser.OxfordPrintedPhraseTitle(sectionBody[p.Anchor.Title]), p.Gloss)))) return null;
@@ -220,6 +263,7 @@ internal static partial class EntryDetailFormatter
             .Append(html, title, titleEnd - title).Append("</mark>").Append(html, titleEnd, sense - titleEnd)
             .Append("<mark data-es-sense>").Append(html, sense, senseEnd - sense).Append("</mark>")
             .Append(html, senseEnd, html.Length - senseEnd);
+        token.ThrowIfCancellationRequested();
         return article with { Html = marked.ToString() };
     }
 
@@ -231,23 +275,31 @@ internal static partial class EntryDetailFormatter
     [GeneratedRegex("""(?:(?<image>""" + ShinseikiTornImage + """)|""" + ShinseikiTornStructure + """)(?=</(?:div|span|p|li|strong)>)""")]
     private static partial Regex ShinseikiTruncatedToken();
 
-    internal static DetailBody FormatDetail(string raw, EntryAnchor? anchor, string sourceId)
+    internal static DetailBody FormatDetail(string raw, EntryAnchor? anchor, string sourceId) =>
+        FormatDetailCancellable(raw, anchor, sourceId, CancellationToken.None);
+
+    internal static DetailBody FormatDetailCancellable(string raw, EntryAnchor? anchor, string sourceId, CancellationToken token)
     {
+        token.ThrowIfCancellationRequested();
         if (sourceId == "shinseiki") raw = EntryParser.RestoreShinseikiQuestionMarkup(raw);
+        token.ThrowIfCancellationRequested();
         bool hanyingCk = sourceId == "hanying" && raw.Contains("<span class=\"CK\">", StringComparison.Ordinal);
         // 坐标分界均在完整标签之间，先分段解码再映射。实体、嵌套标签和重复文字都不靠文本搜索定位。
         string Decode(string html, int rawOffset = 0)
         {
+            token.ThrowIfCancellationRequested();
             if (hanyingCk) html = HanyingBlockStart().Replace(html, "\n");
             if (sourceId == "sango" && html.Contains("&+{", StringComparison.Ordinal))
                 html = SangoHeader().Replace(html, "${line}〔${number}〕");
             if (sourceId == "sanseido") html = EntryParser.SanseidoLinkText(EntryParser.DecodePrintedScripts(html, sourceId));
+            token.ThrowIfCancellationRequested();
             if (sourceId == "shogakukan-zhja" && html.Contains(ShogakukanEmptyExample, StringComparison.Ordinal))
-                html = SeparateShogakukanArticles(html, raw, rawOffset);
+                html = SeparateShogakukanArticles(html, raw, rawOffset, token);
             // 新世纪以空 HTML 注释隔开标题等字段。先去掉模板标记，实体转义的字面示例仍会保留。
             if (sourceId == "shinseiki")
             {
                 html = EntryParser.DecodePrintedScripts(EntryParser.NormalizeShinseikiFormulas(html, raw, rawOffset), sourceId);
+                token.ThrowIfCancellationRequested();
                 html = ShinseikiTruncatedToken().Replace(html, match =>
                     match.Groups["image"].Success ? "[原书图片标签截断]" : "");
                 html = html.Replace("<!-- -->", "", StringComparison.Ordinal);
@@ -258,21 +310,28 @@ internal static partial class EntryDetailFormatter
                     html = ShinseikiExampleSource().Replace(html, "$0\n");
                 html = Regex.Replace(html, @"</h[1-6]\s*>", "\n", RegexOptions.IgnoreCase);
             }
+            token.ThrowIfCancellationRequested();
             if (sourceId == "oxford")
             {
                 html = EntryParser.DecodePrintedScripts(NormalizeOxfordDisplayMarkup(html), sourceId);
+                token.ThrowIfCancellationRequested();
                 if (html.Contains("<a href=\"entry://", StringComparison.Ordinal))
                     html = OxfordCopiedLink().Replace(html, "${label}");
                 html = EntryParser.DecodeOxfordFont(html);
                 // 牛津以蓝色横线分开词头、读音栏和分节；去掉标签前先保留行界。
                 html = html.Replace("<hr color=blue noshade>", "\n", StringComparison.Ordinal);
             }
+            token.ThrowIfCancellationRequested();
             var lines = Regex.Replace(html, @"<(?:br\b[^>]*|/p\s*|/div\s*|/li\s*|/tr\s*)>", "\n", RegexOptions.IgnoreCase);
-            return EntryParser.DisplayText(sourceId, WebUtility.HtmlDecode(Regex.Replace(lines, @"</?[a-zA-Z][^>]*>", "")));
+            token.ThrowIfCancellationRequested();
+            string displayed = EntryParser.DisplayText(sourceId, WebUtility.HtmlDecode(Regex.Replace(lines, @"</?[a-zA-Z][^>]*>", "")));
+            token.ThrowIfCancellationRequested();
+            return displayed;
         }
         if (anchor == null)
         {
             var lines = Decode(raw).Split(['\r','\n'], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            token.ThrowIfCancellationRequested();
             return new(string.Join(Environment.NewLine, lines), null);
         }
 
@@ -282,6 +341,7 @@ internal static partial class EntryDetailFormatter
         int previous = 0;
         for (int i = 0; i < offsets.Length; i++)
         {
+            token.ThrowIfCancellationRequested();
             decoded.Append(Decode(raw[previous..rawOffsets[i]], previous));
             offsets[i] = decoded.Length;
             previous = rawOffsets[i];
@@ -293,6 +353,7 @@ internal static partial class EntryDetailFormatter
         int mapped = 0;
         foreach (Match line in Regex.Matches(decoded.ToString(), @"[^\r\n]+"))
         {
+            token.ThrowIfCancellationRequested();
             var trimmed = line.ValueSpan.Trim();
             if (trimmed.IsEmpty) continue;
             int start = line.Index + line.Length - line.ValueSpan.TrimStart().Length;
@@ -305,6 +366,7 @@ internal static partial class EntryDetailFormatter
             text.Append(trimmed);
         }
         while (mapped < offsets.Length) offsets[mapped++] = text.Length;
+        token.ThrowIfCancellationRequested();
         return new(text.ToString(), new EntryAnchor(offsets[0]..offsets[1], offsets[2]..offsets[3]));
     }
 

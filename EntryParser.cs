@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Globalization;
 using System.Net;
 using System.Text;
@@ -211,19 +212,19 @@ internal static partial class EntryParser
         ]
     };
 
+    // 快速筛选直接取自规则左侧；新增修复无需再维护另一份触发字符表。
+    private static readonly Dictionary<string, SearchValues<string>> DisplayTriggers = DisplayRules.ToDictionary(
+        pair => pair.Key, pair => SearchValues.Create(pair.Value.Select(rule => rule.Before).ToArray(), StringComparison.Ordinal),
+        StringComparer.Ordinal);
+
     internal static (string Before, string After)[] DisplayReplacements(string sourceId) =>
         DisplayRules.TryGetValue(sourceId, out var rules) ? rules : [];
 
     internal static string DisplayText(string sourceId, string value)
     {
-        // 普通文本占绝大多数；只在出现该书已核对的标记时遍历规则。
-        if (!value.AsSpan().ContainsAnyInRange('\uE000','\uF8FF')
-            && !(sourceId == "hanying" && value.AsSpan().ContainsAny('ⁱ','\u2072','\u2073'))
-            && !(sourceId == "sango" && value.Contains('?'))
-            && !(sourceId == "oxford" && value.Contains('&'))
-            && !(sourceId == "shogakukan" && value.Contains("\">", StringComparison.Ordinal))
-            && !(sourceId == "shinseiki" && value.AsSpan().ContainsAny('?','鲉'))
-            && !(sourceId == "eijiro" && value.Contains('　'))) return value;
+        // 普通文本只扫描一次。筛选仅决定是否进入替换，不能预先删掉尚未命中的规则：
+        // 前一条的输出可能成为后一条的输入，仍须按原表顺序逐次替换。
+        if (!DisplayTriggers.TryGetValue(sourceId, out var triggers) || !value.AsSpan().ContainsAny(triggers)) return value;
         foreach (var (before, after) in DisplayReplacements(sourceId))
             value = value.Replace(before, after, StringComparison.Ordinal);
         return value;

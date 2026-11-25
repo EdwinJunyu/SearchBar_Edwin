@@ -65,6 +65,8 @@ public partial class SearchWindow : Window
     private bool reverseModelReady, useReverseModel = true;
     private string CurrentModelDirectory => selectedReverseDirectory ?? ReverseEncoder.ModelDirectory;
     private CancellationTokenSource? pendingPreview;
+    private CancellationTokenSource? pendingDetail;
+    private readonly LastResourceTaskCache<Dictionary<string, byte[]>> mergedResourceTasks = new(LoadMergedResources);
     private readonly Stack<(MergedArticle Page, string Fragment)> mergedHistory = new();
     private (MergedArticle Page, string Fragment)? mergedCurrent;
     private Task<Exception?>? mergedBrowserReady;
@@ -1087,46 +1089,22 @@ public partial class SearchWindow : Window
             {
                 using var store = new DictionaryStore(databasePath, readOnly: true);
                 if (!reverse) return store.Search(text, only, token);
-                if (ReverseEncoder.CanOpen(folder))
-                {
-                    try
+                var result = ReverseSearchService.Search(store, description, only, targetLanguage, token,
+                    folder, semanticRequested, beforeModelLoad: automatic ? null : () =>
                     {
-                        var encoder = ReverseEncoder.Open(folder);
-                        modelReady = store.HasPreparedReverseLanguage(only, encoder, ReverseEncoder.CacheDirectory, token, targetLanguage);
-                        if (modelReady && semanticRequested)
+                        // 服务只报告模型即将初始化；窗口负责检查请求并更新可操作的状态。
+                        Dispatcher.Invoke(() =>
                         {
-                            if (!automatic && !encoder.IsSessionReady)
-                            {
-                                // 本机推理环境初始化可能持续数秒。先在当前请求发布可操作的状态，再进入原生调用。
-                                Dispatcher.Invoke(() =>
-                                {
-                                    if (!IsCatalogCurrent(context)
-                                        || only != dictionaryId || folder != CurrentModelDirectory || !useReverseModel || preparingReverse != null) return;
-                                    reverseModelReady = true;
-                                    UpdateReverseModelButton();
-                                    SetStatus("正在载入本地语义模型…");
-                                }, DispatcherPriority.Normal, token);
-                                token.ThrowIfCancellationRequested();
-                            }
-                            var hits = store.ReverseByLanguage(description, only, targetLanguage, token, encoder, ReverseEncoder.CacheDirectory);
-                            // 部分来源可能只有词语索引。只有读后复验也没有可用模型索引，才提示重新准备。
-                            if (hits.Count > 0 && !hits.Any(h => h.UsedSemanticIndex)
-                                && !store.HasPreparedReverseLanguage(only, encoder, ReverseEncoder.CacheDirectory, token, targetLanguage))
-                            {
-                                modelReady = false;
-                                modelError = "语义索引未通过校验，可重新准备。";
-                            }
-                            return hits;
-                        }
-                    }
-                    catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException
-                        or Microsoft.ML.OnnxRuntime.OnnxRuntimeException or TypeInitializationException or DllNotFoundException)
-                    {
-                        modelReady = false;
-                        modelError = ex.GetBaseException().Message;
-                    }
-                }
-                return store.ReverseByLanguage(description, only, targetLanguage, token);
+                            if (!IsCatalogCurrent(context)
+                                || only != dictionaryId || folder != CurrentModelDirectory || !useReverseModel || preparingReverse != null) return;
+                            reverseModelReady = true;
+                            UpdateReverseModelButton();
+                            SetStatus("正在载入本地语义模型…");
+                        }, DispatcherPriority.Normal, token);
+                    });
+                modelReady = result.ModelReady;
+                modelError = result.ModelError;
+                return result.Hits;
             }, token);
             if (!IsCatalogCurrent(context)) return;
             if (automatic)
@@ -1378,6 +1356,8 @@ public partial class SearchWindow : Window
     private void CloseDetails()
     {
         detailRevision++;
+        pendingDetail?.Cancel();
+        mergedResourceTasks.Reset();
         mergedCurrent = null;
         mergedHistory.Clear();
         mergedDocumentPath = null;
@@ -1599,46 +1579,76 @@ public partial class SearchWindow : Window
     private async Task FollowMergedLink(string key, string fragment)
     {
         if (mergedCurrent is not { } current || !MergedDetail.IsHitTestVisible) return;
+        using var operation = BeginDetailOperation();
+        var token = operation.Token;
         long request = ++detailRevision;
         try
         {
             var next = await Task.Run(() => {
                 using var store = new DictionaryStore(databasePath, readOnly: true);
-                return store.MergedArticleByKey(current.Page.Group, key, current.Page.Revision);
-            });
+                return store.MergedArticleByKey(current.Page.Group, key, current.Page.Revision, token);
+            }, token);
+            token.ThrowIfCancellationRequested();
             if (request != detailRevision || !DetailsPanel.IsVisible) return;
             if (next == null) { SetStatus("原书中未找到该跳转的目标。"); return; }
             await DisplayMerged(next, fragment, request, () => mergedHistory.Push(current));
         }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) { if (request == detailRevision && DetailsPanel.IsVisible) SetStatus("词条跳转失败：" + ex.Message); }
+        finally { if (ReferenceEquals(pendingDetail, operation)) pendingDetail = null; }
     }
 
     private async void MergedBackClick(object sender, RoutedEventArgs args)
     {
         if (!MergedDetail.IsHitTestVisible || !mergedHistory.TryPeek(out var previous)) return;
+        using var operation = BeginDetailOperation();
+        var token = operation.Token;
         long request = ++detailRevision;
         try { await DisplayMerged(previous.Page, previous.Fragment, request, () => mergedHistory.Pop()); }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) { if (request == detailRevision && DetailsPanel.IsVisible) SetStatus("无法返回词条：" + ex.Message); }
+        finally { if (ReferenceEquals(pendingDetail, operation)) pendingDetail = null; }
     }
 
-    private async Task DisplayMerged(MergedArticle article, string fragment, long request, Action? commitHistory = null,
-        Task<Exception?>? browserReady = null)
+    private Task DisplayMerged(MergedArticle article, string fragment, long request, Action? commitHistory = null,
+        Task<Exception?>? browserReady = null) =>
+        DisplayMergedCancellable(article, fragment, request, pendingDetail?.Token ?? CancellationToken.None, commitHistory, browserReady);
+
+    private static Dictionary<string, byte[]> LoadMergedResources(string path, CancellationToken token)
     {
+        var assets = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        foreach (var asset in MdxReader.ReadResources(path, token))
+        {
+            token.ThrowIfCancellationRequested();
+            assets.Add(asset.Key, asset.Data.ToArray());
+        }
+        token.ThrowIfCancellationRequested();
+        return assets;
+    }
+
+    private async Task DisplayMergedCancellable(MergedArticle article, string fragment, long request, CancellationToken token,
+        Action? commitHistory, Task<Exception?>? browserReady)
+    {
+        token.ThrowIfCancellationRequested();
         if (request != detailRevision || !DetailsPanel.IsVisible) return;
         // 资源读取与浏览器启动可以并行。切卷时只把当前请求的资源发布给虚拟来源。
         var ready = browserReady ?? PrepareRichView(request);
-        var assets = mergedAssets;
-        if (!string.Equals(mergedResourcePath, article.ResourceArchive, StringComparison.Ordinal))
+        Dictionary<string, byte[]> assets;
+        if (article.ResourceArchive == null)
         {
-            assets = await Task.Run(() => article.ResourceArchive is null ? new Dictionary<string, byte[]>(StringComparer.Ordinal)
-                : MdxReader.ReadResources(article.ResourceArchive).ToDictionary(a => a.Key, a => a.Data.ToArray(), StringComparer.Ordinal));
-            if (request != detailRevision || !DetailsPanel.IsVisible) return;
+            mergedResourceTasks.Reset();
+            assets = new(StringComparer.Ordinal);
         }
+        // 候选切换仅取消当前等待，同一 MDD 的加载继续复用；换资源卷或关闭详情时取消共享加载。
+        else assets = await mergedResourceTasks.GetAsync(article.ResourceArchive, token);
+        token.ThrowIfCancellationRequested();
+        if (request != detailRevision || !DetailsPanel.IsVisible) return;
         MarkDetail(request, "assets-ready");
         string path = "/page-" + request;
         // 大页的链接重写和 UTF-8 编码不占用窗口线程，用户仍可阅读、关闭或切换。
-        var document = await Task.Run(() => EncodeMergedDocument(article.Html, path, article.SourceNames));
-        var failure = await ready;
+        var document = await Task.Run(() => EncodeMergedDocumentCancellable(article.Html, path, article.SourceNames, token), token);
+        var failure = await ready.WaitAsync(token);
+        token.ThrowIfCancellationRequested();
         if (request != detailRevision || !DetailsPanel.IsVisible) return;
         if (failure != null) throw new InvalidOperationException(failure.Message, failure);
         var browser = mergedWeb!.CoreWebView2;
@@ -1652,7 +1662,8 @@ public partial class SearchWindow : Window
             MergedDetail.IsHitTestVisible = false;
             browser.Navigate(DictionaryOrigin + path + fragment);
             MarkDetail(request, "navigate");
-            await WaitForMergedFrame(browser, path, request);
+            await WaitForMergedFrame(browser, path, request, token);
+            token.ThrowIfCancellationRequested();
             if (request != detailRevision || !DetailsPanel.IsVisible) return;
             commitHistory?.Invoke();
             mergedCurrent = (article, fragment);
@@ -1681,7 +1692,7 @@ public partial class SearchWindow : Window
             .Where(source => source.Id == "oxford" || source.Pairs.Length > 0).ToDictionary(source => source.Id,
                 source => source.Pairs.Select(pair => new[] { pair.Before, pair.After }))));
 
-    private async Task WaitForMergedFrame(CoreWebView2 browser, string path, long request)
+    private async Task WaitForMergedFrame(CoreWebView2 browser, string path, long request, CancellationToken token)
     {
         // 浏览器完成 HTML 解析后才有所有来源分区；只在当前页已绘制、即将交给用户时处理一次。
         string probe = $$"""
@@ -1744,9 +1755,10 @@ public partial class SearchWindow : Window
         var elapsed = Stopwatch.StartNew();
         while (request == detailRevision && DetailsPanel.IsVisible)
         {
-            if (await browser.ExecuteScriptAsync(probe) == "true") return;
+            token.ThrowIfCancellationRequested();
+            if (await browser.ExecuteScriptAsync(probe).WaitAsync(token) == "true") return;
             if (elapsed.Elapsed > TimeSpan.FromSeconds(30)) throw new TimeoutException("词书页面未能完成绘制。");
-            await Task.Delay(16);
+            await Task.Delay(16, token);
         }
     }
 
@@ -1776,10 +1788,24 @@ public partial class SearchWindow : Window
         if (!bounds.IsEmpty) DetailScroll.ScrollToVerticalOffset(Math.Max(0, bounds.Top - 4));
     }
 
+    private CancellationTokenSource BeginDetailOperation()
+    {
+        // 请求拥有并在 finally 后释放自己的 CTS；切换只取消，避免后台还在注册 token 时被 Dispose。
+        pendingDetail?.Cancel();
+        return pendingDetail = new CancellationTokenSource();
+    }
+
     private async Task ShowEntryAsync()
     {
-        if (CandidatePicker.SelectedItem is not Candidate chosen) return;
+        using var operation = BeginDetailOperation();
+        var token = operation.Token;
         long request = ++detailRevision;
+        if (CandidatePicker.SelectedItem is not Candidate chosen)
+        {
+            pendingDetail = null;
+            mergedResourceTasks.Reset();
+            return;
+        }
         MarkDetail(request, "click");
         mergedHistory.Clear();
         mergedCurrent = null;
@@ -1801,14 +1827,15 @@ public partial class SearchWindow : Window
             var full = await Task.Run(() =>
             {
                 using var store = new DictionaryStore(databasePath, readOnly: true);
-                var raw = store.CurrentBody(chosen.Hit.Entry);
+                var raw = store.CurrentBody(chosen.Hit.Entry, token);
+                token.ThrowIfCancellationRequested();
                 MarkDetail(request, "source");
                 if (raw == null) return (Found: false, Merged: (MergedArticle?)null, Preferred: (string?)null, LayoutError: (string?)null);
-                var body = FormatDetail(raw, chosen.Hit.Entry.Anchor, chosen.Hit.Entry.DisplaySourceId);
+                var body = FormatDetailCancellable(raw, chosen.Hit.Entry.Anchor, chosen.Hit.Entry.DisplaySourceId, token);
                 MarkDetail(request, "formatted");
                 Dispatcher.InvokeAsync(() =>
                 {
-                    if (request != detailRevision || !DetailsPanel.IsVisible) return;
+                    if (token.IsCancellationRequested || request != detailRevision || !DetailsPanel.IsVisible) return;
                     DisplayDetail(body);
                     ObserveTextFrame(request);
                 });
@@ -1817,28 +1844,36 @@ public partial class SearchWindow : Window
                 // 来源原文已经读到；伴随资源的位置或权限出错时仍可展示这一来源。
                 try
                 {
-                    if (!sourceSense) merged = store.MergedArticleFor(chosen.Hit.Entry);
+                    token.ThrowIfCancellationRequested();
+                    if (!sourceSense) merged = store.MergedArticleFor(chosen.Hit.Entry, token);
                     // 旧版或自制合并页缺少可核对的小节时，保留已经定位的来源原文。
                     if (merged != null && chosen.Hit.Entry.Anchor != null)
-                        merged = HighlightMergedPhrase(merged, chosen.Hit.Entry, raw);
+                        merged = HighlightMergedPhraseCancellable(merged, chosen.Hit.Entry, raw, token);
                 }
                 catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException) { error = ex.Message; }
                 MarkDetail(request, "merged");
+                token.ThrowIfCancellationRequested();
                 return (Found: true, Merged: merged,
-                    Preferred: reading == null ? null : store.ReadReadingPreference(reading), LayoutError: error);
-            });
+                    Preferred: reading == null ? null : store.ReadReadingPreference(reading, token), LayoutError: error);
+            }, token);
+            token.ThrowIfCancellationRequested();
             if (request != detailRevision || !DetailsPanel.IsVisible) return;
             if (!full.Found)
             {
                 RefreshDictionary();
                 return;
             }
-            if (full.Merged == null) MergedDetail.Visibility = Visibility.Collapsed;
+            if (full.Merged == null)
+            {
+                mergedResourceTasks.Reset();
+                MergedDetail.Visibility = Visibility.Collapsed;
+            }
             if (full.LayoutError != null) SetStatus("无法显示词书排版，已显示本来源原文。" + full.LayoutError);
             if (full.Merged != null)
             {
                 var fragment = chosen.Hit.Entry.Anchor == null ? "" : "#" + SelectedPhraseId;
                 try { await DisplayMerged(full.Merged, fragment, request, browserReady: browserReady); }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { return; }
                 catch (Exception ex)
                 {
                     if (request != detailRevision) return;
@@ -1857,10 +1892,12 @@ public partial class SearchWindow : Window
                 ReadingPreferencePanel.Visibility = Visibility.Visible;
             }
         }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or InvalidDataException or InvalidOperationException or UnauthorizedAccessException)
         {
             if (request == detailRevision && DetailsPanel.IsVisible) EntryText.Text = "正文读取失败：" + ex.Message;
         }
+        finally { if (ReferenceEquals(pendingDetail, operation)) pendingDetail = null; }
     }
 
     private void SetStatus(string text)
@@ -1885,6 +1922,8 @@ public partial class SearchWindow : Window
         ReleasePendingHotkey();
         revision++;
         detailRevision++;
+        pendingDetail?.Cancel();
+        mergedResourceTasks.Dispose();
         pendingPreview?.Cancel();
         mergedWeb?.Dispose();
         pendingFileRank?.Cancel();

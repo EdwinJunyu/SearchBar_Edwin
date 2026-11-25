@@ -468,19 +468,12 @@ try
                 break;
             }
             IReadOnlyList<LookupHit> hits;
-            if (args[0] == "reverse" && ReverseEncoder.CanOpen(ReverseEncoder.ModelDirectory))
+            if (args[0] == "reverse")
             {
-                try
-                {
-                    hits = store.ReverseByLanguage(args[1], only, null, CancellationToken.None, ReverseEncoder.Open(ReverseEncoder.ModelDirectory),
-                        ReverseEncoder.CacheDirectory);
-                }
-                catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException
-                    or Microsoft.ML.OnnxRuntime.OnnxRuntimeException or TypeInitializationException or DllNotFoundException)
-                {
-                    Console.Error.WriteLine("已改用原书词语匹配：" + ex.GetBaseException().Message);
-                    hits = store.ReverseLookup(args[1], only, CancellationToken.None);
-                }
+                var result = ReverseSearchService.Search(store, args[1], only, null, CancellationToken.None,
+                    ReverseEncoder.ModelDirectory, semanticRequested: true, requirePreparedIndex: false);
+                hits = result.Hits;
+                if (result.ModelError != null) Console.Error.WriteLine("已改用原书词语匹配：" + result.ModelError);
             }
             else hits = args[0] == "query" ? store.Search(args[1], only) : store.ReverseLookup(args[1], only, CancellationToken.None);
             foreach(var hit in hits)

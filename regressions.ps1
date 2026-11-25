@@ -4377,6 +4377,20 @@ function Test-ShinseikiTruncatedDetail([Reflection.Assembly]$Assembly) {
 
 function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
     $flags = [Reflection.BindingFlags]'Static,NonPublic'
+    $parser = $Assembly.GetType('EntryParser',$true)
+    $display = $parser.GetMethod('DisplayText',$flags)
+    $tables = $parser.GetField('DisplayRules',$flags).GetValue($null)
+    foreach ($table in $tables.GetEnumerator()) {
+        foreach ($rule in $table.Value) {
+            $inputText = 'plain|' + $rule.Item1 + '|plain'
+            $expected = $inputText
+            foreach ($replacement in $table.Value) {
+                $expected = $expected.Replace($replacement.Item1,$replacement.Item2,[StringComparison]::Ordinal)
+            }
+            Assert-Equal ($display.Invoke($null,@($table.Key,$inputText))) $expected '规则表中的每条规则均能通过快速筛选且保持替换顺序'
+        }
+        Assert-Equal ($display.Invoke($null,@($table.Key,'ordinary text 123'))) 'ordinary text 123' '普通文本保持原值'
+    }
     $format = [Lookup].GetMethod('Format',$flags)
     $detail = $Assembly.GetType('ESearch.EntryDetailFormatter').GetMethod('FormatDetail',$flags)
     # 样例来自实际词头和正文；同时覆盖同码异书、正常标点和原始索引身份。
@@ -5207,6 +5221,13 @@ function Test-JapaneseAuxiliaries([string]$Scratch) {
         Assert-Equal (($oldPhrase[0] -split "`t")[1..2] -join '|') 'phrase|勉強した' '已有片段查词结果优先于新增的整词回退'
         $sentence = @(Invoke-Search @('query','本を読んでいませんでした。','shogakukan'))
         Assert-Equal (($sentence[0] -split "`t")[2]) '読んでいませんでした' '句中完整活用片段优先于较短的て形'
+        foreach ($pair in @(@('明日は来たい。','来たい → 来る'), @('本を読みたい。','読みたい → 読む'))) {
+            $wish = @(Invoke-Search @('query',$pair[0],'shogakukan'))
+            Assert-Equal (($wish -join '|').Contains($pair[1])) $true '句内愿望形与整词查询共用原形候选'
+        }
+        $wishReading = @(Invoke-Search @('query','服をきたい。','shogakukan')) -join '|'
+        Assert-Equal ($wishReading.Contains('→ 着る')) $true '句内假名愿望形保留一段动词'
+        Assert-Equal ($wishReading.Contains('→ 切る') -or $wishReading.Contains('→ 繰る')) $false '句内候选同样验证动词类别'
         $spoken = @(Invoke-Search @('query','本を読んじゃった。','shogakukan'))
         Assert-Equal ($spoken[0].Contains('読んじゃった → 読む')) $true '句中还原完整口语片段并保留原文'
         $plainSentence = @(Invoke-Search @('query','ご飯を食べました。','shogakukan'))
