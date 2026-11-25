@@ -9,10 +9,9 @@ from itertools import groupby
 from pathlib import Path
 import posixpath
 import re
-import sys
 import unicodedata
-import zipfile
 from urllib.parse import quote, unquote
+from html5_dependency import HTML5_PROFILE, load_html5_parser
 
 
 NAMES = {
@@ -30,27 +29,11 @@ CSS_RULE = re.compile(r"([^{}]+)\{([^{}]*)\}")
 TRUNCATED = re.compile(r"</(?=</div>)|<!--[^<>]*?(?=<|\Z)|</?[a-z][\w:-]*[^<>]*(?=</|\Z)",re.I)
 ACTIVE_TAGS = frozenset("a b big code em font i nobr s small strike strong tt u".split())
 ACTIVE_START = re.compile(r"<(?:a|b|big|code|em|font|i|nobr|s|small|strike|strong|tt|u)(?=[\s>/])",re.I)
-HTML5_PROFILE = {"version":"selectolax 1.0.2 / Lexbor (MIT)",
-    "distribution":"https://pypi.org/project/selectolax/1.0.2/#files",
-    "wheel":"selectolax-1.0.2-cp314-cp314-win_amd64.whl","wheel_sha256":"98bff51f30126bc1640c596892e27dfeacfbeac470e9cf717894654404e953b6",
-    "pyd_sha256":"d6a130eb85da3944ab0f3ce4581718c3a9325c68850ed779357b1298d807ebc3"}
 
 
 @lru_cache(maxsize=1)
 def browser_fragment_parser():
-    base = Path(__file__).resolve().parent / ".tools"
-    wheel, unpacked = base / HTML5_PROFILE["wheel"], base / "selectolax-1.0.2"
-    if not wheel.is_file() or sha256(wheel.read_bytes()).hexdigest() != HTML5_PROFILE["wheel_sha256"]:
-        raise ValueError(f"请从 {HTML5_PROFILE['distribution']} 恢复 {wheel} 并核对 SHA-256")
-    pyd = unpacked/"selectolax/lexbor.cp314-win_amd64.pyd"
-    if not pyd.is_file():
-        with zipfile.ZipFile(wheel) as archive:
-            archive.extractall(unpacked)
-    if sha256(pyd.read_bytes()).hexdigest() != HTML5_PROFILE["pyd_sha256"]:
-        raise ValueError("HTML5 原生解析器校验失败")
-    sys.path.insert(0,str(unpacked))
-    from selectolax.lexbor import LexborHTMLParser
-    return LexborHTMLParser
+    return load_html5_parser()
 
 
 def formatting_tail(value, expanded=False):
@@ -370,25 +353,51 @@ class MergedDisplayCleaner:
         return raw
 
 
-class _DisplayPage(HTMLParser):
-    """用解析器定位允许改动的区间；原始标签、属性以及可见区间外的数据不经序列化。"""
+class _SourceHTMLParser(HTMLParser):
+    """共享原文坐标及 HTML 栈规则；各子类自行定义元素状态和输出。"""
 
-    def __init__(self, page, cleaner):
+    def __init__(self, page):
         super().__init__(convert_charrefs=False)
-        self.page, self.cleaner = page, cleaner
+        self.page = page
         self.lines = [0] + [m.end() for m in re.finditer("\n", page)]
         self.stack = []
-        self.spans, self.edits = [], []
-        self.body_start, self.native_alias = -1, False
 
     def source_index(self):
         line, col = self.getpos()
         return self.lines[line - 1] + col
 
+    @staticmethod
+    def first_attributes(attrs):
+        # 浏览器保留首次出现的属性；HTMLParser 会把重复项全部返回。
+        return dict(reversed(attrs))
+
+    def push_element(self, tag, *state):
+        if tag not in _VOID:
+            self.stack.append((tag, *state))
+
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i][0] == tag:
+                del self.stack[i:]
+                return
+
+    def handle_startendtag(self, tag, attrs):
+        # HTML 的普通元素即使以 /> 收尾仍然打开；void 元素无需维护栈。
+        self.handle_starttag(tag, attrs)
+
+
+class _DisplayPage(_SourceHTMLParser):
+    """用解析器定位允许改动的区间；原始标签、属性以及可见区间外的数据不经序列化。"""
+
+    def __init__(self, page, cleaner):
+        super().__init__(page)
+        self.cleaner = cleaner
+        self.spans, self.edits = [], []
+        self.body_start, self.native_alias = -1, False
+
     def handle_starttag(self, tag, attrs):
         source = self.stack[-1][1] if self.stack else None
-        # 浏览器保留起始标签中首次出现的属性；HTMLParser 会把重复项全部返回。
-        values = dict(reversed(attrs))
+        values = self.first_attributes(attrs)
         classes = (values.get("class") or "").split()
         pos = self.source_index()
         if tag == "div" and "es-source" in classes:
@@ -428,18 +437,7 @@ class _DisplayPage(HTMLParser):
                         fixed = _DIGITS.sub(digits, match[2])
                         self.edits.append((*match.span(2), self.cleaner.replace_text(source, fixed)))
                         source = None
-        if tag not in _VOID:
-            self.stack.append((tag, source, visible))
-
-    def handle_endtag(self, tag):
-        for i in range(len(self.stack) - 1, -1, -1):
-            if self.stack[i][0] == tag:
-                del self.stack[i:]
-                return
-
-    def handle_startendtag(self, tag, attrs):
-        # HTML 的普通元素即使以 /> 收尾仍然打开；void 元素无需维护栈。
-        self.handle_starttag(tag, attrs)
+        self.push_element(tag, source, visible)
 
     def mark(self, length):
         if self.stack and self.stack[-1][2] and (source := self.stack[-1][1]):
@@ -996,49 +994,36 @@ def _element_visibility(tag, attributes, classes, inherited):
     return effective.get('display') == 'none', visible
 
 
-class _VisibleLocations(HTMLParser):
+class _VisibleLocations(_SourceHTMLParser):
     """仅允许在可见文本或实际标签起点修正，字面示例、属性和隐藏片段保持原样。"""
 
     def __init__(self, page, candidates):
-        super().__init__(convert_charrefs=False)
-        self.lines = [0] + [m.end() for m in re.finditer("\n", page)]
+        super().__init__(page)
         self.candidates = candidates
         self.allowed = set()
-        self.stack = []
         self.feed(page)
         self.close()
 
-    def position(self):
-        line, col = self.getpos()
-        return self.lines[line - 1] + col
-
     def handle_starttag(self, tag, attrs):
-        attributes = dict(reversed(attrs))
+        attributes = self.first_attributes(attrs)
         excluded, visible = _element_visibility(tag, attributes, (attributes.get("class") or "").split(),
                                                 not self.stack or self.stack[-1][2])
         protected = excluded or bool(self.stack and self.stack[-1][1])
-        pos = self.position()
+        pos = self.source_index()
         if visible and not protected and self.candidates.get(pos) == "tag":
             self.allowed.add(pos)
-        if tag not in _VOID:
-            self.stack.append((tag, protected, visible))
-
-    def handle_startendtag(self, tag, attrs):
-        self.handle_starttag(tag, attrs)
+        self.push_element(tag, protected, visible)
 
     def handle_endtag(self, tag):
-        pos = self.position()
+        pos = self.source_index()
         if self.candidates.get(pos) == "end" and not (self.stack and (self.stack[-1][1] or not self.stack[-1][2])):
             self.allowed.add(pos)
-        for i in range(len(self.stack) - 1, -1, -1):
-            if self.stack[i][0] == tag:
-                del self.stack[i:]
-                break
+        super().handle_endtag(tag)
 
     def handle_data(self, data):
         if self.stack and (self.stack[-1][1] or not self.stack[-1][2]):
             return
-        start = self.position()
+        start = self.source_index()
         for pos, kind in self.candidates.items():
             if kind == "text" and start <= pos < start + len(data):
                 self.allowed.add(pos)

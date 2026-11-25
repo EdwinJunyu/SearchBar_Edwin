@@ -983,5 +983,96 @@ class EnglishLayoutTests(unittest.TestCase):
             self.assertEqual(merge_render.repair_english_display(original, "hanying"), original)
 
 
+class ParserTraversalTests(unittest.TestCase):
+    def test_visibility_and_offsets_survive_malformed_nesting(self):
+        cases = [
+            ('<i hidden><b>old</i>old', 1),
+            ('<i hidden>old</unknown>old</i>old', 2),
+            ('<i hidden/><b>old</b></i>old', 1),
+            ('<img hidden/>old<br hidden>old', 0),
+            ('<i style="display:block" style="display:none">old</i>', 0),
+            ('<i style="display:none" style="display:block">old</i>old', 1),
+            ('<!-- old -->\r\n<i hidden>old</i>\nold', 2),
+        ]
+        import re
+        cleaner = merge_render.MergedDisplayCleaner({'sango': [('old', 'new')]})
+        for fragment, first_visible in cases:
+            with self.subTest(fragment=fragment):
+                positions = [match.start() for match in re.finditer('old', fragment)]
+                allowed = merge_render._VisibleLocations(fragment, dict.fromkeys(positions, 'text')).allowed
+                self.assertEqual(allowed, set(positions[first_visible:]))
+                prefix = '<!--ESHELP1--><div class="es-source es-sango"><a name="es-sango-1"></a><div class="es-label"><b>sango</b></div>'
+                expected = fragment
+                for pos in reversed(positions[first_visible:]):
+                    expected = expected[:pos] + 'new' + expected[pos+3:]
+                self.assertEqual(cleaner.clean((prefix + fragment + '</div>').encode()),
+                                 (prefix + expected + '</div>').encode())
+
+    def test_end_tag_visibility_is_checked_before_popping(self):
+        fragment = '<i hidden><b>x</i>\r\n</unknown>'
+        hidden_end = fragment.index('</i>')
+        visible_end = fragment.index('</unknown>')
+        allowed = merge_render._VisibleLocations(fragment, {hidden_end: 'end', visible_end: 'end'}).allowed
+        self.assertEqual(allowed, {visible_end})
+
+
+class Html5DependencyTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        import importlib
+        import sys
+        import types
+        import zipfile
+        self.loader = importlib.import_module('html5_dependency')
+        self.root = Path(self.enterContext(TemporaryDirectory()))
+        self.enterContext(patch.object(self.loader, '__file__', str(self.root / 'html5_dependency.py')))
+        self.base = self.root / '.tools'
+        self.base.mkdir()
+        self.native = b'fixture native module'
+        self.wheel = self.base / self.loader.HTML5_PROFILE['wheel']
+        with zipfile.ZipFile(self.wheel, 'w') as archive:
+            archive.writestr('selectolax/lexbor.cp314-win_amd64.pyd', self.native)
+        self.enterContext(patch.dict(self.loader.HTML5_PROFILE, {
+            'wheel_sha256': hashlib.sha256(self.wheel.read_bytes()).hexdigest(),
+            'pyd_sha256': hashlib.sha256(self.native).hexdigest(),
+        }))
+        self.pyd = self.base / 'selectolax-1.0.2/selectolax/lexbor.cp314-win_amd64.pyd'
+        # 只替代 Windows 扩展导入；归档读取、解压与哈希校验使用真实文件。
+        module = types.ModuleType('selectolax.lexbor')
+        self.parser = type('FixtureParser', (), {})
+        module.LexborHTMLParser = self.parser
+        self.enterContext(patch.dict(sys.modules, {'selectolax.lexbor': module}))
+        self.enterContext(patch.object(sys, 'path', sys.path.copy()))
+        merge_render.browser_fragment_parser.cache_clear()
+        self.addCleanup(merge_render.browser_fragment_parser.cache_clear)
+
+    def test_both_callers_extract_and_load_validated_dependency(self):
+        self.assertIs(merge_render.browser_fragment_parser(), self.parser)
+        self.assertEqual(self.pyd.read_bytes(), self.native)
+        self.assertIs(audit_merged.html5_parser(), self.parser)
+
+    def test_invalid_wheel_is_rejected_before_extraction(self):
+        self.wheel.write_bytes(b'invalid wheel')
+        for caller in (merge_render.browser_fragment_parser, audit_merged.html5_parser):
+            with self.subTest(caller=caller.__name__), self.assertRaises(ValueError):
+                caller()
+        self.assertFalse(self.pyd.exists())
+
+    def test_invalid_native_module_is_not_overwritten_or_loaded(self):
+        self.pyd.parent.mkdir(parents=True)
+        self.pyd.write_bytes(b'corrupted native module')
+        for caller in (merge_render.browser_fragment_parser, audit_merged.html5_parser):
+            with self.subTest(caller=caller.__name__), self.assertRaises(ValueError):
+                caller()
+        self.assertEqual(self.pyd.read_bytes(), b'corrupted native module')
+
+    def test_audit_rechecks_native_module_after_render_cache_is_warm(self):
+        self.assertIs(merge_render.browser_fragment_parser(), self.parser)
+        self.pyd.write_bytes(b'changed after render')
+        self.assertIs(merge_render.browser_fragment_parser(), self.parser)
+        with self.assertRaises(ValueError):
+            audit_merged.html5_parser()
+
+
 if __name__ == "__main__":
     unittest.main()

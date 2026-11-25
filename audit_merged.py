@@ -25,10 +25,10 @@ import sys
 from tempfile import TemporaryDirectory
 from time import perf_counter
 import unicodedata
-import zipfile
 import zlib
 from urllib.parse import quote, unquote
 from uuid import uuid4
+from html5_dependency import load_html5_parser
 
 ROOT = Path(__file__).resolve().parent
 INVENTORY = ROOT / "reports/词书合并-源文件盘点.json"
@@ -200,20 +200,7 @@ def file_hash(path):
 
 def html5_parser():
     """可离线重放。只载入已校验的官方 Windows CPython 3.14 wheel 和原生 Lexbor 解析器。"""
-    base = ROOT/".tools"
-    wheel = base/"selectolax-1.0.2-cp314-cp314-win_amd64.whl"
-    target = base/"selectolax-1.0.2"
-    pyd = target/"selectolax/lexbor.cp314-win_amd64.pyd"
-    ensure(file_hash(wheel)=="98bff51f30126bc1640c596892e27dfeacfbeac470e9cf717894654404e953b6",
-           "用于独立 HTML5 DOM 审计的 selectolax 1.0.2 官方 wheel 哈希不符")
-    if not pyd.is_file():
-        with zipfile.ZipFile(wheel) as archive:
-            archive.extractall(target)
-    ensure(file_hash(pyd)=="d6a130eb85da3944ab0f3ce4581718c3a9325c68850ed779357b1298d807ebc3",
-           "HTML5 原生解析器哈希不符")
-    sys.path.insert(0,str(target))
-    from selectolax.lexbor import LexborHTMLParser
-    return LexborHTMLParser
+    return load_html5_parser()
 
 
 def check_section_dom(parser, key, actual, standalone):

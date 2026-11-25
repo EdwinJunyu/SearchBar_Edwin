@@ -19,6 +19,28 @@ jobs:
           dotnet-version: '10.0.x'
       - name: Build CLI and Windows desktop
         run: dotnet build -c Release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          architecture: x64
+      - name: Prepare pinned dictionary tool dependencies
+        shell: python
+        run: |
+          if __name__ == '__main__':
+              import subprocess
+              import sys
+              from pathlib import Path
+              from urllib.request import urlretrieve
+              sys.path.insert(0, str(Path.cwd()))
+              from merge_render import GD_TABLES
+              subprocess.run([sys.executable, '-m', 'pip', 'download', '--only-binary=:all:',
+                              '--no-deps', 'mdict-utils==1.3.14', 'selectolax==1.0.2', '-d', '.tools'], check=True)
+              for name, (_, url, _) in GD_TABLES.items():
+                  urlretrieve(url, Path('.tools') / name)
+      - name: Dictionary rendering and dependency checks
+        run: python -B -X utf8 -m unittest -v test_merge_render
+      - name: Independent archive and HTML5 audit self-test
+        run: python -B -X utf8 audit_merged.py --self-test --check-dom
       - name: Calculator and request context checks
         run: dotnet run --project tests/RefactorChecks/RefactorChecks.csproj -c Release
       - name: Reverse search policy checks
