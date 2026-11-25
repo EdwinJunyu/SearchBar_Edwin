@@ -1722,7 +1722,7 @@ internal sealed partial class DictionaryStore : IDisposable
     }
 
     private string ReadIndexedBody(string hash, long start, long end, bool exact, CancellationToken token = default) =>
-        ManagedMdx.Body(db.DataSource, hash, start, end, () => ReadVerifiedDirectory(db.DataSource, hash, token), exact, token);
+        ManagedMdx.BodyCancellable(db.DataSource, hash, start, end, () => ReadVerifiedDirectory(db.DataSource, hash, token), exact, token);
 
     private static byte[]? ReadVerifiedDirectory(string databasePath, string hash, CancellationToken token)
     {
@@ -2999,7 +2999,10 @@ internal static class ManagedMdx
     }
 
     internal static string Body(string databasePath, string hash, long start, long end, Func<byte[]?>? loadDirectory = null,
-        bool exact = false, CancellationToken token = default)
+        bool exact = false) => BodyCancellable(databasePath, hash, start, end, loadDirectory, exact, CancellationToken.None);
+
+    internal static string BodyCancellable(string databasePath, string hash, long start, long end, Func<byte[]?>? loadDirectory,
+        bool exact, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         string path = SourcePath(databasePath, hash);
