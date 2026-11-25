@@ -348,6 +348,76 @@ class RenderTests(unittest.TestCase):
         self.assertFalse(list(self.renderer.helpers()))
 
 
+class MdictWriteCleanupTests(unittest.TestCase):
+    def setUp(self):
+        import mdict_io
+        self.mdict = mdict_io
+        self.upstream = mdict_io._writer_backend()
+        self.root = Path(self.enterContext(TemporaryDirectory()))
+
+    def test_write_failure_removes_partial_and_preserves_destination(self):
+        from unittest.mock import patch
+        failure = OSError('injected write failure')
+        def fail(writer, stream):
+            stream.write(b'incomplete archive')
+            raise failure
+        for resource in (False, True):
+            with self.subTest(resource=resource):
+                target = self.root / ('book.mdd' if resource else 'book.mdx')
+                target.write_bytes(b'original archive')
+                with patch.object(self.upstream.MDictWriter, 'write', fail):
+                    with self.assertRaises(OSError) as caught:
+                        self.mdict.write_mdict(target, [], '', '', resource)
+                self.assertIs(caught.exception, failure)
+                self.assertEqual(target.read_bytes(), b'original archive')
+                self.assertEqual(list(self.root.glob('*.partial')), [])
+                self.assertEqual(list(self.root.glob('.mdict-*')), [])
+
+    def test_replace_failure_cleans_only_this_attempt(self):
+        from unittest.mock import patch
+        unrelated = self.root / '.other.partial'
+        unrelated.write_bytes(b'other operation')
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                target = self.root / ('existing.mdx' if existing else 'new.mdx')
+                if existing:
+                    target.write_bytes(b'original archive')
+                failure = PermissionError('injected replace failure')
+                with patch.object(self.mdict.os, 'replace', side_effect=failure):
+                    with self.assertRaises(PermissionError) as caught:
+                        self.mdict.write_mdict(target, [], '', '')
+                self.assertIs(caught.exception, failure)
+                self.assertEqual(target.exists(), existing)
+                if existing:
+                    self.assertEqual(target.read_bytes(), b'original archive')
+                self.assertEqual(list(self.root.glob('*.partial')), [unrelated])
+                self.assertEqual(unrelated.read_bytes(), b'other operation')
+                self.assertEqual(list(self.root.glob('.mdict-*')), [])
+
+    def test_exclusive_create_failure_does_not_delete_existing_partial(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        target = self.root / 'book.mdx'
+        partial = self.root / '.book.mdx.collision.partial'
+        partial.write_bytes(b'another writer owns this')
+        with patch.object(self.mdict, 'uuid4', return_value=SimpleNamespace(hex='collision')):
+            with self.assertRaises(FileExistsError):
+                self.mdict.write_mdict(target, [], '', '')
+        self.assertEqual(partial.read_bytes(), b'another writer owns this')
+        self.assertFalse(target.exists())
+
+    def test_success_publishes_readable_mdx_and_mdd_without_partial(self):
+        for resource, rows in ((False, [('食べる', '吃'.encode())]),
+                               (True, [(r'\image.png', b'\x00\xff')])):
+            with self.subTest(resource=resource):
+                target = self.root / ('book.mdd' if resource else 'book.mdx')
+                target.write_bytes(b'old archive')
+                self.mdict.write_mdict(target, rows, 'test', '', resource)
+                self.assertEqual([(key, body) for _, key, body in self.mdict.read_entries(target)], rows)
+                self.assertEqual(list(self.root.glob('*.partial')), [])
+                self.assertEqual(list(self.root.glob('.mdict-*')), [])
+
+
 class RenderDatabaseTests(unittest.TestCase):
     def setUp(self):
         from unittest.mock import patch
@@ -672,10 +742,12 @@ class CompactIndexTests(unittest.TestCase):
                 db.executemany("INSERT INTO terms VALUES (?,?,?,?)", rows)
             db.close()
             before = original.read_bytes()
-            result = audit_merged.compare_term_layouts(original, root / "trial")
+            result = audit_merged.compare_term_layouts(original, root / "trial", fresh_process=True)
             self.assertEqual(result["verified"], {"keys":4,"mappings":7})
             self.assertEqual(set(result["blocks"]), {"4","8","16","32"})
             self.assertIn("packed_nonterm_db_bytes", result, "缺少重建后基础库的真实文件大小")
+            for measurement in result['point_queries'].values():
+                self.assertGreater(measurement['fresh_process']['n'], 0)
             self.assertEqual(original.read_bytes(), before)
             with self.assertRaises(FileExistsError):
                 audit_merged.compare_term_layouts(original, root / "trial")
@@ -689,6 +761,30 @@ class CompactIndexTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 with audit_merged.CompactTermReader(root / "trial", 4) as reader:
                     reader.lookup("😀")
+
+    def test_experiment_module_and_legacy_cli_preserve_snapshot(self):
+        import sys
+        import term_layout_experiments as experiments
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source.db'
+            with sqlite3.connect(source) as db:
+                db.executescript("""
+                    CREATE TABLE dictionaries(id TEXT PRIMARY KEY);
+                    INSERT INTO dictionaries VALUES ('a');
+                    CREATE TABLE terms(term,kind,dict,ordinal);
+                    INSERT INTO terms VALUES ('桜',0,'a',7);
+                """)
+            db.close()
+            before = source.read_bytes()
+            report = root / 'report.json'
+            subprocess.run([sys.executable, '-B', str(Path(audit_merged.__file__)),
+                            '--compare-term-layouts', str(source), str(root / 'trial'),
+                            '--output', str(report)], check=True, capture_output=True)
+            self.assertEqual(json.loads(report.read_text('utf-8'))['verified'], {'keys': 1, 'mappings': 1})
+            with experiments.CompactTermReader(root / 'trial', 4) as reader:
+                self.assertEqual(reader.lookup('桜'), [(0, 'a', 7)])
+            self.assertEqual(source.read_bytes(), before)
 
 
 @unittest.skipUnless(os.name == "nt", "Windows x64 发布程序的集成测试")

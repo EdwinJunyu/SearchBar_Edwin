@@ -12,6 +12,7 @@ import os
 import struct
 import sys
 import zlib
+from contextlib import ExitStack
 from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -322,7 +323,7 @@ def write_mdict(path, rows, title, description, resource=False):
     # 正式 key/record block 实现；索引编码、压缩、校验码、区段布局及最终 write 均由上游生成。
     writer = ExactKeyWriter({}, title, description, version="2.0", encoding="utf8",
                             compression_type=2, is_mdd=resource)
-    with TemporaryDirectory(prefix=".mdict-", dir=path.parent) as temp:
+    with TemporaryDirectory(prefix=".mdict-", dir=path.parent) as temp, ExitStack() as cleanup:
         scratch = Path(temp)
         # 块缓存保留临时目录的私有 ACL，真正的成品先在目标目录内独占创建以继承桌面读取权限。
         final = path.with_name(f".{path.name}.{uuid4().hex}.partial")
@@ -378,6 +379,8 @@ def write_mdict(path, rows, title, description, resource=False):
             writer._build_keyb_index()
             writer._build_recordb_index()
             with final.open("xb") as output:
+                # 仅在独占创建成功后登记；退出时流已关闭，且不能误删其他写入者的同名文件。
+                cleanup.callback(final.unlink, missing_ok=True)
                 writer.write(output)
         os.replace(final, path)
 
