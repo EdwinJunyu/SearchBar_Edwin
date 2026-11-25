@@ -778,9 +778,10 @@ class CompactIndexTests(unittest.TestCase):
             db.close()
             before = source.read_bytes()
             report = root / 'report.json'
-            subprocess.run([sys.executable, '-B', str(Path(audit_merged.__file__)),
-                            '--compare-term-layouts', str(source), str(root / 'trial'),
-                            '--output', str(report)], check=True, capture_output=True)
+            result = subprocess.run([sys.executable, '-B', '-X', 'utf8', str(Path(audit_merged.__file__)),
+                                     '--compare-term-layouts', str(source), str(root / 'trial'),
+                                     '--output', str(report)], capture_output=True, encoding='utf-8')
+            self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(report.read_text('utf-8'))['verified'], {'keys': 1, 'mappings': 1})
             with experiments.CompactTermReader(root / 'trial', 4) as reader:
                 self.assertEqual(reader.lookup('桜'), [(0, 'a', 7)])
