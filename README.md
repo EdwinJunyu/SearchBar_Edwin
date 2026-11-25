@@ -1,7 +1,4 @@
 # SearchBar_Edwin
-
-## 中文
-
 Windows 搜索工具（自用）。默认按 `Alt + Space` 唤起搜索框，输入一次就能同时查本地词典和搜索文件。
 
 Windows x64 完整包内含中英、日语两部合并词典，保留八部原书的来源和释义。下载 ZIP、解压后打开 `SearchBar_Edwin-win-x64/SearchBar_Edwin.exe`，旧版下载包的入口为 `E_Search.exe`。首次启动会在本机安装词库。[下载最新版本](https://github.com/EdwinJunyu/SearchBar_Edwin/releases/latest)
@@ -12,8 +9,8 @@ Windows x64 完整包内含中英、日语两部合并词典，保留八部原�
 - **GPT 自动跳转**：输入前缀“ai” + 空格输入问题(提示词)然后回车即可跳转至 ChatGPT 网页
 - **计算器**：直接在搜索框输入算式，支持四则运算和科学函数。
 
-## English
 
+# SearchBar_Edwin
 Personal search tool for Windows. Press `Alt + Space` by default to look up a word in local dictionaries and search for files with the same query.
 
 The Windows x64 ZIP includes Chinese–English and Japanese volumes with entries from eight source dictionaries. Extract the ZIP and open `SearchBar_Edwin-win-x64/SearchBar_Edwin.exe` to install the dictionaries on first launch. Earlier packages use `E_Search.exe`. [Download the latest release](https://github.com/EdwinJunyu/SearchBar_Edwin/releases/latest)
