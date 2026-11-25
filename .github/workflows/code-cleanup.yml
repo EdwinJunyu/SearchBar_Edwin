@@ -33,10 +33,14 @@ jobs:
               from urllib.request import urlretrieve
               sys.path.insert(0, str(Path.cwd()))
               from merge_render import GD_TABLES
+              from audit_merged import GOLDENDICT_COMMIT
               subprocess.run([sys.executable, '-m', 'pip', 'download', '--only-binary=:all:',
                               '--no-deps', 'mdict-utils==1.3.14', 'selectolax==1.0.2', '-d', '.tools'], check=True)
               for name, (_, url, _) in GD_TABLES.items():
                   urlretrieve(url, Path('.tools') / name)
+              for name in ('folding.cc', 'inc_diacritic_folding.hh'):
+                  urlretrieve(f'https://raw.githubusercontent.com/goldendict/goldendict/{GOLDENDICT_COMMIT}/{name}',
+                              Path('.tools') / ('goldendict-bd95948-' + name))
       - name: Dictionary rendering and dependency checks
         run: python -B -X utf8 -m unittest -v test_merge_render
       - name: Independent archive and HTML5 audit self-test
