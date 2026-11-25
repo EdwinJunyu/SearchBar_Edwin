@@ -4864,10 +4864,10 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
             # 模拟旧拼写请求在新结果显示后才完成，即使取消未抢先中止，界面也必须保留新结果。
             $contextConstructor = $type.Assembly.GetType('ESearch.SearchRequestContext',$true).GetConstructor(
                 [type[]]@([long],[long],[Threading.CancellationToken]))
-            $oldContext = $contextConstructor.Invoke(@($priorRevision,
+            $staleRequestContext = $contextConstructor.Invoke(@($priorRevision,
                 $type.GetField('catalogRevision',$flags).GetValue($window),[Threading.CancellationToken]::None))
             $oldResult = $type.GetMethod('SearchDictionaryAsync',$flags).Invoke($window,
-                @('recieve',$oldContext))
+                @('recieve',$staleRequestContext))
             Wait-ModeUi { $oldResult.IsCompleted }
             [void]$oldResult.GetAwaiter().GetResult()
             Assert-Equal $choices.Items.Count 0 '迟到的旧拼写结果不重新显示建议'
