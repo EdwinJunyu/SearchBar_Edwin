@@ -1357,7 +1357,8 @@ public partial class SearchWindow : Window
     {
         detailRevision++;
         pendingDetail?.Cancel();
-        mergedResourceTasks.Reset();
+        // 放弃在途的资源读取，已解包的同卷资源可以在下次展开时直接复用。
+        mergedResourceTasks.Reset(keepCompleted: true);
         mergedCurrent = null;
         mergedHistory.Clear();
         mergedDocumentPath = null;

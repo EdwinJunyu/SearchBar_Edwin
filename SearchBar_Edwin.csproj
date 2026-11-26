@@ -117,7 +117,8 @@
     <WriteLinesToFile File="$(_SdkCache)/Everything-SDK-LICENSE.txt" Lines="$(_SdkNotice)" Overwrite="true" WriteOnlyWhenDifferent="true" Encoding="UTF-8" />
   </Target>
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
-    <Compile Remove="SearchWindow.xaml.cs;SettingsWindow.xaml.cs" />
+    <!-- Everything worker、文件历史及结果行只由 Windows 桌面入口使用。 -->
+    <Compile Remove="SearchWindow.xaml.cs;SettingsWindow.xaml.cs;EverythingSearch.cs;FileHit.cs;FileRefindHistory.cs" />
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="SearchBar_Edwin.TestSupport" />

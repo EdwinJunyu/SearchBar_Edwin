@@ -55,9 +55,15 @@ var oldPhrase = Search("勉強したい");
 Check(oldPhrase.Count == 1 && oldPhrase[0].Method == "phrase" && oldPhrase[0].Term == "勉強した",
     "existing phrase stays ahead of whole-word common fallback");
 
+// 句内检索沿用基线的候选范围，即使原书也收录了可猜出的动词或同读音词条。
+entries = [.. entries,
+    new("shogakukan", 17, "ja", 1, "くる", "くる", "同形词的释义"),
+    new("shogakukan", 18, "ja", 1, "みたい", null, "像……一样"),
+    new("shogakukan", 19, "ja", 1, "蹴る", "ける", "踢")];
+Check(Phrases("明日は来たい。").Count == 0, "whole-word wish candidates cannot introduce sentence homographs");
+
 foreach (var (input, surface, expected) in new[] {
-    ("明日は来たい。", "来たい", "来る"), ("本を読みたい。", "読みたい", "読む"),
-    ("本をヨミタイ。", "ヨミタイ", "読む"), ("ここへきたい。", "きたい", "着る|来る"),
+    ("本を読みたい。", "みたい", "みたい"), ("彼は書けちゃった。", "けちゃった", "蹴る"),
     ("かこう。", "かこう", "加工|河口"), ("ご飯を食べました。", "食べました", "食べる"),
     ("本を読めません。", "読めません", "読める"),
     ("彼は書けませんでした。", "書けませんでした", "書く") })
@@ -68,7 +74,7 @@ foreach (var (input, surface, expected) in new[] {
 }
 Check(Phrases("明日来たい。").Count == 0, "continuous kanji compound boundary stays protected");
 Check(Phrases("本を書いじゃった。").Count == 0, "mismatched te-form voicing is not guessed");
-entries = [.. entries, new("shogakukan", 17, "ja", 1, "期待", "きたい", "期待")];
+entries = [.. entries, new("shogakukan", 20, "ja", 1, "期待", "きたい", "期待")];
 Check(Heads(Phrases("きたい。")) == "期待", "exact noun reading suppresses common-verb fallback");
 Check(Heads(Search("きたい")) == "期待", "exact word reading still suppresses common-verb fallback");
 

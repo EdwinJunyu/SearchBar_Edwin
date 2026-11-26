@@ -38,6 +38,12 @@ async Task Canceled(Task task, string scenario)
     object result = await second.WaitAsync(TimeSpan.FromSeconds(10));
     Check(ReferenceEquals(result, await cache.GetAsync("same.mdd")), "completed package is reused");
     Check(loads == 1, "same-path viewers share exactly one load");
+    cache.Reset(keepCompleted: true);
+    Check(ReferenceEquals(result, await cache.GetAsync("same.mdd")) && loads == 1,
+        "closing after a completed load keeps the same package");
+    cache.Reset();
+    Check(!ReferenceEquals(result, await cache.GetAsync("same.mdd")) && loads == 2,
+        "a full reset invalidates even the completed package");
 }
 
 // A loader finishing a synchronous chunk can delay its replacement, but cannot run alongside it or overwrite it.
@@ -108,7 +114,7 @@ async Task Canceled(Task task, string scenario)
     Check(await cache.GetAsync("retry.mdd") == 42 && attempts == 2, "faulted load is retried");
 }
 
-// Reset discards the sole retained package and cancellation is owned by the cache lifetime.
+// Closing clears an unfinished package and allows a fresh load on reopen.
 {
     var entered = Signal();
     int attempts = 0;
@@ -124,9 +130,9 @@ async Task Canceled(Task task, string scenario)
     });
     Task<int> first = cache.GetAsync("reset.mdd");
     await Done(entered.Task);
-    cache.Reset();
-    await Canceled(first, "reset cancels shared load");
-    Check(await cache.GetAsync("reset.mdd") == 2, "reset allows a fresh load for the same path");
+    cache.Reset(keepCompleted: true);
+    await Canceled(first, "closing cancels the unfinished shared load");
+    Check(await cache.GetAsync("reset.mdd") == 2, "reopening after cancellation loads the same path afresh");
 }
 
 {

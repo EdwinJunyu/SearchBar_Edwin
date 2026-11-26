@@ -1243,6 +1243,28 @@ public static class ESearchRacePublish {
         }
         $publisher=$Assembly.GetType('ManagedMdx').GetMethod('PublishVerified',[Reflection.BindingFlags]'NonPublic,Static')
         $hash=(Get-FileHash -LiteralPath $source).Hash
+        $packed=[IO.Path]::Combine($Directory,'cancel-publish.mdxp')
+        [MdxReader]::PackDelivery($source,$packed,$hash)
+        $folder=[IO.Directory]::CreateDirectory((Join-Path $Directory 'cancel-publish')).FullName
+        $target=[IO.Path]::Combine($folder,"$hash.mdx")
+        $existing=[byte[]](1,2,3)
+        [IO.File]::WriteAllBytes($target,$existing)
+        [IO.File]::WriteAllBytes([IO.Path]::Combine($folder,'other.tmp'),$existing)
+        $cancel=[Threading.CancellationTokenSource]::new()
+        try {
+            $stage=[Action[string]]{
+                param([string]$temporary)
+                # 在真实 MDXP 校验还原完成、正式目标尚未发布时确定性取消。
+                [MdxReader]::RestoreDelivery($packed,$temporary,$hash,$cancel.Token)
+                $cancel.Cancel()
+            }
+            $canceled=$false
+            try { $null=$publisher.Invoke($null,@($target,[string]$hash,$cancel.Token,$stage)) }
+            catch { if ($_.Exception.GetBaseException() -isnot [OperationCanceledException]) { throw }; $canceled=$true }
+            Assert-Equal $canceled $true '还原完成时取消会报告取消'
+            Assert-Equal ([BitConverter]::ToString([IO.File]::ReadAllBytes($target))) '01-02-03' '取消保留原目标'
+            Assert-Equal ((Get-ChildItem -LiteralPath $folder -Filter '*.tmp' -Name) -join '|') 'other.tmp' '取消只清除本次已校验的暂存文件'
+        } finally { $cancel.Dispose() }
         foreach($ext in 'mdx','mdd'){
             $folder=Join-Path $Directory ("publisher-$ext-"+[guid]::NewGuid().ToString('N'))
             $target=Join-Path $folder "$hash.$ext"
@@ -2177,6 +2199,32 @@ function Test-FileDisplayLayout([Reflection.Assembly]$Assembly,[string]$Director
         Write-Output 'PASS WPF 文件行在 736/360 DIP 显示完整可辨目录'
     } finally {
         $w.GetType().GetField('exiting',[Reflection.BindingFlags]'NonPublic,Instance').SetValue($w,$true)
+        $w.Close()
+    }
+}
+
+function Test-DetailResourceReopen([Reflection.Assembly]$Assembly,[string]$Directory) {
+    Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
+    foreach ($library in 'Microsoft.Web.WebView2.Core','Microsoft.Web.WebView2.Wpf') {
+        $null=[Reflection.Assembly]::LoadFrom((Join-Path (Split-Path $Assembly.Location) "$library.dll"))
+    }
+    $archive=[IO.Path]::Combine($Directory,'detail-reopen.mdd')
+    Write-Mdx $archive ([ordered]@{'\es\test\proof.bin'=[byte[]](3,8,13)}) -Resource
+    $w=[ESearch.SearchWindow]::new((Join-Path $Directory 'detail-reopen.db'),$null)
+    $flags=[Reflection.BindingFlags]'NonPublic,Instance'
+    try {
+        # 用真实窗口的关闭路径和 MDD 加载器核对资源实例，避免用耗时阈值判断是否重读。
+        $cache=$w.GetType().GetField('mergedResourceTasks',$flags).GetValue($w)
+        $get=$cache.GetType().GetMethod('GetAsync',$flags)
+        $argsForLoad=@($archive,[Threading.CancellationToken]::None)
+        $loaded=$get.Invoke($cache,$argsForLoad).GetAwaiter().GetResult()
+        Assert-Equal $loaded.Count 1 '详情验收加载一项真实 MDD 资源'
+        $null=$w.GetType().GetMethod('CloseDetails',$flags).Invoke($w,@())
+        $reopened=$get.Invoke($cache,$argsForLoad).GetAwaiter().GetResult()
+        Assert-Equal ([object]::ReferenceEquals($loaded,$reopened)) $true '收起后重开复用同一个已解包资源'
+        Write-Output 'PASS 收起再展开同卷时复用已加载的 MDD'
+    } finally {
+        $w.GetType().GetField('exiting',$flags).SetValue($w,$true)
         $w.Close()
     }
 }
@@ -4815,7 +4863,7 @@ function Test-JapaneseAuxiliaries([string]$Scratch) {
             '食べる' = 'たべる<br>【食べる】<br>吃'; '読む' = 'よむ<br>【読む】<br>读'
             '書く' = 'かく<br>【書く】<br>写'; '勉強する' = 'べんきょうする<br>【勉強する】<br>学习'
             '着る' = 'きる<br>【着る】<br>穿'; '切る' = 'きる<br>【切る】<br>切'
-            '来る' = 'くる<br>【来る】<br>来'
+            '来る' = 'くる<br>【来る】<br>来'; 'みたい' = 'みたい<br>像……一样'
             '読める' = 'よめる<br>【読める】<br>能读'; '食ぶ' = 'たぶ<br>【食ぶ】<br>古语'
             '話す' = 'はなす<br>【話す】<br>说'; '話される' = 'はなされる<br>【話される】<br>被说'
             '話されました' = 'はなされました<br>【話されました】<br>原词记录'
@@ -4864,13 +4912,9 @@ function Test-JapaneseAuxiliaries([string]$Scratch) {
         Assert-Equal (($oldPhrase[0] -split "`t")[1..2] -join '|') 'phrase|勉強した' '已有片段查词结果优先于新增的整词回退'
         $sentence = @(Invoke-Search @('query','本を読んでいませんでした。','shogakukan'))
         Assert-Equal (($sentence[0] -split "`t")[2]) '読んでいませんでした' '句中完整活用片段优先于较短的て形'
-        foreach ($pair in @(@('明日は来たい。','来たい → 来る'), @('本を読みたい。','読みたい → 読む'))) {
-            $wish = @(Invoke-Search @('query',$pair[0],'shogakukan'))
-            Assert-Equal (($wish -join '|').Contains($pair[1])) $true '句内愿望形与整词查询共用原形候选'
-        }
-        $wishReading = @(Invoke-Search @('query','服をきたい。','shogakukan')) -join '|'
-        Assert-Equal ($wishReading.Contains('→ 着る')) $true '句内假名愿望形保留一段动词'
-        Assert-Equal ($wishReading.Contains('→ 切る') -or $wishReading.Contains('→ 繰る')) $false '句内候选同样验证动词类别'
+        Assert-Equal @(Invoke-Search @('query','明日は来たい。','shogakukan')).Count 0 '整词愿望形回退不扩展到句内'
+        $wish = @(Invoke-Search @('query','本を読みたい。','shogakukan'))
+        Assert-Equal (($wish | ForEach-Object { ($_ -split "`t")[1..2] -join '|' }) -join ',') 'phrase|みたい' '句内保留基线短片段'
         $spoken = @(Invoke-Search @('query','本を読んじゃった。','shogakukan'))
         Assert-Equal ($spoken[0].Contains('読んじゃった → 読む')) $true '句中还原完整口语片段并保留原文'
         $plainSentence = @(Invoke-Search @('query','ご飯を食べました。','shogakukan'))
@@ -7005,6 +7049,7 @@ if ($BackendTestDirectory -or $IndexedMdxTestDirectory) {
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
     if ($IndexedMdxTestDirectory) { Test-IndexedMdx $IndexedMdxTestDirectory $assembly; Test-ReleaseDataLocation; return }
     Test-ReverseEncoderReference $assembly
+    Test-DetailResourceReopen $assembly $BackendTestDirectory
     Test-IndexedMdx $BackendTestDirectory $assembly
     Test-Calculation
     Test-LookupAudit $BackendTestDirectory $assembly

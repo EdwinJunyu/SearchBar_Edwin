@@ -2910,29 +2910,40 @@ internal static class ManagedMdx
         Directory.CreateDirectory(staging);
         string temporary = CheckedSource(Path.Combine(staging, Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".tmp"));
         stage(temporary);
-        token.ThrowIfCancellationRequested();
-        try { File.Move(CheckedSource(temporary), CheckedSource(path)); }
-        catch (IOException) when (File.Exists(path))
+        try
         {
-            // 发布者只移动自己的暂存文件。成功竞争的副本及原子替换出的损坏文件分别留存。
-            // 不同数据库也可能共享资源目录。只串行化竞争后的复核与替换，避免二次替换已修复的字节。
-            string key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(path).ToUpperInvariant())));
-            using var gate = new Mutex(false, "ESearch-Publish-" + key);
-            try { while (!gate.WaitOne(100)) token.ThrowIfCancellationRequested(); }
-            catch (AbandonedMutexException) { /* 前一发布者退出后，本线程已取得互斥锁。 */ }
-            try
+            token.ThrowIfCancellationRequested();
+            try { File.Move(CheckedSource(temporary), CheckedSource(path)); }
+            catch (IOException) when (File.Exists(path))
             {
-                string retired = CheckedPath(Path.Combine(root, "retired"));
-                Directory.CreateDirectory(retired);
-                string backup = CheckedSource(Path.Combine(retired, Path.GetFileName(temporary)));
-                if (!Matches())
+                // 发布者只移动自己的暂存文件。成功竞争的副本及原子替换出的损坏文件分别留存。
+                // 不同数据库也可能共享资源目录。只串行化竞争后的复核与替换，避免二次替换已修复的字节。
+                string key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(path).ToUpperInvariant())));
+                using var gate = new Mutex(false, "ESearch-Publish-" + key);
+                try { while (!gate.WaitOne(100)) token.ThrowIfCancellationRequested(); }
+                catch (AbandonedMutexException) { /* 前一发布者退出后，本线程已取得互斥锁。 */ }
+                try
                 {
-                    try { File.Replace(CheckedSource(temporary), CheckedSource(path), CheckedPath(backup + ".damaged")); }
-                    catch (IOException) when (File.Exists(path) && Matches()) { }
+                    string retired = CheckedPath(Path.Combine(root, "retired"));
+                    Directory.CreateDirectory(retired);
+                    string backup = CheckedSource(Path.Combine(retired, Path.GetFileName(temporary)));
+                    if (!Matches())
+                    {
+                        try { File.Replace(CheckedSource(temporary), CheckedSource(path), CheckedPath(backup + ".damaged")); }
+                        catch (IOException) when (File.Exists(path) && Matches()) { }
+                    }
+                    if (File.Exists(temporary)) File.Move(CheckedSource(temporary), backup);
                 }
-                if (File.Exists(temporary)) File.Move(CheckedSource(temporary), backup);
+                finally { gate.ReleaseMutex(); }
             }
-            finally { gate.ReleaseMutex(); }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            // stage 成功后才拥有该临时文件。取消只清理本次副本，保留正式目标和其他发布者的文件。
+            try { File.Delete(CheckedSource(temporary)); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException)
+            { System.Diagnostics.Trace.TraceWarning("已取消的 MDX/MDD 发布未能清理暂存文件：{0}", ex.Message); }
+            throw;
         }
         return path;
     }

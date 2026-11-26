@@ -350,7 +350,7 @@ public static partial class Lookup
             Collect(lemma, false, "deinflection", rank, "ja", verbClass: verbClass);
             if (IsKana(lemma)) Collect(NormalizeReading(lemma), true, "deinflection", rank, "ja", verbClass: verbClass);
         }
-        var candidates = JapaneseCandidates(inflected).ToArray();
+        var candidates = JapaneseCandidates(inflected, wholeWord: true).ToArray();
         foreach (var candidate in candidates.Where(c => c.Fallback == JapaneseFallback.None))
             CollectJapanese(candidate.Key, candidate.Rank);
         // エ段＋る也可能本来就是一段动词。已收录的普通还原优先于可能态猜测。
@@ -424,8 +424,7 @@ public static partial class Lookup
     }
 
     private sealed record Phrase(string Surface, string Key, string Language, bool Reading,
-        int Units, int Offset, bool Restored, string? Canonical = null, JapaneseFallback Fallback = JapaneseFallback.None,
-        bool SecondaryObject = false, VerbClass? Conjugation = null);
+        int Units, int Offset, bool Restored, string? Canonical = null, bool WeakPotential = false, bool SecondaryObject = false);
 
     internal static IReadOnlyList<LookupHit> SearchPhrases(string input,
         Func<IEnumerable<string>, bool, string, HashSet<string>> existing,
@@ -501,18 +500,16 @@ public static partial class Lookup
         foreach (var length in possible.GroupBy(p => p.Units).OrderByDescending(g => g.Key))
         {
             var hits = new Dictionary<(string,long,string,EntryAnchor?,int?), (Phrase Phrase, LookupHit Hit)>();
-            var resolvedJapanese = new Dictionary<int, JapaneseFallback>();
-            foreach (var phrase in length.OrderBy(p => p.Fallback).ThenBy(p => p.SecondaryObject).ThenBy(p => p.Restored).ThenBy(p => p.Offset)
-                         .DistinctBy(p => (p.Key, p.Language, p.Reading, Position(p), p.Conjugation)))
+            var resolvedJapanese = new HashSet<int>();
+            foreach (var phrase in length.OrderBy(p => p.WeakPotential).ThenBy(p => p.SecondaryObject).ThenBy(p => p.Restored).ThenBy(p => p.Offset)
+                         .DistinctBy(p => (p.Key, p.Language, p.Reading, Position(p))))
             {
-                // 同一位置先用普通还原，再猜可能态，最后尝试愿望、命令、意志形。
-                // 同级候选仍全部保留，如「きたい」可以来自着る或来る。
-                if (resolvedJapanese.TryGetValue(phrase.Offset, out var resolved) && phrase.Fallback.CompareTo(resolved) > 0) continue;
+                // 同一位置已有可打开的日语词条时，不再用エ段猜测古语或其他同形词。
+                if (phrase.WeakPotential && resolvedJapanese.Contains(phrase.Offset)) continue;
                 foreach (var entry in resolve(phrase))
                 {
                     if (entry.Language != phrase.Language) continue;
-                    if (phrase.Conjugation is { } conjugation && !MatchesVerbHead(entry, phrase.Key, conjugation)) continue;
-                    if (phrase.Language == "ja") resolvedJapanese[phrase.Offset] = phrase.Fallback;
+                    if (!phrase.WeakPotential && phrase.Language == "ja") resolvedJapanese.Add(phrase.Offset);
                     var head = phrase.Canonical ?? entry.Headword;
                     var displayHead = head == entry.Headword ? entry.DisplayHeadword : EntryParser.DisplayHeadword(entry.DisplaySourceId, head);
                     var label = phrase.Surface == head ? displayHead : $"{phrase.Surface} → {displayHead}";
@@ -707,7 +704,6 @@ public static partial class Lookup
         }
         // 没有假名的汉语文本和短小的孤立词不做日语切片。窗口有上限，长句的候选数随字数线性增长。
         if (!input.Any(c => IsHiraganaUnit(c) || IsKatakanaUnit(c))) yield break;
-        string wholeInput = Normalize(input);
         foreach (System.Text.RegularExpressions.Match run in JapaneseRuns.Matches(input))
         {
             if (run.Length == input.Length && Normalize(run.Value).Length <= 4) continue;
@@ -726,17 +722,15 @@ public static partial class Lookup
                     if (key.Length < 3) continue;
                     if (key.Length > 32) break;
                     var inflected = IsKana(key) ? NormalizeReading(key) : key;
-                    foreach (var candidate in JapaneseCandidates(inflected).Prepend(new(key, 0))
-                                 .DistinctBy(c => (c.Key, c.Conjugation)))
+                    foreach (var candidate in JapaneseCandidates(inflected, wholeWord: false).Prepend(new(key, 0))
+                                 .DistinctBy(c => c.Key))
                     {
-                        // 完整输入的新增词形仍交给整词回退，保留原先已命中的较短词典短语。
-                        if (candidate.Fallback == JapaneseFallback.Common && key == wholeInput) continue;
                         bool restored = candidate.Key != key;
-                        yield return new(surface, candidate.Key, "ja", false, key.Length, start, restored,
-                            Fallback: candidate.Fallback, Conjugation: candidate.Conjugation);
+                        bool weak = candidate.Fallback == JapaneseFallback.Potential;
+                        yield return new(surface, candidate.Key, "ja", false, key.Length, start, restored, WeakPotential: weak);
                         if (IsKana(candidate.Key))
                             yield return new(surface, NormalizeReading(candidate.Key), "ja", true, key.Length, start, restored,
-                                Fallback: candidate.Fallback, Conjugation: candidate.Conjugation);
+                                WeakPotential: weak);
                     }
                 }
             }
@@ -1105,20 +1099,22 @@ public static partial class Lookup
     private readonly record struct JapaneseCandidate(string Key, int Rank,
         JapaneseFallback Fallback = JapaneseFallback.None, VerbClass? Conjugation = null);
 
-    private static IEnumerable<JapaneseCandidate> JapaneseCandidates(string inflected)
+    private static IEnumerable<JapaneseCandidate> JapaneseCandidates(string inflected, bool wholeWord)
     {
-        // 单词和句子共享生成顺序与类别；是否采用回退由各自已解析的词条决定。
+        // 整词和句内共享普通还原。只有整词后备会猜测辅助体还原后的可能态及愿望、命令、意志形。
         var direct = Lemmas(inflected).Distinct(StringComparer.Ordinal).ToArray();
         var tried = direct.ToHashSet(StringComparer.Ordinal);
         foreach (var lemma in direct) yield return new(lemma, 2);
-        var fallbackForms = new List<string>();
+        List<string>? fallbackForms = wholeWord ? new() : null;
         foreach (var lemma in AuxiliaryLemmas(inflected, direct, fallbackForms))
             if (tried.Add(lemma)) yield return new(lemma, 3);
-        foreach (var form in fallbackForms)
+        var potentialForms = fallbackForms ?? direct.Prepend(inflected).Where(form => form.EndsWith('る'));
+        foreach (var form in potentialForms)
             if (Godan(form[..^1], "えけげせてねべめれ") is { } lemma && tried.Add(lemma))
                 yield return new(lemma, 3, JapaneseFallback.Potential);
-        foreach (var (lemma, conjugation) in CommonVerbLemmas(inflected))
-            yield return new(lemma, 3, JapaneseFallback.Common, conjugation);
+        if (wholeWord)
+            foreach (var (lemma, conjugation) in CommonVerbLemmas(inflected))
+                yield return new(lemma, 3, JapaneseFallback.Common, conjugation);
     }
 
     private static IEnumerable<(string Lemma, VerbClass Class)> CommonVerbLemmas(string word)

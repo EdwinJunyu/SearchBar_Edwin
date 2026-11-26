@@ -59,11 +59,13 @@ internal sealed class LastResourceTaskCache<T> : IDisposable
         finally { load.Complete(); }
     }
 
-    internal void Reset()
+    internal void Reset(bool keepCompleted = false)
     {
         Load? previous;
         lock (gate)
         {
+            // The viewer may close while a load is finishing. Only retain a successfully completed package.
+            if (keepCompleted && current?.Task.IsCompletedSuccessfully == true) return;
             previous = current;
             current = null;
         }
