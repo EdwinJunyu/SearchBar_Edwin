@@ -11,336 +11,31 @@ param([string] $RealDatabase, [switch] $Desktop, [switch] $FileDesktop, [string]
 $ErrorActionPreference = 'Stop'
 # 失败重导本身也是验收项，命令退出码由 Invoke-Search 明确检查。
 $PSNativeCommandUseErrorActionPreference = $false
+# 保留历史命令入口，发布实现与日常回归分开维护。
+if ($PackageSeed -or $VerifyReleaseZip) {
+    $releaseArgs = @{}
+    if ($PackageSeed) { $releaseArgs.PackageSeed = $PackageSeed }
+    if ($VerifyReleaseZip) { $releaseArgs.VerifyReleaseZip = $VerifyReleaseZip }
+    & (Join-Path $PSScriptRoot 'release.ps1') @releaseArgs
+    return
+}
+
 $dotnet = Join-Path $PSScriptRoot '.tools/dotnet/dotnet.exe'
 if (-not (Test-Path -LiteralPath $dotnet)) { $dotnet = (Get-Command dotnet -ErrorAction Stop).Path }
+function Initialize-CoreTestSupport {
+    if ('ESearch.Tests.CoreLogic' -as [type]) { return }
+    $project = Join-Path $PSScriptRoot 'tests/CoreTestSupport/CoreTestSupport.csproj'
+    & $dotnet build $project -c Release | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw '核心逻辑测试程序集构建失败' }
+    $library = Join-Path $PSScriptRoot 'tests/CoreTestSupport/bin/Release/net10.0/SearchBar_Edwin.TestSupport.dll'
+    [void][Reflection.Assembly]::LoadFrom($library)
+}
+
 function Get-PowerShellHost([string]$FileName) {
     $path = Join-Path $PSHOME $FileName
     if ([IO.File]::Exists($path)) { return $path }
     return Join-Path (Split-Path (Get-Command pwsh -ErrorAction Stop).Source) $FileName
 }
-function Get-ReleaseAppName([string]$Directory) {
-    if (Test-Path -LiteralPath (Join-Path $Directory 'SearchBar_Edwin.exe')) { return 'SearchBar_Edwin' }
-    return 'E_Search'
-}
-function Get-ReleaseEvidence([string]$Directory, [string]$Database) {
-    # 从 EXE 读取支持的辞书，再用包内种子运行验收。个人安装和用户词库不参与发布测试。
-    $previousDb = $env:E_SEARCH_DB
-    try {
-        $env:E_SEARCH_DB = $Database
-        $exe = Join-Path $Directory ((Get-ReleaseAppName $Directory) + '.exe')
-        $version = @(& $exe --version | ForEach-Object { $_ })
-        if ($LASTEXITCODE -ne 0) { throw '发布程序无法输出版本' }
-        $info = ($version -join "") | ConvertFrom-Json
-        $catalog = @(& $exe list | ForEach-Object { ($_ -split "`t")[0] })
-        if ($LASTEXITCODE -ne 0) { throw '包内种子词库无法读取' }
-        $samples = @(& $exe verify | ForEach-Object { $_ })
-        if ($LASTEXITCODE -ne 0 -or $samples.Count -lt 7 -or @($samples -notmatch '^PASS\t').Count) {
-            throw '发布程序的词典样本验收失败'
-        }
-        if (!($samples -cmatch '^PASS\t食べる\theadword\t食べる\tshogakukan:\d+\t')) {
-            throw '发布验收没有读到原始 UTF-8 日语词头，请核对 EXE 输出的解码方式'
-        }
-        return [ordered]@{ version=$info.version; build=$info.build; supportedDictionaries=$info.supportedDictionaries
-            bundledDictionaries=$catalog; samples=$samples }
-    } finally { $env:E_SEARCH_DB = $previousDb }
-}
-
-function Get-ReleaseFingerprint($Hashes) {
-    $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $Hashes -Compress))
-    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
-}
-
-function Get-IndexedSeedHashes([string]$Directory, [string]$Database, [switch]$Resources) {
-    $previousDb = $env:E_SEARCH_DB
-    try {
-        $env:E_SEARCH_DB = $Database
-        # WinExe 需显式接入管道，PowerShell 才会等待程序并收集标准输出。
-        $command = if ($Resources) { 'merged-resources' } else { 'indexed-sources' }
-        $hashes = @(& (Join-Path $Directory ((Get-ReleaseAppName $Directory) + '.exe')) $command | ForEach-Object { $_ })
-        if ($LASTEXITCODE -ne 0) { throw "无法读取种子清单 $command" }
-        foreach ($hash in $hashes) {
-            if ($hash -cnotmatch '^[0-9A-F]{64}$') { throw "种子的 MDX 哈希无效：$hash" }
-            $source = if ($Resources) { Join-Path (Split-Path $Database) "merged-resources/$hash.mdd" }
-                else { Join-Path ($Database + '.sources') ($hash + '.mdx') }
-            if ((Get-FileHash -LiteralPath $source).Hash -cne $hash) { throw "辞书文件内容校验失败：$source" }
-            $hash
-        }
-    } finally { $env:E_SEARCH_DB = $previousDb }
-}
-
-function Get-ReleaseSources {
-    $files = @(git @gitArgs -c core.quotepath=false ls-files --cached --others --exclude-standard -- $inputs)
-    if ($LASTEXITCODE -ne 0 -or !$files.Count) { throw '无法枚举构建输入' }
-    $hashes = [ordered]@{}
-    foreach ($file in ($files | Sort-Object -Unique -CaseSensitive)) {
-        $path = Join-Path $PSScriptRoot $file
-        if (Test-Path -LiteralPath $path -PathType Leaf) { $hashes[$file] = (Get-FileHash -LiteralPath $path).Hash }
-    }
-    return $hashes
-}
-
-function Get-ReleaseBinaries([string]$Directory) {
-    $binaries = [ordered]@{}
-    $product = Get-ReleaseAppName $Directory
-    foreach ($name in "$product.exe","$product.dll",'Everything32.dll','Everything64.dll','EverythingARM64.dll') {
-        $binaries[$name] = (Get-FileHash -LiteralPath (Join-Path $Directory $name)).Hash
-    }
-    return $binaries
-}
-
-function Get-ReleaseVolumeHashes([string]$Directory, [string]$Database) {
-    $previousDb = $env:E_SEARCH_DB
-    $hashes = [ordered]@{}
-    try {
-        $env:E_SEARCH_DB = $Database
-        foreach ($volume in 'zh-en','zh-ja') {
-            $rows = @(& (Join-Path $Directory ((Get-ReleaseAppName $Directory) + '.exe')) indexed-volume-source $volume | ForEach-Object { $_ })
-            if ($LASTEXITCODE -ne 0 -or $rows.Count -gt 1 -or
-                ($rows.Count -eq 1 -and $rows[0] -cnotmatch '^[0-9A-F]{64}$')) { throw "种子的 $volume 卷标识无效" }
-            if ($rows.Count) { $hashes[$volume] = $rows[0] }
-        }
-        return $hashes
-    } finally { $env:E_SEARCH_DB = $previousDb }
-}
-
-function Test-ReleaseZip([string]$Archive, [string]$Cache) {
-    # 只复用本脚本的验证目录。独占锁覆盖解压和执行，避免并发复验交叉使用两包的文件。
-    [void][IO.Directory]::CreateDirectory($Cache)
-    $guard = [IO.File]::Open((Join-Path $Cache 'verify.lock'),'OpenOrCreate','ReadWrite','None')
-    try {
-        $extract = [IO.Directory]::CreateDirectory((Join-Path $Cache 'extracted')).FullName
-        $archiveFile = [IO.Compression.ZipFile]::OpenRead($Archive)
-        try {
-            $members = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-            foreach ($entry in $archiveFile.Entries) { [void]$members.Add($entry.FullName.Replace('\','/')) }
-            # 隔离旧包独有的 DLL 和上次 SQLite 生成的旁文件，不能让残留文件使当前包误过验收。
-            foreach ($file in [IO.Directory]::EnumerateFiles($extract,'*',[IO.SearchOption]::AllDirectories)) {
-                $relative = [IO.Path]::GetRelativePath($extract,$file)
-                if ($members.Contains($relative.Replace('\','/'))) { continue }
-                $retired = Join-Path $Cache ('previous/' + [guid]::NewGuid().ToString('N') + '/' + $relative)
-                [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($retired))
-                [IO.File]::Move($file,$retired)
-            }
-            [IO.Compression.ZipFileExtensions]::ExtractToDirectory($archiveFile,$extract,$true)
-        } finally { $archiveFile.Dispose() }
-        $folder = if ($members.Contains('SearchBar_Edwin-win-x64/release.json')) { 'SearchBar_Edwin-win-x64' } else { 'E_Search-win-x64' }
-        $directory = Join-Path $extract $folder
-        $manifest = Get-Content -Raw -Encoding utf8 -LiteralPath (Join-Path $directory 'release.json') | ConvertFrom-Json -AsHashtable
-        $seed = Join-Path $directory 'Data/dictionaries.db'
-        $binaries = Get-ReleaseBinaries $directory
-        foreach ($name in $binaries.Keys) {
-            if ($binaries[$name] -cne $manifest.binaries[$name]) { throw "ZIP 内 $name 的 SHA-256 与发布记录不一致" }
-        }
-        if ((Get-ReleaseFingerprint $manifest.sourceFiles) -cne $manifest.sourceSha256 -or
-            (Get-FileHash -LiteralPath $seed).Hash -cne $manifest.seedSha256) { throw 'ZIP 的源码清单或种子与发布记录不一致' }
-        $deliveries = @{}
-        if ($manifest.ContainsKey('volumeDeliveries')) {
-            $deliveries = $manifest.volumeDeliveries
-            $codecHash = $manifest.deliveryCodecSha256
-            $volumes = Get-ReleaseVolumeHashes $directory $seed
-            if ($volumes.Count -ne $deliveries.Count) { throw '分发清单与种子中的卷数不符' }
-            foreach ($volume in $volumes.Keys) {
-                if ($deliveries[$volume].sourceSha256 -cne $volumes[$volume]) { throw "分发清单与 $volume 原卷不符" }
-            }
-        } elseif ($manifest.japaneseDelivery) {
-            # 老包只记录了日语卷，包内程序也只有当时的 CLI；保留其原来的验收入口。
-            $deliveries = @{'zh-ja'=$manifest.japaneseDelivery}
-            $codecHash = $manifest.japaneseDelivery.codecSha256
-        }
-        if ($deliveries.Count) {
-            if ((Get-FileHash -LiteralPath (Join-Path $directory 'es-zlib-ng.dll')).Hash -cne $codecHash) {
-                throw '分发卷还原组件与清单不一致'
-            }
-            foreach ($volume in $deliveries.Keys) {
-                $item = $deliveries[$volume]
-                $hash = $item.sourceSha256
-                if ($hash -cnotmatch '^[0-9A-F]{64}$' -or $hash -cnotin $manifest.indexedSources) {
-                    throw "$volume 分发卷没有对应的种子引用"
-                }
-                $packed = Join-Path ($seed + '.sources') "$hash.mdxp"
-                if ((Test-Path -LiteralPath (Join-Path ($seed + '.sources') "$hash.mdx")) -or
-                    (Get-FileHash -LiteralPath $packed).Hash -cne $item.packedSha256) {
-                    throw "$volume 须仅以经过校验的分发文件交付"
-                }
-                $stream = [IO.File]::OpenRead($packed)
-                try {
-                    $header = [byte[]]::new(8)
-                    $stream.ReadExactly($header,0,8)
-                    $expected = if ($manifest.japaneseDelivery) { 'ESMDXP01' } else { $item.format }
-                    if ($expected -cnotin 'ESMDXP01','ESMDXP02' -or
-                        [Text.Encoding]::ASCII.GetString($header) -cne $expected) { throw "$volume 分发格式与清单不一致" }
-                } finally { $stream.Dispose() }
-            }
-            # 使用与桌面首启相同的个人库安装入口。每次复验使用新目录，避免误用旧 MDX。
-            $profileDirectory = Join-Path $Cache ('profile-' + [guid]::NewGuid().ToString('N'))
-            $previousProfile = $env:LOCALAPPDATA
-            $previousDb = $env:E_SEARCH_DB
-            try {
-                $env:LOCALAPPDATA = $profileDirectory
-                $env:E_SEARCH_DB = $null
-                $timer = [Diagnostics.Stopwatch]::StartNew()
-                $paths = @(& (Join-Path $directory ((Get-ReleaseAppName $directory) + '.exe')) install-seed | ForEach-Object { $_ })
-                if ($LASTEXITCODE -ne 0) { throw '新用户安装分发卷失败' }
-                $seed = Join-Path $profileDirectory ((Get-ReleaseAppName $directory) + '/dictionaries.db')
-                if ($paths.Count -ne 1 -or $paths[0] -ne [IO.Path]::GetFullPath($seed)) { throw '首启没有生成个人词库' }
-                Write-Output ("PASS 首次创建个人词库 {0:N2} 秒" -f $timer.Elapsed.TotalSeconds)
-            } finally {
-                $env:LOCALAPPDATA = $previousProfile
-                $env:E_SEARCH_DB = $previousDb
-            }
-        }
-        if ($manifest.ContainsKey('indexedSources') -and
-            ((@(Get-IndexedSeedHashes $directory $seed) -join ',') -cne ($manifest.indexedSources -join ','))) {
-            throw 'ZIP 的 MDX 与种子引用清单不一致'
-        }
-        $observed = Get-ReleaseEvidence $directory $seed
-        if ($manifest.ContainsKey('mergedResources') -and
-            ((@(Get-IndexedSeedHashes $directory $seed -Resources) -join ',') -cne ($manifest.mergedResources -join ','))) {
-            throw 'ZIP 内 MDD 与双卷种子不符'
-        }
-        foreach ($field in $observed.Keys) {
-            $expected = ConvertTo-Json -Compress -InputObject $manifest.verified[$field]
-            if ((ConvertTo-Json -Compress -InputObject $observed[$field]) -ceq $expected) { continue }
-            # 早期日文 Windows 宿主把 UTF-8 样本按 CP932 解码后写进清单。仅对旧样本逐字复验这一次转换。
-            if ($field -eq 'samples' -and !$manifest.ContainsKey('sampleEncoding')) {
-                $legacy = @($observed.samples | ForEach-Object {
-                    [Text.Encoding]::GetEncoding(932).GetString([Text.Encoding]::UTF8.GetBytes($_))
-                })
-                if ((ConvertTo-Json -Compress -InputObject $legacy) -ceq $expected) { continue }
-            }
-            throw "ZIP 内程序的 $field 与发布记录不一致"
-        }
-        if ($observed.build -cne "$($observed.version)+$($manifest.baseCommit).$($manifest.sourceSha256)") {
-            throw 'ZIP 内程序的构建标识与源码清单不一致'
-        }
-        Write-Output "PASS 最终 ZIP $($observed.build)，种子 $($observed.bundledDictionaries.Count) 本，$($observed.samples.Count) 项样本全部通过"
-    } finally { $guard.Dispose() }
-}
-
-function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache) {
-    $work = [IO.Directory]::CreateDirectory((Join-Path $delivery ('.work/' + [guid]::NewGuid().ToString('N')))).FullName
-
-    $seed = (Resolve-Path -LiteralPath $PackageSeed).Path
-    $stage = Join-Path $work 'stage'
-    $directory = [IO.Directory]::CreateDirectory((Join-Path $stage 'SearchBar_Edwin-win-x64')).FullName
-    $gitArgs = @('-c',('safe.directory=' + $PSScriptRoot.Replace('\','/')),'-C',$PSScriptRoot)
-    $commit = (git @gitArgs rev-parse --verify HEAD)
-    if ($LASTEXITCODE -ne 0) { throw '无法读取发布源码的 Git 提交' }
-    # 一并记录未提交改动。按路径和内容计算构建身份，使同一提交上的两份工作区也可区分。
-    $inputs = @('*.cs','*.xaml','*.csproj','regressions.ps1')
-    $hashes = Get-ReleaseSources
-    $fingerprint = Get-ReleaseFingerprint $hashes
-    $tag = "$commit.$fingerprint"
-    & $dotnet publish (Join-Path $PSScriptRoot 'SearchBar_Edwin.csproj') -c Release -f net10.0-windows -r win-x64 --self-contained true "-p:SourceRevisionId=$tag" -o $directory
-    if ($LASTEXITCODE -ne 0) { throw "发布构建失败，退出码 $LASTEXITCODE" }
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'reports') -Destination $directory -Recurse
-    # 基准提交加本次源码差异可以还原尚未提交的构建；仅打包参与构建与验收的文件。
-    $reports = Join-Path $directory 'reports'
-    git @gitArgs diff --quiet HEAD -- $inputs
-    if ($LASTEXITCODE -eq 1) {
-        $patch = Join-Path $reports 'working-tree.patch'
-        git @gitArgs diff --binary --no-ext-diff --no-color "--output=$patch" HEAD -- $inputs
-        if ($LASTEXITCODE -ne 0) { throw '无法记录本次构建的源码差异' }
-    } elseif ($LASTEXITCODE -ne 0) { throw '无法检查构建输入的改动' }
-    $untracked = @(git @gitArgs -c core.quotepath=false ls-files --others --exclude-standard -- $inputs)
-    if ($LASTEXITCODE -ne 0) { throw '无法枚举新增源码' }
-    foreach ($file in $untracked) {
-        $copy = Join-Path $reports "untracked-source/$file"
-        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($copy))
-        [IO.File]::Copy((Join-Path $PSScriptRoot $file),$copy)
-    }
-    if ((git @gitArgs rev-parse --verify HEAD) -cne $commit -or
-        (Get-ReleaseFingerprint (Get-ReleaseSources)) -cne $fingerprint) { throw '构建时源码发生变化，请用当前工作区重新发布。' }
-    $evidence = Get-ReleaseEvidence $directory $seed
-    $indexedSources = @(Get-IndexedSeedHashes $directory $seed)
-    $mergedResources = @(Get-IndexedSeedHashes $directory $seed -Resources)
-    if ($evidence.build -cne "$($evidence.version)+$tag") { throw '编译标识与本次源码不一致' }
-    $manifest = [ordered]@{ baseCommit=$commit; sourceSha256=$fingerprint; sourceFiles=$hashes
-        binaries=(Get-ReleaseBinaries $directory)
-        seedSha256=(Get-FileHash -LiteralPath $seed).Hash
-        indexedSources=$indexedSources; mergedResources=$mergedResources; sampleEncoding='utf-8'; verified=$evidence }
-    # 从种子识别卷，普通单书仍随包提供原 MDX。相同 SHA 只需一个载体。
-    $volumes = Get-ReleaseVolumeHashes $directory $seed
-    $byHash = @{}
-    $manifest.volumeDeliveries = [ordered]@{}
-    if ($volumes.Count) {
-        $manifest.deliveryCodecSha256 = (Get-FileHash -LiteralPath (Join-Path $directory 'es-zlib-ng.dll')).Hash
-    }
-    foreach ($volume in $volumes.Keys) {
-        $hash = $volumes[$volume]
-        if ($hash -cnotin $indexedSources) { throw "$volume 与种子引用不符" }
-        if (!$byHash.ContainsKey($hash)) {
-            $packed = Join-Path $work "$hash.mdxp"
-            $sourcePath = Join-Path ($seed + '.sources') "$hash.mdx"
-            & (Join-Path $directory 'SearchBar_Edwin.exe') pack-volume $volume $sourcePath $packed | Out-Host
-            if ($LASTEXITCODE -ne 0) { throw "$volume 分发编码失败" }
-            $byHash[$hash] = [ordered]@{
-                sourceSha256=$hash
-                packedSha256=(Get-FileHash -LiteralPath $packed).Hash
-                format=if ($volume -ceq 'zh-ja') { 'ESMDXP02' } else { 'ESMDXP01' }
-            }
-        }
-        $manifest.volumeDeliveries[$volume] = $byHash[$hash]
-    }
-    $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $directory 'release.json')
-    $filename = "SearchBar_Edwin-$($evidence.version)-$($commit.Substring(0,7))-$($fingerprint.Substring(0,12))-win-x64.zip"
-    $candidate = Join-Path $work $filename
-    # 以流式创建模式写入程序和种子，避免在内存或暂存目录中再复制整份大数据库。
-    $source = [IO.File]::Open($seed,'Open','Read','Read')
-    try {
-        foreach ($suffix in '-wal','-journal') {
-            if ([IO.File]::Exists($seed+$suffix) -and (Get-Item -LiteralPath ($seed+$suffix)).Length -gt 0) {
-                throw '请通过 SQLite 备份生成独立种子，再用于发布。'
-            }
-        }
-        $zip = [IO.Compression.ZipFile]::Open($candidate,'Create')
-        try {
-            foreach ($file in [IO.Directory]::EnumerateFiles($directory,'*',[IO.SearchOption]::AllDirectories)) {
-                $member = [IO.Path]::GetRelativePath($stage,$file).Replace('\','/')
-                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,$member,[IO.Compression.CompressionLevel]::Fastest)
-            }
-            # 词库占包体的大部分，对这一项使用 Optimal 以减小下载体积。
-            $entry = $zip.CreateEntry('SearchBar_Edwin-win-x64/Data/dictionaries.db',[IO.Compression.CompressionLevel]::Optimal)
-            $stream = $entry.Open()
-            try { $source.CopyTo($stream) } finally { $stream.Dispose() }
-            # 仅发布当批种子确实引用的原书，历史版本与修复隔离区留在本机。
-            foreach ($hash in $indexedSources) {
-                $file = Join-Path ($seed + '.sources') ($hash + '.mdx')
-                if ($byHash.ContainsKey($hash)) { $file = Join-Path $work "$hash.mdxp" }
-                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,
-                    ("SearchBar_Edwin-win-x64/Data/dictionaries.db.sources/" + [IO.Path]::GetFileName($file)),[IO.Compression.CompressionLevel]::NoCompression)
-            }
-            foreach ($hash in $mergedResources) {
-                $file = Join-Path (Split-Path $seed) "merged-resources/$hash.mdd"
-                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$file,
-                    "SearchBar_Edwin-win-x64/Data/merged-resources/$hash.mdd",[IO.Compression.CompressionLevel]::NoCompression)
-            }
-        } finally { $zip.Dispose() }
-    } finally { $source.Dispose() }
-    Test-ReleaseZip $candidate $cache
-    $destination = Join-Path $delivery $filename
-    if ([IO.File]::Exists($destination)) {
-        # 重新发布同一源码时，给本次通过验收的包独立命名，保留以前的交付。
-        $destination = Join-Path $delivery ([IO.Path]::GetFileNameWithoutExtension($filename) + '-' + [guid]::NewGuid().ToString('N').Substring(0,8) + '.zip')
-    }
-    [IO.File]::Move($candidate,$destination)
-    Write-Output "发布包 $destination"
-}
-
-if ($PackageSeed -or $VerifyReleaseZip) {
-    if ($PackageSeed -and $VerifyReleaseZip) { throw '打包和复验已有 ZIP 请分别执行。' }
-    $delivery = Join-Path $PSScriptRoot 'bin/release-delivery'
-    $cache = Join-Path $delivery '.work/verify'
-    $previousEncoding = [Console]::OutputEncoding
-    try {
-        # EXE 始终输出 UTF-8。打包和解压复验共用该合同，避免两次都按同一个错误代码页解码而误报通过。
-        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-        if ($VerifyReleaseZip) { Test-ReleaseZip (Resolve-Path -LiteralPath $VerifyReleaseZip).Path $cache }
-        else { New-ReleaseZip $PackageSeed $delivery $cache }
-    } finally { [Console]::OutputEncoding = $previousEncoding }
-    return
-}
-
 $app = Join-Path $PSScriptRoot 'bin/Release/net10.0/SearchBar_Edwin.dll'
 if (-not (Test-Path -LiteralPath $app)) { throw '请先执行 dotnet build -c Release' }
 if ($RealDatabase) { $RealDatabase = (Resolve-Path -LiteralPath $RealDatabase).Path }
@@ -1152,6 +847,7 @@ function Test-CatalogVolumes($Store, [Reflection.Assembly]$Assembly, [string]$Da
 }
 
 function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, [switch]$Audio) {
+    if ($Assembly) { Initialize-CoreTestSupport }
     $dir = [IO.Directory]::CreateDirectory((Join-Path $Directory ([guid]::NewGuid().ToString('N')))).FullName
     $previous = $env:E_SEARCH_DB
     try {
@@ -1230,10 +926,8 @@ function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, 
         Assert-Equal (@(Invoke-Search @('article','zh-en','helper')) -join ' ') '<p>指定来源</p>' '辅助页可按卷内精确键打开'
         if ($Assembly) {
             # 使用实际详情窗的 URL 改写入口，再用改写后的卷内键读取合成原生实体补救页。
-            $rewrite = $Assembly.GetType('ESearch.SearchWindow',$true).GetMethod('RewriteMergedLinks',[Reflection.BindingFlags]'Static,NonPublic')
-            Assert-Equal ($null -ne $rewrite) $true '详情窗包含同源补充跳转绑定'
             $sourceHtml = @(Invoke-Search @('article','zh-ja','alias')) -join ' '
-            $navigation = $rewrite.Invoke($null,@($sourceHtml,'/page-2'))
+            $navigation = [ESearch.Tests.CoreLogic]::RewriteMergedLinks($sourceHtml,'/page-2')
             $url = [regex]::Match($navigation,'href="([^"]+)"').Groups[1].Value
             Assert-Equal $url ("/page-2/lookup/" + $appTarget) 'SearchBar_Edwin 实体补救链接改写为该文档的内部路径'
             $target = [Uri]::UnescapeDataString($url.Substring('/page-2/lookup/'.Length))
@@ -1280,8 +974,7 @@ function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, 
                     Assert-Equal $article.Html $articleBefore.Html '正文和卷内链接保持原值'
                     Assert-Equal $article.SourceNames['oxford'] '牛津 <主书>' '正文取得同一来源名'
                     $header = '<a name="es-oxford-1"></a><a name="es-hanying-2"></a><div class="es-label"><b>牛津 #1 · 汉英 #2</b></div>'
-                    $render = $Assembly.GetType('ESearch.SearchWindow').GetMethod('EncodeMergedDocument',[Reflection.BindingFlags]'Static,NonPublic')
-                    $document = [Text.Encoding]::UTF8.GetString($render.Invoke($null,@($header,'/test',$article.SourceNames)))
+                    $document = [Text.Encoding]::UTF8.GetString([ESearch.Tests.CoreLogic]::EncodeMergedDocument($header,'/test',$article.SourceNames))
                     Assert-Equal ($document.Contains($header.Replace('牛津 #1','牛津 &lt;主书&gt; #1'))) $true '共用正文只改指定来源并转义名称'
                 } finally { $reader.Dispose() }
                 $store.SetCatalogName($true,'zh-en','')
@@ -1550,6 +1243,28 @@ public static class ESearchRacePublish {
         }
         $publisher=$Assembly.GetType('ManagedMdx').GetMethod('PublishVerified',[Reflection.BindingFlags]'NonPublic,Static')
         $hash=(Get-FileHash -LiteralPath $source).Hash
+        $packed=[IO.Path]::Combine($Directory,'cancel-publish.mdxp')
+        [MdxReader]::PackDelivery($source,$packed,$hash)
+        $folder=[IO.Directory]::CreateDirectory((Join-Path $Directory 'cancel-publish')).FullName
+        $target=[IO.Path]::Combine($folder,"$hash.mdx")
+        $existing=[byte[]](1,2,3)
+        [IO.File]::WriteAllBytes($target,$existing)
+        [IO.File]::WriteAllBytes([IO.Path]::Combine($folder,'other.tmp'),$existing)
+        $cancel=[Threading.CancellationTokenSource]::new()
+        try {
+            $stage=[Action[string]]{
+                param([string]$temporary)
+                # 在真实 MDXP 校验还原完成、正式目标尚未发布时确定性取消。
+                [MdxReader]::RestoreDelivery($packed,$temporary,$hash,$cancel.Token)
+                $cancel.Cancel()
+            }
+            $canceled=$false
+            try { $null=$publisher.Invoke($null,@($target,[string]$hash,$cancel.Token,$stage)) }
+            catch { if ($_.Exception.GetBaseException() -isnot [OperationCanceledException]) { throw }; $canceled=$true }
+            Assert-Equal $canceled $true '还原完成时取消会报告取消'
+            Assert-Equal ([BitConverter]::ToString([IO.File]::ReadAllBytes($target))) '01-02-03' '取消保留原目标'
+            Assert-Equal ((Get-ChildItem -LiteralPath $folder -Filter '*.tmp' -Name) -join '|') 'other.tmp' '取消只清除本次已校验的暂存文件'
+        } finally { $cancel.Dispose() }
         foreach($ext in 'mdx','mdd'){
             $folder=Join-Path $Directory ("publisher-$ext-"+[guid]::NewGuid().ToString('N'))
             $target=Join-Path $folder "$hash.$ext"
@@ -1828,52 +1543,10 @@ function Test-ImportRecovery([string]$Directory,[Reflection.Assembly]$Assembly) 
     } finally { $env:E_SEARCH_DB=$previousDb }
 }
 
-function Test-Calculation([Reflection.Assembly]$Assembly) {
-    $calculator = $Assembly.GetType('ESearch.SearchWindow', $true).GetMethod('TryCalculate', [Reflection.BindingFlags]'Static,NonPublic')
-    foreach ($case in ([ordered]@{
-        '2+3*4' = '14'
-        '(2+3)*4' = '20'
-        ' -(2 + (3 - 1)) * 4' = '-16'
-        '18 ÷ 3 × 2' = '12'
-        '-0.5' = '-0.5'
-        '1.2 / -0.4' = '-3'
-        '0.1+0.2' = '0.3'
-        '9007199254740993+1' = '9007199254740994'
-        '18/3/2' = '3'
-        '10-3-2' = '5'
-        '2^3^2' = '512'
-        '-2^2' = '-4'
-        '(-2)^2' = '4'
-        '2^-3' = '0.125'
-        'sqrt(2^4)+abs(-3)' = '7'
-        'sin(30)' = '0.5'
-        'cos(180)' = '-1'
-        'cos(90)' = '0'
-        'tan(45)' = '1'
-        'exp(ln(e)-1)' = '1'
-        'log(1000)' = '3'
-        'LOG10(100)' = '2'
-        '10^-40' = '1E-40'
-        'π/pi' = '1'
-        '1e3+1' = '1001'
-        '1E-3*2' = '0.002'
-    }).GetEnumerator()) {
-        $arguments = [object[]]@($case.Key, '')
-        $recognized = $calculator -and $calculator.Invoke($null, $arguments)
-        Assert-Equal $recognized $true "应识别算式 $($case.Key)"
-        Assert-Equal $arguments[1] $case.Value "算式 $($case.Key)"
-    }
-    foreach ($term in '2026','2.5','pi','π','e','report(2).pdf','2+3.txt','(2+3','2+3)','1/0','2(3)',
-        'sqrt(16).pdf','unknown(16)','sqrt(-1)','ln(0)','tan(90)','(-2)^0.5','exp(10000)',
-        '1/(1e308*1e308)','sqrt(-1)^0','2^','1e+','1e-3') {
-        $arguments = [object[]]@($term, '')
-        Assert-Equal ($calculator.Invoke($null, $arguments)) $false "保留普通搜索 $term"
-    }
-    foreach ($deep in (('2^' * 1000) + '1'), (('sqrt(' * 1000) + '1' + (')' * 1000))) {
-        $arguments = [object[]]@($deep, '')
-        Assert-Equal ($calculator.Invoke($null, $arguments)) $false '过深的幂链或函数嵌套'
-    }
-    Write-Output 'PASS 四则运算、幂与科学函数、角度制及普通搜索识别'
+function Test-Calculation {
+    Initialize-CoreTestSupport
+    $count = [ESearch.Tests.CoreLogic]::CheckCalculator()
+    Write-Output "PASS $count 项计算器案例：四则运算、幂与科学函数、角度制及普通搜索识别"
 }
 
 function Test-FileNameCompletions([string]$Scratch, [Reflection.Assembly]$Assembly) {
@@ -2526,6 +2199,32 @@ function Test-FileDisplayLayout([Reflection.Assembly]$Assembly,[string]$Director
         Write-Output 'PASS WPF 文件行在 736/360 DIP 显示完整可辨目录'
     } finally {
         $w.GetType().GetField('exiting',[Reflection.BindingFlags]'NonPublic,Instance').SetValue($w,$true)
+        $w.Close()
+    }
+}
+
+function Test-DetailResourceReopen([Reflection.Assembly]$Assembly,[string]$Directory) {
+    Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
+    foreach ($library in 'Microsoft.Web.WebView2.Core','Microsoft.Web.WebView2.Wpf') {
+        $null=[Reflection.Assembly]::LoadFrom((Join-Path (Split-Path $Assembly.Location) "$library.dll"))
+    }
+    $archive=[IO.Path]::Combine($Directory,'detail-reopen.mdd')
+    Write-Mdx $archive ([ordered]@{'\es\test\proof.bin'=[byte[]](3,8,13)}) -Resource
+    $w=[ESearch.SearchWindow]::new((Join-Path $Directory 'detail-reopen.db'),$null)
+    $flags=[Reflection.BindingFlags]'NonPublic,Instance'
+    try {
+        # 用真实窗口的关闭路径和 MDD 加载器核对资源实例，避免用耗时阈值判断是否重读。
+        $cache=$w.GetType().GetField('mergedResourceTasks',$flags).GetValue($w)
+        $get=$cache.GetType().GetMethod('GetAsync',$flags)
+        $argsForLoad=@($archive,[Threading.CancellationToken]::None)
+        $loaded=$get.Invoke($cache,$argsForLoad).GetAwaiter().GetResult()
+        Assert-Equal $loaded.Count 1 '详情验收加载一项真实 MDD 资源'
+        $null=$w.GetType().GetMethod('CloseDetails',$flags).Invoke($w,@())
+        $reopened=$get.Invoke($cache,$argsForLoad).GetAwaiter().GetResult()
+        Assert-Equal ([object]::ReferenceEquals($loaded,$reopened)) $true '收起后重开复用同一个已解包资源'
+        Write-Output 'PASS 收起再展开同卷时复用已加载的 MDD'
+    } finally {
+        $w.GetType().GetField('exiting',$flags).SetValue($w,$true)
         $w.Close()
     }
 }
@@ -3410,6 +3109,7 @@ BEGIN SELECT RAISE(ABORT,'重复写入同一条记录的检索键'); END
 }
 
 function Test-SanseidoSummary([string]$Scratch, [Reflection.Assembly]$Assembly) {
+    Initialize-CoreTestSupport
     $previous = $env:E_SEARCH_DB
     $env:E_SEARCH_DB = Join-Path $Scratch 'sanseido-summary.db'
     try {
@@ -3463,9 +3163,8 @@ function Test-SanseidoSummary([string]$Scratch, [Reflection.Assembly]$Assembly) 
                 Assert-Equal ($reader.CurrentBody($hit.Entry)) $words[$key] "三省堂详情原文 $key"
             }
         } finally { $reader.Dispose() }
-        if ($window = $Assembly.GetType('ESearch.SearchWindow')) {
-            $static=[Reflection.BindingFlags]'Static,NonPublic'
-            $plain=$window.GetMethod('FormatDetail',$static).Invoke($null,@($words.accelerator,$null,'sanseido'))
+        if ($Assembly) {
+            $plain=[ESearch.Tests.CoreLogic]::FormatDetail($words.accelerator,$null,'sanseido')
             Assert-Equal ($plain.Text -split '\r?\n')[-1].EndsWith('アクセル(1)') $true '三省堂详情保留可见的义项号'
             Assert-Equal ($plain.Text.Contains('">')) $false '三省堂详情不显示损坏属性的边界'
             $digest=[Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes('アクセル<font color='))
@@ -3474,12 +3173,12 @@ function Test-SanseidoSummary([string]$Scratch, [Reflection.Assembly]$Assembly) 
             $good='<a href="/page/lookup/'+$key+'">アクセル<font color="#008000">(1)</font></a>'
             $other=$bad.Replace('entry://','/page/lookup/')
             $html='<div class="es-source es-sanseido">'+$bad+'</div><div class="es-source es-oxford">'+$bad+'</div>'
-            $got=$window.GetMethod('RewriteMergedLinks',$static).Invoke($null,@($html,'/page'))
+            $got=[ESearch.Tests.CoreLogic]::RewriteMergedLinks($html,'/page')
             Assert-Equal $got ('<div class="es-source es-sanseido">'+$good+'</div><div class="es-source es-oxford">'+$other+'</div>') '仅在三省堂来源修复链接文字并保留实际目标'
             $fake=$html.Replace($key,('esmissing-sanseido-'+('a'*64)))
-            Assert-Equal ($window.GetMethod('RewriteMergedLinks',$static).Invoke($null,@($fake,'/page'))) ($fake.Replace('entry://','/page/lookup/')) '目标哈希与原前缀不同时保留损坏现场'
+            Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($fake,'/page')) ($fake.Replace('entry://','/page/lookup/')) '目标哈希与原前缀不同时保留损坏现场'
             $mismatch=('<div class="es-source es-sanseido">'+$bad+'</div>').Replace('アクセル<font color="#008000">(1)','アクセル<font color="#008000">(2)')
-            Assert-Equal ($window.GetMethod('RewriteMergedLinks',$static).Invoke($null,@($mismatch,'/page'))) ($mismatch.Replace('entry://','/page/lookup/')) '前后的义项号不同，不推断或移除残片'
+            Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($mismatch,'/page')) ($mismatch.Replace('entry://','/page/lookup/')) '前后的义项号不同，不推断或移除残片'
         }
         # 按需词库的旧戳也可能把词性而非正文存进摘要，且无多余的引号可供检测。
         Invoke-Search @('import-indexed','sanseido',$mdx) | Out-Null
@@ -4174,9 +3873,9 @@ function Test-HanyingReferences([string]$Scratch) {
 }
 
 function Test-SecondPassDisplay([Reflection.Assembly]$Assembly) {
-    $window = $Assembly.GetType('ESearch.SearchWindow')
+    Initialize-CoreTestSupport
+
     $static = [Reflection.BindingFlags]'Static,NonPublic'
-    $detail = $window.GetMethod('FormatDetail',$static)
     $shownHead = [LookupEntry].GetProperty('DisplayHeadword',[Reflection.BindingFlags]'Instance,NonPublic')
     # 这些完整标签直接来自三部原书；读音、脚注及 HTML 字面示例仍按原文显示。
     foreach ($row in @(
@@ -4194,12 +3893,12 @@ function Test-SecondPassDisplay([Reflection.Assembly]$Assembly) {
         @('oxford','品脱(容量单位,为 <Sup>1</up>/8加仑','品脱(容量单位,为 ⅛加仑'),
         @('other','C<sub>2</sub>・Google(font size=-2><sup>TM</sup></font>','C2・Google(font size=-2>TM')
     )) {
-        Assert-Equal ($detail.Invoke($null,@($row[1],$null,$row[0]))).Text $row[2] "原书上下标 $($row[0]) $($row[1])"
+        Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($row[1],$null,$row[0])).Text $row[2] "原书上下标 $($row[0]) $($row[1])"
     }
     $legacy = 'Google(font size=-2><sup>TM</sup></font>・为 <Sup>1</up>/8加仑'
     $ox = '<div class="es-source es-oxford"><a name="es-oxford-15994"></a><a href="#origin">' + $legacy + '</a></div>'
     $foreign = '<div class="es-source es-hanying">' + $legacy + '</div>'
-    $encoded = $window.GetMethod('EncodeMergedDocument',$static).Invoke($null,@(($ox + $foreign),'/test',$null))
+    $encoded = [ESearch.Tests.CoreLogic]::EncodeMergedDocument(($ox + $foreign),'/test',$null)
     $merged = [Text.Encoding]::UTF8.GetString($encoded)
     Assert-Equal ($merged.Contains($ox.Replace($legacy,'Google™・为 ⅛加仑') + $foreign)) $true '牛津合并页保留链接、锚点与其他书同形片段'
     $parser = $Assembly.GetType('EntryParser')
@@ -4224,58 +3923,55 @@ function Test-SecondPassDisplay([Reflection.Assembly]$Assembly) {
     }
     # 取自三合一 ADB 的两个物理条目，后文的字面标记不得当成条目序号。
     $serial = "<br><font color=black>ADB&+{2}`r`n<br><font color=blue>ADB`r`n<br><font color=red>【African Development Bank】例 A&+{2}"
-    $plain = $detail.Invoke($null,@($serial,$null,'sango')).Text
+    $plain = [ESearch.Tests.CoreLogic]::FormatDetail($serial,$null,'sango').Text
     Assert-Equal (($plain -split '\r?\n')[0]) 'ADB〔2〕' '同形词编号可阅读'
     Assert-Equal ($plain.Contains('例 A&+{2}')) $true '正文内普通符号保留'
-    Assert-Equal ($detail.Invoke($null,@($serial,$null,'other')).Text.Contains('ADB&+{2}')) $true '别书不套用三合一格式'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($serial,$null,'other').Text.Contains('ADB&+{2}')) $true '别书不套用三合一格式'
     # 现代汉英“安全”的词头、义项和双语例句分别由不同的 span 标注。
     $body='<span class="CK"><span class="DC">安全</span><span class="JS"><span class="YX">安全</span><span class="JX">safe</span><span class="LJ"><span class="LY">安全转移</span><span class="LS">move to places of safety;</span></span></span></span>'
-    $plain = $detail.Invoke($null,@($body,$null,'hanying')).Text
+    $plain = [ESearch.Tests.CoreLogic]::FormatDetail($body,$null,'hanying').Text
     Assert-Equal (($plain -split '\r?\n') -join '|') '安全|安全|safe|安全转移|move to places of safety;' '缺少原样式表时还原双语例句的边界'
-    Assert-Equal ($detail.Invoke($null,@($body,$null,'other')).Text.Contains('安全转移move')) $true '普通自定义词书沿用自己的格式'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($body,$null,'other').Text.Contains('安全转移move')) $true '普通自定义词书沿用自己的格式'
     $section = '<div class="es-source es-sango"><a name="es-sango-242"></a><div class="es-label"><b>三合一日语辞典 #242</b></div>'
-    $render = $window.GetMethod('EncodeMergedDocument',$static)
-    $rendered = [Text.Encoding]::UTF8.GetString($render.Invoke($null,@(($section+$serial+'</div>'),'/v/test',$null)))
+    $rendered = [Text.Encoding]::UTF8.GetString([ESearch.Tests.CoreLogic]::EncodeMergedDocument(($section+$serial+'</div>'),'/v/test',$null))
     Assert-Equal ($rendered.Contains($section+'<br><font color=black>ADB〔2〕')) $true '旧合并页面的来源锚点和编号'
     Assert-Equal ($rendered.Contains('例 A&+{2}')) $true '旧合并页面的正文符号'
     # 新世纪 #24331 用图片隔开日中释义，用 example-source 标出日文例句。
     $shin = '<span>すき間ができる。</span><span class="divide-imgs"><img alt="" src="sep.png"/></span><span>开，漏。</span><div class="unit-example"><strong class="dot">⇒</strong><p><span class="example-source">穴が—·く</span><span>漏了个洞。</span></p></div>'
-    $jaLines = $detail.Invoke($null,@($shin,$null,'shinseiki')).Text -split '\r?\n'
+    $jaLines = [ESearch.Tests.CoreLogic]::FormatDetail($shin,$null,'shinseiki').Text -split '\r?\n'
     Assert-Equal ($jaLines -join '|') 'すき間ができる。|开，漏。|⇒穴が—·く|漏了个洞。' '日中释义和例句逐行可读'
-    Assert-Equal ($detail.Invoke($null,@($shin,$null,'other')).Text.Contains('穴が—·く漏了个洞。')) $true '别书相同标记保留其格式'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($shin,$null,'other').Text.Contains('穴が—·く漏了个洞。')) $true '别书相同标记保留其格式'
     $ox = '<font color=blue size=+2><b><font color=red size=5>♠ </font>credit</b></font><hr color=blue noshade><font color=blue size=+1><b>credit </b></font> /'
-    Assert-Equal (($detail.Invoke($null,@($ox,$null,'oxford')).Text -split '\r?\n') -join '|') '♠ credit|credit  /' '牛津词头与下方读音栏之间的水平线'
+    Assert-Equal (([ESearch.Tests.CoreLogic]::FormatDetail($ox,$null,'oxford').Text -split '\r?\n') -join '|') '♠ credit|credit  /' '牛津词头与下方读音栏之间的水平线'
     $note = '<p>」が異体字になっていたので修正した。">'
-    Assert-Equal ($detail.Invoke($null,@($note,$null,'shogakukan')).Text) '」が異体字になっていたので修正した。' '鉄格子保留编辑原注并去除末尾引号尖括号残片'
-    Assert-Equal ($detail.Invoke($null,@($note,$null,'other')).Text) $note.Substring(3) '别书的字面引号和尖括号'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($note,$null,'shogakukan').Text) '」が異体字になっていたので修正した。' '鉄格子保留编辑原注并去除末尾引号尖括号残片'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($note,$null,'other').Text) $note.Substring(3) '别书的字面引号和尖括号'
 }
 
 function Test-ShogakukanJoinedDetail([Reflection.Assembly]$Assembly) {
-    $window = $Assembly.GetType('ESearch.SearchWindow')
+    Initialize-CoreTestSupport
+
     $flags = [Reflection.BindingFlags]'Static,NonPublic'
-    $detail = $window.GetMethod('FormatDetail',$flags)
-    $encode = $window.GetMethod('EncodeMergedDocument',$flags)
     # 原书把“噪音”整篇接在“噪声污染”后面，两篇只有一个物理序号；第二篇里的真正例句须保留。
     $body = "<br>zàoshēng wūrǎn<font color=red>【噪声污染】</font>`r`n<br>騒音公害．`r`n<p><font color=green>例：</font></>`r`n噪音  `r`n<br>zàoyīn<font color=red>【噪音】</font>`r`n<br>雑音．`r`n<p><font color=green>例：</font><br>白～"
     $clean = $body.Replace('<p><font color=green>例：</font></>','<p>')
-    Assert-Equal ($detail.Invoke($null,@($body,$null,'shogakukan-zhja')).Text) ($detail.Invoke($null,@($clean,$null,'shogakukan-zhja')).Text) '两篇正文及真正的例句完整显示'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($body,$null,'shogakukan-zhja').Text) ([ESearch.Tests.CoreLogic]::FormatDetail($clean,$null,'shogakukan-zhja').Text) '两篇正文及真正的例句完整显示'
     foreach ($different in '【其它】','zàoyǐn','【别字】') {
         $old = switch ($different) {'【其它】' {'【噪声污染】'} 'zàoyǐn' {'zàoyīn'} '【别字】' {'【噪音】'}}
         $other = $body.Replace($old,$different)
-        Assert-Equal ($detail.Invoke($null,@($other,$null,'shogakukan-zhja')).Text.Contains('例：</>')) $true '父词头、拼音和第二标题须相符'
+        Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($other,$null,'shogakukan-zhja').Text.Contains('例：</>')) $true '父词头、拼音和第二标题须相符'
     }
     $section = '<div class="es-source es-shogakukan-zhja"><a name="es-shogakukan-zhja-17139"></a>'
     $interleaved = $body.Replace('騒音公害．','騒音公害．<font color=red>【引用】</font>')
-    Assert-Equal ($detail.Invoke($null,@($interleaved,$null,'shogakukan-zhja')).Text.Contains('例：</>')) $true '相隔另一个词头时保留例句标记'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($interleaved,$null,'shogakukan-zhja').Text.Contains('例：</>')) $true '相隔另一个词头时保留例句标记'
     $foreign = '<div class="es-source es-sango">' + $body + '</div>'
-    $page = [Text.Encoding]::UTF8.GetString($encode.Invoke($null,@(($section + $body + '</div>' + $foreign),'/local/1',$null)))
+    $page = [Text.Encoding]::UTF8.GetString([ESearch.Tests.CoreLogic]::EncodeMergedDocument(($section + $body + '</div>' + $foreign),'/local/1',$null))
     Assert-Equal ($page.Contains($section + $clean + '</div>' + $foreign)) $true '已保存合并页只改该书分区的分隔'
     $hiddenHeading = '<span hidden><font color=red>【引用】</font></span><!--<font color=red>【另一篇】</font>-->'
     $mixed = $section + $body.Replace('騒音公害．','騒音公害．' + $hiddenHeading) + '</div>'
-    $rewrite = $window.GetMethod('RewriteMergedLinks',$flags)
-    Assert-Equal ($rewrite.Invoke($null,@($mixed,'/local/1'))) ($mixed.Replace('<p><font color=green>例：</font></>', '<p>')) '夹在相邻真标题间的隐藏词头不切断连页依据'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($mixed,'/local/1')) ($mixed.Replace('<p><font color=green>例：</font></>', '<p>')) '夹在相邻真标题间的隐藏词头不切断连页依据'
     $falseHead = $section + $body.Replace('<font color=red>【噪声污染】</font>','<!--<font color=red>【噪声污染】</font>-->') + '</div>'
-    Assert-Equal ($rewrite.Invoke($null,@($falseHead,'/local/1'))) $falseHead '注释里的小学馆标题不能作为修订依据'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($falseHead,'/local/1')) $falseHead '注释里的小学馆标题不能作为修订依据'
     $emptyExample = '<p><font color=green>例：</font></>'
     $supplement = '<p><font color=red>【補足】</font>'
     # 两条均从小学馆中日原书按物理序号取样，保留栏目、读音和第二篇正文的原始边界。
@@ -4286,15 +3982,15 @@ function Test-ShogakukanJoinedDetail([Reflection.Assembly]$Assembly) {
         $article = "<br>$($row[1])<font color=red>【$($row[2])】</font>`r`n$supplement`r`n<br>$($row[3])`r`n$emptyExample`r`n$($row[4])  `r`n<br>$($row[5])<font color=red>【$($row[4])】</font>`r`n<br>$($row[6])"
         $prefix = '<div class="es-source es-shogakukan-zhja"><a name="es-shogakukan-zhja-' + $row[0] + '"></a>'
         $fixed = $article.Replace($emptyExample,'<p>')
-        Assert-Equal ($rewrite.Invoke($null,@(($prefix+$article+'</div>'),'/test'))) ($prefix+$fixed+'</div>') "保留原书栏目并连接下一词头 #$($row[0])"
-        Assert-Equal ($detail.Invoke($null,@($article,$null,'shogakukan-zhja')).Text) ($detail.Invoke($null,@($fixed,$null,'shogakukan-zhja')).Text) "普通详情识别补足栏目 #$($row[0])"
+        Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks(($prefix+$article+'</div>'),'/test')) ($prefix+$fixed+'</div>') "保留原书栏目并连接下一词头 #$($row[0])"
+        Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($article,$null,'shogakukan-zhja').Text) ([ESearch.Tests.CoreLogic]::FormatDetail($fixed,$null,'shogakukan-zhja').Text) "普通详情识别补足栏目 #$($row[0])"
         $realHeading = $article.Replace($supplement,'<br>ほそく<font color=red>【補足】</font>')
-        Assert-Equal ($rewrite.Invoke($null,@(($prefix+$realHeading+'</div>'),'/test'))) ($prefix+$realHeading+'</div>') '同名的真实中间标题仍会隔断连页'
+        Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks(($prefix+$realHeading+'</div>'),'/test')) ($prefix+$realHeading+'</div>') '同名的真实中间标题仍会隔断连页'
     }
 }
 
 function Test-ShinseikiTruncatedDetail([Reflection.Assembly]$Assembly) {
-    $detail = $Assembly.GetType('ESearch.SearchWindow').GetMethod('FormatDetail',[Reflection.BindingFlags]'Static,NonPublic')
+    Initialize-CoreTestSupport
     # “口”和“迦葉”的原书在标签中间截断，后面仍可能另起义项。保留前后正文及转义后的字面示例。
     foreach ($row in @(
         @('<p>へらず口をきく。</span><span class="divide-imgs</p></div></div>', 'へらず口をきく。'),
@@ -4302,25 +3998,25 @@ function Test-ShinseikiTruncatedDetail([Reflection.Assembly]$Assembly) {
         @('<p>対義は&lt;--&gt;。字面：&lt;span class="divide-imgs&lt;/p&gt;</p>', '対義は<-->。字面：<span class="divide-imgs</p>'),
         @('<span>前文。</span><img alt="" src="data:image/png;base64,iVBORw0KGg</span><span>后文。</span>', '前文。[原书图片标签截断]后文。')
     )) {
-        Assert-Equal ($detail.Invoke($null,@($row[0],$null,'shinseiki')).Text) $row[1] '新世纪原书截断点保持正文边界'
+        Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($row[0],$null,'shinseiki').Text) $row[1] '新世纪原书截断点保持正文边界'
     }
-    Assert-Equal ($detail.Invoke($null,@('释义<span class="divide-imgs</p>',$null,'other')).Text) '释义<span class="divide-imgs' '其它来源沿用原格式'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail('释义<span class="divide-imgs</p>',$null,'other').Text) '释义<span class="divide-imgs' '其它来源沿用原格式'
     $shown = [LookupEntry].GetProperty('DisplayGloss',[Reflection.BindingFlags]'NonPublic,Instance')
     $header = '<h1><span class="word">ヘキサン</span></h1>'
     $formula = 'C<sub><</sub>sup>6H<sub><</sub>sup>14'
     $body = $header + '<span>分子式' + $formula + '5種の异性体</span>'
-    $before = $detail.Invoke($null,@($body,$null,'shinseiki')).Text
+    $before = [ESearch.Tests.CoreLogic]::FormatDetail($body,$null,'shinseiki').Text
     Assert-Equal ($before.Contains('C₆H₁₄5種の异性体')) $true '紧邻分子式的异构体个数 5 仍是正文'
     $vitamin = '<h1><span class="word">造血薬</span></h1><span>B<sub><</sub>sup>12'
     foreach ($suffix in '3','３') {
         $longer = $vitamin + $suffix + '</span>'
-        Assert-Equal ($detail.Invoke($null,@($longer,$null,'shinseiki')).Text.Contains('B₁₂')) $false '长数字不套用 B12 的校勘规则'
+        Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($longer,$null,'shinseiki').Text.Contains('B₁₂')) $false '长数字不套用 B12 的校勘规则'
         $summary = [LookupEntry]::new('shinseiki',1,'ja',1,'造血薬',$null,('Bsup>12'+$suffix))
         Assert-Equal ($shown.GetValue($summary)) ('Bsup>12'+$suffix) '旧库摘要同样保护更长的数字'
     }
-    Assert-Equal ($detail.Invoke($null,@(($vitamin + '。</span>'),$null,'shinseiki')).Text.Contains('B₁₂。')) $true '完整 B12 后的标点保留'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail(($vitamin + '。</span>'),$null,'shinseiki').Text.Contains('B₁₂。')) $true '完整 B12 后的标点保留'
     $other = $vitamin.Replace('造血薬','引用') + '。</span>'
-    $twice = $detail.Invoke($null,@(($vitamin + '。</span>' + $other),$null,'shinseiki')).Text
+    $twice = [ESearch.Tests.CoreLogic]::FormatDetail(($vitamin + '。</span>' + $other),$null,'shinseiki').Text
     Assert-Equal ([regex]::Matches($twice,'B₁₂').Count) 1 '同页其他词头不借用上一词条的公式修订'
     $stored = [LookupEntry]::new('shinseiki',1,'ja',1,'ヘキサン',$null,'分子式Csup>6Hsup>14。有5种异构体')
     Assert-Equal ($shown.GetValue($stored)) '分子式C₆H₁₄。有5种异构体' '旧库存摘要的公式与物理原文一致'
@@ -4328,42 +4024,40 @@ function Test-ShinseikiTruncatedDetail([Reflection.Assembly]$Assembly) {
     $power = $powerTitle + '<span>对于a<sup><sub><</sub>/sup>n而言的n。</sup></span>'
     $section = '<div class="es-source es-shinseiki"><a name="es-shinseiki-195342"></a>'
     $foreign = '<div class="es-source es-sango">' + $power + '</div>'
-    $encoder = $Assembly.GetType('ESearch.SearchWindow').GetMethod('EncodeMergedDocument',[Reflection.BindingFlags]'Static,NonPublic')
-    $page = [Text.Encoding]::UTF8.GetString($encoder.Invoke($null,@(($section + $power + '</div>' + $foreign),'/local/1',$null)))
+    $page = [Text.Encoding]::UTF8.GetString([ESearch.Tests.CoreLogic]::EncodeMergedDocument(($section + $power + '</div>' + $foreign),'/local/1',$null))
     Assert-Equal ($page.Contains($section + $powerTitle + '<span>对于aⁿ而言的n。</span></div>' + $foreign)) $true '复原幂指数后普通句子脱离上标'
-    $rewrite = $Assembly.GetType('ESearch.SearchWindow').GetMethod('RewriteMergedLinks',[Reflection.BindingFlags]'Static,NonPublic')
     $bad = 'B<sub><</sub>sup>12'
     $rawText = $section + '<h1><span class="word">造血薬</span></h1><script>let x="<!--";</script><p>' + $bad + '</p></div>'
     $fakeSource = $rawText.Replace('<script>let x="<!--";</script>','<!--<div class="es-source es-oxford">-->')
-    Assert-Equal ($rewrite.Invoke($null,@($fakeSource,'/test'))) ($fakeSource.Replace($bad,'B₁₂')) '注释中的来源包装标签不能改变后续可见词条的来源'
-    Assert-Equal ($rewrite.Invoke($null,@($rawText,'/test'))) ($rawText.Replace($bad,'B₁₂')) '脚本中的注释字面量不能遮住脚本之后的正文'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($fakeSource,'/test')) ($fakeSource.Replace($bad,'B₁₂')) '注释中的来源包装标签不能改变后续可见词条的来源'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($rawText,'/test')) ($rawText.Replace($bad,'B₁₂')) '脚本中的注释字面量不能遮住脚本之后的正文'
     $protected = '<span hidden>' + $bad + '</span><b style="display:none">' + $bad + '</b><i style="visibility:hidden">' + $bad + '</i><!--' + $bad + '--><a title="' + $bad + '">x</a>'
     $fakeTitle = '<template><h1><span class="word">引用</span></h1></template>'
     $mixed = $section + '<h1><span class="word">造血薬</span></h1>' + $protected + $fakeTitle + '<p>' + $bad + '</p></div>'
-    Assert-Equal ($rewrite.Invoke($null,@($mixed,'/test'))) ($mixed.Replace(('<p>'+$bad+'</p>'),'<p>B₁₂</p>')) '旧卷仅修可见 B12；模板伪标题、属性与隐藏兄弟逐字保留'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($mixed,'/test')) ($mixed.Replace(('<p>'+$bad+'</p>'),'<p>B₁₂</p>')) '旧卷仅修可见 B12；模板伪标题、属性与隐藏兄弟逐字保留'
     $child = '<em style="visibility:visible">' + $bad + '</em>'
     $duplicates = $section + '<h1><span class="word">造血薬</span></h1><p class="word" CLASS="es-label" style="display:inline" STYLE="display:none">' + $bad + '</p></div>'
-    Assert-Equal ($rewrite.Invoke($null,@($duplicates,'/test'))) ($duplicates.Replace($bad,'B₁₂')) '重复 class 和 style 仅首项决定公式是否可见'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($duplicates,'/test')) ($duplicates.Replace($bad,'B₁₂')) '重复 class 和 style 仅首项决定公式是否可见'
     $inherit = $section + '<h1><span class="word">造血薬</span></h1><i style="visibility:hidden">' + $bad + $child + '</i><b style="display:none">' + $child + '</b></div>'
     $expected = $inherit.Replace(($child+'</i>'),($child.Replace($bad,'B₁₂')+'</i>'))
-    Assert-Equal ($rewrite.Invoke($null,@($inherit,'/test'))) $expected '子节点可重设 visibility；display:none 的子树不能复显'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($inherit,'/test')) $expected '子节点可重设 visibility；display:none 的子树不能复显'
     $edge = 'log<sub>1021</sub>＝1.3222'
     $good = '<h1><span class="word">指标</span></h1><p>' + $edge + '</p>'
     $unrelated = '<h1><span class="word">引用</span></h1><p>' + $edge + '</p>'
     $mixed = $section + $good + $unrelated + '</div>'
-    Assert-Equal ($rewrite.Invoke($null,@($mixed,'/test'))) ($section + $good.Replace($edge,'log<sub>10</sub>21＝1.3222') + $unrelated + '</div>') '旧卷脚标边界只适用于确证的那篇词头'
-    $shownEdges = $detail.Invoke($null,@(($good+$unrelated),$null,'shinseiki')).Text
+    Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($mixed,'/test')) ($section + $good.Replace($edge,'log<sub>10</sub>21＝1.3222') + $unrelated + '</div>') '旧卷脚标边界只适用于确证的那篇词头'
+    $shownEdges = [ESearch.Tests.CoreLogic]::FormatDetail(($good+$unrelated),$null,'shinseiki').Text
     Assert-Equal ($shownEdges.Contains('log₁₀21＝1.3222') -and $shownEdges.Contains('log₁₀₂₁＝1.3222')) $true '普通详情与旧卷使用相同词头边界'
     # 反查时标题不在选中的正文片段内。使用生产反查返回的原始物理坐标，再核对最终高亮范围。
     $reverseBody = '<div class="wrap-switch"><h1><span class="word">べきしすう</span><span>【<span>幂指数</span>】</span></h1><ul class="ncdata-sense-wrap"><li><span>次数。</span><span class="divide-imgs"></span><span>对于a<sup><sub><</sub>/sup>n而言的n。</sup></span></li></ul></div>'
     $reverse = $Assembly.GetType('EntryParser').GetMethod('ShinseikiReverseSenses',[Reflection.BindingFlags]'NonPublic,Static')
     $sense = @($reverse.Invoke($null,@($reverseBody,'幂指数')))[0].Item2
     $anchor = [Activator]::CreateInstance($Assembly.GetType('EntryAnchor'),@([Range]::new($sense.Start,$sense.Start),$sense))
-    $highlight = $detail.Invoke($null,@($reverseBody,$anchor,'shinseiki'))
+    $highlight = [ESearch.Tests.CoreLogic]::FormatDetail($reverseBody,$anchor,'shinseiki')
     $range = $highlight.Anchor.Sense
     Assert-Equal ($highlight.Text.Substring($range.Start.Value,$range.End.Value-$range.Start.Value)) '对于aⁿ而言的n。' '中文义项的公式复原后仍高亮同一原文'
-    Assert-Equal ($detail.Invoke($null,@($body.Replace('ヘキサン','例文'),$null,'shinseiki')).Text.Contains('C₆H₁₄')) $false '缺少对应词头时不把正文示例改为公式'
-    Assert-Equal ($detail.Invoke($null,@($body.Replace($header,'<h1><span class="word">例文</span></h1><span>ヘキサン</span>'),$null,'shinseiki')).Text.Contains('C₆H₁₄')) $false '只在正文提到书内词头不构成公式校勘依据'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($body.Replace('ヘキサン','例文'),$null,'shinseiki').Text.Contains('C₆H₁₄')) $false '缺少对应词头时不把正文示例改为公式'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($body.Replace($header,'<h1><span class="word">例文</span></h1><span>ヘキサン</span>'),$null,'shinseiki').Text.Contains('C₆H₁₄')) $false '只在正文提到书内词头不构成公式校勘依据'
     foreach ($row in @(
         @('shinseiki','後唐','后唐。中国五代之一，沙陀部人李存推翻后梁后建立的王朝(923—936)。定都洛阳。后被其重臣石敬塘所灭。<!--', $true),
         @('shinseiki','新興','新しく勢いが盛んになること。新たに興ること。<!--', $true),
@@ -4376,9 +4070,23 @@ function Test-ShinseikiTruncatedDetail([Reflection.Assembly]$Assembly) {
 }
 
 function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
+    Initialize-CoreTestSupport
     $flags = [Reflection.BindingFlags]'Static,NonPublic'
+    $parser = $Assembly.GetType('EntryParser',$true)
+    $display = $parser.GetMethod('DisplayText',$flags)
+    $tables = $parser.GetField('DisplayRules',$flags).GetValue($null)
+    foreach ($table in $tables.GetEnumerator()) {
+        foreach ($rule in $table.Value) {
+            $inputText = 'plain|' + $rule.Item1 + '|plain'
+            $expected = $inputText
+            foreach ($replacement in $table.Value) {
+                $expected = $expected.Replace($replacement.Item1,$replacement.Item2,[StringComparison]::Ordinal)
+            }
+            Assert-Equal ($display.Invoke($null,@($table.Key,$inputText))) $expected '规则表中的每条规则均能通过快速筛选且保持替换顺序'
+        }
+        Assert-Equal ($display.Invoke($null,@($table.Key,'ordinary text 123'))) 'ordinary text 123' '普通文本保持原值'
+    }
     $format = [Lookup].GetMethod('Format',$flags)
-    $detail = $Assembly.GetType('ESearch.SearchWindow').GetMethod('FormatDetail',$flags)
     # 样例来自实际词头和正文；同时覆盖同码异书、正常标点和原始索引身份。
     foreach ($row in @(
         @('shinseiki',"表現`u{E003}式",'表現様式'),
@@ -4440,7 +4148,7 @@ function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
     )) {
         $entry = [LookupEntry]::new($row[0],1,'zh',1,$row[1],$null,$row[1])
         Assert-Equal ($format.Invoke($null,@($entry,'headword'))) $row[2] "词书摘要 $($row[0])"
-        Assert-Equal ($detail.Invoke($null,@("<b>$($row[1])</b>",$null,$row[0]))).Text $row[2] "词书详情 $($row[0])"
+        Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail("<b>$($row[1])</b>",$null,$row[0])).Text $row[2] "词书详情 $($row[0])"
         Assert-Equal $entry.Headword $row[1] '显示后原词头仍可用作查词键'
     }
     $html = '<h1>あら<!-- --></h1><div>东洋鲈鱼。&lt;!--例--&gt;</div>'
@@ -4456,51 +4164,49 @@ function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
     }
     $unitTitle='<h1><span class="word">⇒</span><!-- --><!-- --><!-- --></h1></div><div class="ncdata-body">[<span class="unabbrev">angstrom</span>]'
     $bird='<span>カイツブリの古名。</span><!-- --><span class="divide-imgs"><img alt="" src="separator.png"/></span><span>⇒?的古名。</span>'
-    Assert-Equal ($detail.Invoke($null,@($unitTitle,$null,'shinseiki')).Text.StartsWith('Å')) $true '原书 angstrom 标注证实单位标题'
-    Assert-Equal ($detail.Invoke($null,@(($unitTitle.Replace('angstrom','other')),$null,'shinseiki')).Text.StartsWith('⇒')) $true '其它标题里的箭头保持原形'
-    Assert-Equal ($detail.Invoke($null,@($bird,$null,'shinseiki')).Text.EndsWith('䴙䴘的古名。')) $true '同一义项日文明确指出鸟属'
-    Assert-Equal ($detail.Invoke($null,@(($bird.Replace('カイツブリ','別の鳥')),$null,'shinseiki')).Text.EndsWith('⇒?的古名。')) $true '不同鸟名不套用该译文'
-    $retained=$Assembly.GetType('ESearch.SearchWindow').GetMethod('RewriteMergedLinks',$flags)
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($unitTitle,$null,'shinseiki').Text.StartsWith('Å')) $true '原书 angstrom 标注证实单位标题'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail(($unitTitle.Replace('angstrom','other')),$null,'shinseiki').Text.StartsWith('⇒')) $true '其它标题里的箭头保持原形'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($bird,$null,'shinseiki').Text.EndsWith('䴙䴘的古名。')) $true '同一义项日文明确指出鸟属'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail(($bird.Replace('カイツブリ','別の鳥')),$null,'shinseiki').Text.EndsWith('⇒?的古名。')) $true '不同鸟名不套用该译文'
     $section='<div class="es-source es-shinseiki"><a name="es-shinseiki-1"></a>'
     $other=$section.Replace('shinseiki','sango')
-    $rich=$retained.Invoke($null,@("$section$unitTitle$bird</div>$other$unitTitle$bird</div>",'/test'))
+    $rich=[ESearch.Tests.CoreLogic]::RewriteMergedLinks("$section$unitTitle$bird</div>$other$unitTitle$bird</div>",'/test')
     Assert-Equal $rich.Contains($section+$unitTitle.Replace('⇒','Å')+$bird.Replace('⇒?的古名。','䴙䴘的古名。')) $true '已建合并页的新世纪原文标题与同义古名'
     Assert-Equal $rich.Contains($other+$unitTitle+$bird) $true '其余来源与来源锚点保持原样'
     $birdHead=[LookupEntry]::new('shinseiki',169370,'ja',1,'鵒鳥',$null,'⇒?的古名。')
     Assert-Equal ($format.Invoke($null,@($birdHead,'headword'))) '䴙䴘的古名。' '旧摘要用准确物理词头作证'
-    Assert-Equal ($detail.Invoke($null,@($html,$null,'shinseiki'))).Text ("あら" + [Environment]::NewLine + '东洋鲈鱼。<!--例-->') '新世纪隐藏模板注释，保留实体编码的示例'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($html,$null,'shinseiki')).Text ("あら" + [Environment]::NewLine + '东洋鲈鱼。<!--例-->') '新世纪隐藏模板注释，保留实体编码的示例'
     $ipa = '<FONT face="Kingsoft Phonetic Plain, Tahoma" color=red>5Apl</FONT>'
-    Assert-Equal ($detail.Invoke($null,@("5Apl / $ipa /",$null,'oxford'))).Text '5Apl / ˈæpl /' '仅在牛津音标标签内转写'
-    Assert-Equal ($detail.Invoke($null,@($ipa,$null,'other'))).Text '5Apl' '其它来源保留同一拼写'
-    Assert-Equal ($detail.Invoke($null,@($ipa.Replace('5Apl','C++'),$null,'oxford'))).Text 'C++' '未识别的字体片段整体保留'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail("5Apl / $ipa /",$null,'oxford')).Text '5Apl / ˈæpl /' '仅在牛津音标标签内转写'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($ipa,$null,'other')).Text '5Apl' '其它来源保留同一拼写'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($ipa.Replace('5Apl','C++'),$null,'oxford')).Text 'C++' '未识别的字体片段整体保留'
     $entities = 'BUY NOW&amp;NDASH;PAY LATER；56&amp;half; inches in Britain；&amp;half;'
-    Assert-Equal ($detail.Invoke($null,@($entities,$null,'oxford'))).Text 'BUY NOW–PAY LATER；56½ inches in Britain；&half;' '牛津两处双重转义只在已核实的原句内恢复'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($entities,$null,'oxford')).Text 'BUY NOW–PAY LATER；56½ inches in Britain；&half;' '牛津两处双重转义只在已核实的原句内恢复'
     $label = 'Adam<FONT style="font-weight:normal">''</FONT>s apple'
     $rawLink = '<a href="entry://' + $label + '">' + $label + '</a>'
-    Assert-Equal ($detail.Invoke($null,@($rawLink,$null,'oxford'))).Text "Adam's apple" '牛津误嵌进原 href 的撇号标记只显示一次'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($rawLink,$null,'oxford')).Text "Adam's apple" '牛津误嵌进原 href 的撇号标记只显示一次'
     $hashed = 'esmissing-oxford-cbc379a6a271353b888d0c37b264542e925bf595480ce7a1c31ef9fa83080cd7'
     $brokenLink = '<a href="entry://' + $hashed + '"font-weight:normal">''</FONT>s apple">' + $label + '</a>'
     $section = '<div class="es-source es-oxford">'
-    $rewrite = $Assembly.GetType('ESearch.SearchWindow').GetMethod('RewriteMergedLinks',$flags)
     $path = '/page-1'
     # 六条牛津例句都在译文闭标签后留下同一属性尾。COLLOC 与普通词条中举例的尖括号仍属可见正文。
     $colloc = '<font>皮革护理油 </font>(</SPAN>COLLOC)"&gt;</SPAN eid="21" n-g n="3"></SPAN>'
-    Assert-Equal ($detail.Invoke($null,@($colloc,$null,'oxford'))).Text '皮革护理油 (COLLOC)' '牛津搭配注保留文字并清除误印的属性尾'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($colloc,$null,'oxford')).Text '皮革护理油 (COLLOC)' '牛津搭配注保留文字并清除误印的属性尾'
     $bigColloc = $colloc.Replace('</font>(', '</font></SPAN>(')
     $literal = ' marks, &lt; &gt;, (COLLOC)"&gt;'
-    Assert-Equal ($detail.Invoke($null,@(($bigColloc + $literal),$null,'oxford'))).Text '皮革护理油 (COLLOC) marks, < >, (COLLOC)">' '牛津双闭标签的例句可修，正文举例原样显示'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail(($bigColloc + $literal),$null,'oxford')).Text '皮革护理油 (COLLOC) marks, < >, (COLLOC)">' '牛津双闭标签的例句可修，正文举例原样显示'
     $otherSection = '<div class="es-source es-other">' + $colloc + '</div>'
     $sections = $section + $colloc + '</div>' + $otherSection
-    Assert-Equal ($rewrite.Invoke($null,@($sections,$path))) ($section + $colloc.Replace('COLLOC)"&gt;', 'COLLOC)') + '</div>' + $otherSection) '旧合并页只清理牛津来源区的同一属性尾'
-    Assert-Equal ($rewrite.Invoke($null,@(($section + $brokenLink + '</div>'),$path))) ($section + '<a href="/page-1/lookup/' + $hashed + '">' + $label + '</a></div>') '旧合并页保留原跳转目标和可见撇号格式'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($sections,$path)) ($section + $colloc.Replace('COLLOC)"&gt;', 'COLLOC)') + '</div>' + $otherSection) '旧合并页只清理牛津来源区的同一属性尾'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks(($section + $brokenLink + '</div>'),$path)) ($section + '<a href="/page-1/lookup/' + $hashed + '">' + $label + '</a></div>') '旧合并页保留原跳转目标和可见撇号格式'
     $mismatched = $section + $brokenLink.Replace('>Adam','>Eve') + '</div>'
-    Assert-Equal ($rewrite.Invoke($null,@($mismatched,$path))) ($mismatched.Replace('entry://','/page-1/lookup/')) '标签与原卷内目标哈希不符时不猜原链接'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($mismatched,$path)) ($mismatched.Replace('entry://','/page-1/lookup/')) '标签与原卷内目标哈希不符时不猜原链接'
     # 牛津把字体名的四个引号各包进 FONT 标签；有些中文释义还把两个闭标签颠倒。
     $quote = '<FONT style="font-weight:normal">''</FONT>'
     $sub = '<SPAN style="FONT-WEIGHT: normal; FONT-SIZE: 7pt; VERTICAL-ALIGN: sub; FONT-STYLE: normal; FONT-FAMILY: ' + $quote + 'Arial' + $quote + ', ' + $quote + '细明体' + $quote + '">'
     $super = $sub.Replace('ALIGN: sub','ALIGN: super')
     $formula = 'C' + $sub + '2</SPAN>H' + $sub + '2</SPAN>'
-    Assert-Equal ($detail.Invoke($null,@($formula,$null,'oxford'))).Text 'C₂H₂' '牛津乙炔原文保留化学下标'
+    Assert-Equal ([ESearch.Tests.CoreLogic]::FormatDetail($formula,$null,'oxford')).Text 'C₂H₂' '牛津乙炔原文保留化学下标'
     $source = '<font color=#FF5000>• 埃(等于 10' + $super + '-10</font> 米)</SPAN>'
     $senses = $Assembly.GetType('EntryParser').GetMethod('OxfordSenses',$flags).Invoke($null,@($source))
     $sense = @($senses)[0]
@@ -4509,12 +4215,13 @@ function Test-DictionaryDisplayText([Reflection.Assembly]$Assembly) {
     Assert-Equal $source.Substring($range.Item1,$range.Item2) ($source.Substring($source.IndexOf('•')) -creplace '</SPAN>$','') '牛津义项范围仍是原书中的完整译义'
     $foreignSection = '<div class="es-source es-hanying">' + $formula + '</div>'
     $oxfordSection = $section + '<a name="es-oxford-261"></a>' + $formula + '</div>'
-    $merged = $rewrite.Invoke($null,@(($foreignSection + $oxfordSection),$path))
+    $merged = [ESearch.Tests.CoreLogic]::RewriteMergedLinks(($foreignSection + $oxfordSection),$path)
     Assert-Equal $merged.StartsWith($foreignSection + $section + '<a name="es-oxford-261"></a>') $true '仅修改牛津小节，原卷锚点仍在原位置'
     Assert-Equal ($merged.Substring($foreignSection.Length) -match '细明体') $false '旧牛津合并页不再含损坏的 CSS 属性'
 }
 
 function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly) {
+    Initialize-CoreTestSupport
     $previous=$env:E_SEARCH_DB
     $env:E_SEARCH_DB=Join-Path $Scratch 'phrase-anchor.db'
     try {
@@ -4550,38 +4257,36 @@ function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly
             Assert-Equal $raw.Substring($senseRange.Item1,$senseRange.Item2) '用完 &amp; 耗尽' '定位义项而非父词条同文'
             Assert-Equal ($senseRange.Item1 -gt $raw.IndexOf('definition')) $true '重复译文锚点指向真实小节'
             # 将同一父正文经过窗口使用的文本转换，核对去标签、实体解码及换行后的高亮位置。
-            $format=$Assembly.GetType('ESearch.SearchWindow').GetMethod('FormatDetail',[Reflection.BindingFlags]'Static,NonPublic')
-            $view=$format.Invoke($null,@($raw,$anchor,'oxford'))
-            Assert-Equal $view.Text ($format.Invoke($null,@($raw,$null,'oxford'))).Text '高亮不会删减父词条内容'
+            $view=[ESearch.Tests.CoreLogic]::FormatDetail($raw,$anchor,'oxford')
+            Assert-Equal $view.Text ([ESearch.Tests.CoreLogic]::FormatDetail($raw,$null,'oxford')).Text '高亮不会删减父词条内容'
             $titleRange=$view.Anchor.Title.GetOffsetAndLength($view.Text.Length)
             $senseRange=$view.Anchor.Sense.GetOffsetAndLength($view.Text.Length)
             Assert-Equal $view.Text.Substring($titleRange.Item1,$titleRange.Item2).Trim() 'run out (of sth)' '窗口标题高亮跨越嵌套标签'
             Assert-Equal $view.Text.Substring($senseRange.Item1,$senseRange.Item2) '用完 & 耗尽' '窗口义项高亮包含解码后的实体'
             Assert-Equal ($titleRange.Item1 -gt $view.Text.IndexOf('【PHR V】')) $true '同文只突出短语动词区对应小节'
             # 另一来源含相同正文，只有物理序号对应的小节可以提供排版锚点。
-            $highlight=$Assembly.GetType('ESearch.SearchWindow').GetMethod('HighlightMergedPhrase',[Reflection.BindingFlags]'Static,NonPublic')
             $article=$Assembly.GetType('MergedArticle').GetConstructor([type[]]@([string],[string],[string],[string]))
             $prefix='<div class="es-source es-hanying"><a name="es-hanying-1"></a>'+$raw+'</div>'
             $source='<div class="es-source es-oxford"><a name="es-oxford-1"></a>'
             $html=$prefix+$source+$raw+'</div>'
             $page=$article.Invoke(@('zh-en','run',$html,$null))
-            $mapped=$highlight.Invoke($null,@($page,$entry,$raw))
+            $mapped=[ESearch.Tests.CoreLogic]::HighlightMergedPhrase($page,$entry,$raw)
             Assert-Equal $mapped.Html.StartsWith($prefix) $true '另一来源里的相同正文保持完整'
             Assert-Equal ($mapped.Html.Contains('<mark id="es-selected-phrase"> <i>run</i> out (of sth) </mark>')) $true '排版标题保留原书嵌套格式及空白'
             Assert-Equal ($mapped.Html.Contains('<mark data-es-sense>用完 &amp; 耗尽</mark>')) $true '选中义项的实体和原书位置正确'
             $html=$prefix+$source+$raw.Replace('用完 &amp; 耗尽','另一个义项')+'</div>'
             $changed=$article.Invoke(@('zh-en','run',$html,$null))
-            Assert-Equal ($null -eq $highlight.Invoke($null,@($changed,$entry,$raw))) $true '无法核对的小节交还已定位的来源原文'
+            Assert-Equal ($null -eq [ESearch.Tests.CoreLogic]::HighlightMergedPhrase($changed,$entry,$raw)) $true '无法核对的小节交还已定位的来源原文'
             $turn=$reader.Search('I turn him off.','oxford',[Threading.CancellationToken]::None) | Where-Object { $_.Entry.Gloss -eq '使失去兴趣' } | Select-Object -First 1
             $turnSource=$source.Replace('es-oxford-1"',('es-oxford-'+$turn.Entry.EntryId+'"'))
             $turnHtml=$turnSource+$turnBody.Replace($stress,$printedStress)+'</div>'
             $turnPage=$article.Invoke(@('zh-en','turn',$turnHtml,$null))
-            $mapped=$highlight.Invoke($null,@($turnPage,$turn.Entry,$turnBody))
+            $mapped=[ESearch.Tests.CoreLogic]::HighlightMergedPhrase($turnPage,$turn.Entry,$turnBody)
             Assert-Equal ($mapped.Html.Contains('<mark id="es-selected-phrase"> '+$printedStress+"turn sb∽'off </mark></SPAN>")) $true '音标转为 Unicode 后保留旧卷标题中的原始标记'
             Assert-Equal ($mapped.Html.Contains('<mark data-es-sense>使失去兴趣</mark>')) $true '相同标题按原书位置选中第二个释义'
             Assert-Equal ($mapped.Html.Contains('<mark data-es-sense>使厌烦</mark>')) $false '相同标题的首个释义保持原样'
             $changed=$article.Invoke(@('zh-en','turn',$turnHtml.Replace('使失去兴趣','使厌烦'),$null))
-            Assert-Equal ($null -eq $highlight.Invoke($null,@($changed,$turn.Entry,$turnBody))) $true '重复标题的释义序列不符就回到原书锚点'
+            Assert-Equal ($null -eq [ESearch.Tests.CoreLogic]::HighlightMergedPhrase($changed,$turn.Entry,$turnBody)) $true '重复标题的释义序列不符就回到原书锚点'
             $coat=$reader.Search('I TOOK  my coat off.','oxford',[Threading.CancellationToken]::None)
             Assert-Equal $coat.Count 2 '可分表达的两种已收录标题均能打开'
             $expectedTitles=@("take sth∽'off","take sb∽'off")
@@ -4590,7 +4295,7 @@ function Test-PhraseDetailAnchor([string]$Scratch,[Reflection.Assembly]$Assembly
                 $hit=$coat[$i]
                 Assert-Equal $hit.Term 'TOOK  my coat off' '还原后的义项保留原输入片段'
                 $raw=$reader.CurrentBody($hit.Entry)
-                $view=$format.Invoke($null,@($raw,$property.GetValue($hit.Entry),'oxford'))
+                $view=[ESearch.Tests.CoreLogic]::FormatDetail($raw,$property.GetValue($hit.Entry),'oxford')
                 $titleRange=$view.Anchor.Title.GetOffsetAndLength($view.Text.Length)
                 $senseRange=$view.Anchor.Sense.GetOffsetAndLength($view.Text.Length)
                 Assert-Equal $view.Text.Substring($titleRange.Item1,$titleRange.Item2).Trim() $expectedTitles[$i] '选择不同义项时标题高亮随之切换'
@@ -4848,8 +4553,12 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
             $refresh.Invoke($window,$null)
             Wait-ModeUi { $gloss.Text -ceq '收到' }
             # 模拟旧拼写请求在新结果显示后才完成，即使取消未抢先中止，界面也必须保留新结果。
+            $contextConstructor = $type.Assembly.GetType('ESearch.SearchRequestContext',$true).GetConstructor(
+                [type[]]@([long],[long],[Threading.CancellationToken]))
+            $staleRequestContext = $contextConstructor.Invoke(@($priorRevision,
+                $type.GetField('catalogRevision',$flags).GetValue($window),[Threading.CancellationToken]::None))
             $oldResult = $type.GetMethod('SearchDictionaryAsync',$flags).Invoke($window,
-                @('recieve',$priorRevision,[Threading.CancellationToken]::None))
+                @('recieve',$staleRequestContext))
             Wait-ModeUi { $oldResult.IsCompleted }
             [void]$oldResult.GetAwaiter().GetResult()
             Assert-Equal $choices.Items.Count 0 '迟到的旧拼写结果不重新显示建议'
@@ -4930,8 +4639,9 @@ function Test-SpellingSuggestions([string]$Scratch, [Reflection.Assembly]$Assemb
             $refresh.Invoke($window,$null)
             $query.Text='反查英语收到'
             Wait-ModeUi { $gloss.Text.Contains('receive') -and $status.Text.Contains('牛津英语词典') }
+            $prefixContext=$contextConstructor.Invoke(@($prefixRevision,$prefixCatalog,[Threading.CancellationToken]::None))
             $stale=$type.GetMethod('SearchPrefixesAsync',$flags).Invoke($window,
-                @('book','oxford',$prefixRevision,$prefixCatalog,[Threading.CancellationToken]::None))
+                @('book','oxford',$prefixContext))
             Wait-ModeUi { $stale.IsCompleted }
             [void]$stale.GetAwaiter().GetResult()
             Assert-Equal $prefixes.Items.Count 0 '反查期间清空前缀候选'
@@ -5153,7 +4863,7 @@ function Test-JapaneseAuxiliaries([string]$Scratch) {
             '食べる' = 'たべる<br>【食べる】<br>吃'; '読む' = 'よむ<br>【読む】<br>读'
             '書く' = 'かく<br>【書く】<br>写'; '勉強する' = 'べんきょうする<br>【勉強する】<br>学习'
             '着る' = 'きる<br>【着る】<br>穿'; '切る' = 'きる<br>【切る】<br>切'
-            '来る' = 'くる<br>【来る】<br>来'
+            '来る' = 'くる<br>【来る】<br>来'; 'みたい' = 'みたい<br>像……一样'
             '読める' = 'よめる<br>【読める】<br>能读'; '食ぶ' = 'たぶ<br>【食ぶ】<br>古语'
             '話す' = 'はなす<br>【話す】<br>说'; '話される' = 'はなされる<br>【話される】<br>被说'
             '話されました' = 'はなされました<br>【話されました】<br>原词记录'
@@ -5202,6 +4912,9 @@ function Test-JapaneseAuxiliaries([string]$Scratch) {
         Assert-Equal (($oldPhrase[0] -split "`t")[1..2] -join '|') 'phrase|勉強した' '已有片段查词结果优先于新增的整词回退'
         $sentence = @(Invoke-Search @('query','本を読んでいませんでした。','shogakukan'))
         Assert-Equal (($sentence[0] -split "`t")[2]) '読んでいませんでした' '句中完整活用片段优先于较短的て形'
+        Assert-Equal @(Invoke-Search @('query','明日は来たい。','shogakukan')).Count 0 '整词愿望形回退不扩展到句内'
+        $wish = @(Invoke-Search @('query','本を読みたい。','shogakukan'))
+        Assert-Equal (($wish | ForEach-Object { ($_ -split "`t")[1..2] -join '|' }) -join ',') 'phrase|みたい' '句内保留基线短片段'
         $spoken = @(Invoke-Search @('query','本を読んじゃった。','shogakukan'))
         Assert-Equal ($spoken[0].Contains('読んじゃった → 読む')) $true '句中还原完整口语片段并保留原文'
         $plainSentence = @(Invoke-Search @('query','ご飯を食べました。','shogakukan'))
@@ -7336,8 +7049,9 @@ if ($BackendTestDirectory -or $IndexedMdxTestDirectory) {
     [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_winsqlite3]::new())
     if ($IndexedMdxTestDirectory) { Test-IndexedMdx $IndexedMdxTestDirectory $assembly; Test-ReleaseDataLocation; return }
     Test-ReverseEncoderReference $assembly
+    Test-DetailResourceReopen $assembly $BackendTestDirectory
     Test-IndexedMdx $BackendTestDirectory $assembly
-    Test-Calculation $assembly
+    Test-Calculation
     Test-LookupAudit $BackendTestDirectory $assembly
     # 直接使用窗口所用的预览逻辑，同时保留详情选择器所需的全部原始命中。
     $hits = [LookupHit[]]@(

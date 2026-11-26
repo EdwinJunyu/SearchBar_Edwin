@@ -39,12 +39,16 @@ public static class MdxReader
             yield return (entry.Ordinal, entry.Headword, reader.ReadImportExact(entry.Start, entry.End));
     }
 
-    public static IEnumerable<(int Ordinal, string Key, ReadOnlyMemory<byte> Data)> ReadResources(string path)
+    public static IEnumerable<(int Ordinal, string Key, ReadOnlyMemory<byte> Data)> ReadResources(string path, CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         using var file = File.OpenRead(path);
-        using var reader = ReadDirectory(file, Guid.NewGuid().ToString("N"), includeKeys: true, resource: true);
+        using var reader = ReadDirectory(file, Guid.NewGuid().ToString("N"), includeKeys: true, resource: true, token: token);
         foreach (var entry in reader.Entries)
-            yield return (entry.Ordinal, entry.Headword, reader.ReadRange(entry.Start, entry.End, importing: true));
+        {
+            token.ThrowIfCancellationRequested();
+            yield return (entry.Ordinal, entry.Headword, reader.ReadRange(entry.Start, entry.End, importing: true, token: token));
+        }
     }
 
     public static IndexedReader OpenIndexed(string path) => Open(path, null);
@@ -116,12 +120,13 @@ public static class MdxReader
         return foundMetadata ? stream.ToArray() : null;
     }
 
-    private static byte[] UnshapeDelivery(ReadOnlySpan<byte> data, int rawLength)
+    private static byte[] UnshapeDelivery(ReadOnlySpan<byte> data, int rawLength, CancellationToken token = default)
     {
         var raw = new byte[rawLength];
         int pos = 0;
         while (!data.IsEmpty)
         {
+            token.ThrowIfCancellationRequested();
             Require(data.Length >= 8, "MDXP 记录长度截断。");
             int meta = BinaryPrimitives.ReadInt32LittleEndian(data);
             int html = BinaryPrimitives.ReadInt32LittleEndian(data[4..]);
@@ -148,11 +153,12 @@ public static class MdxReader
         return raw;
     }
 
-    private static void CopyDeliveryBytes(Stream source, Stream destination, long count, byte[] buffer)
+    private static void CopyDeliveryBytes(Stream source, Stream destination, long count, byte[] buffer, CancellationToken token = default)
     {
         Require(count >= 0 && count <= source.Length - source.Position, "MDXP 流区间越界。");
         while (count > 0)
         {
+            token.ThrowIfCancellationRequested();
             int n = (int)Math.Min(count, buffer.Length);
             source.ReadExactly(buffer.AsSpan(0, n));
             destination.Write(buffer, 0, n);
@@ -285,26 +291,32 @@ public static class MdxReader
 
     private readonly record struct DeliveryFrame(byte[] Bytes, int RawLength, int ShapedLength, bool Expanded = false);
 
-    private static (byte[] Bytes, uint? Checksum) RestoreFrame(DeliveryFrame frame)
+    private static (byte[] Bytes, uint? Checksum) RestoreFrame(DeliveryFrame frame, CancellationToken token)
     {
+        token.ThrowIfCancellationRequested();
         if (frame.RawLength == 0) return (frame.Bytes, null);
-        byte[] shaped = frame.Expanded ? frame.Bytes : ExpandDelivery(frame.Bytes, frame.ShapedLength);
-        byte[] plain = UnshapeDelivery(shaped, frame.RawLength);
-        return (CompressDelivery(plain), Adler(plain));
+        byte[] shaped = frame.Expanded ? frame.Bytes : ExpandDelivery(frame.Bytes, frame.ShapedLength, token);
+        byte[] plain = UnshapeDelivery(shaped, frame.RawLength, token);
+        // 原生压缩调用不能中断；每个输入受 DeliveryBlockLimit 限制，在调用两侧检查取消。
+        token.ThrowIfCancellationRequested();
+        byte[] compressed = CompressDelivery(plain);
+        token.ThrowIfCancellationRequested();
+        return (compressed, Adler(plain, token));
     }
 
-    private static byte[] ExpandDelivery(byte[] bytes, int length)
+    private static byte[] ExpandDelivery(byte[] bytes, int length, CancellationToken token = default)
     {
         using var compressed = new MemoryStream(bytes);
         using var decoder = new ZLibStream(compressed, CompressionMode.Decompress);
         var result = new byte[length];
-        decoder.ReadExactly(result);
+        ReadCancellable(decoder, result, token);
         Require(decoder.ReadByte() == -1, "MDXP 变换流多出正文。");
         return result;
     }
 
-    public static void RestoreDelivery(string payloadPath, string mdxPath, string expectedSha256)
+    public static void RestoreDelivery(string payloadPath, string mdxPath, string expectedSha256, CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         byte[] hash = SourceDigest(expectedSha256);
         using var input = File.OpenRead(payloadPath);
         using var reader = new BinaryReader(input);
@@ -320,7 +332,7 @@ public static class MdxReader
         WriteDelivery(mdxPath, output =>
         {
             byte[] buffer = new byte[65536];
-            CopyDeliveryBytes(input, output, prefix, buffer);
+            CopyDeliveryBytes(input, output, prefix, buffer, token);
             const int batchBudget = 8 * 1024 * 1024;
             var batch = new List<DeliveryFrame>(32);
             int batchCost = 0;
@@ -328,6 +340,7 @@ public static class MdxReader
 
             void FlushBatch()
             {
+                token.ThrowIfCancellationRequested();
                 if (batch.Count == 0) return;
                 var results = new (byte[] Bytes, uint? Checksum)[batch.Count];
                 // 每个工作线程一次处理多块，输入与输出顺序只由当前线程管理。
@@ -335,14 +348,15 @@ public static class MdxReader
                 void DecodeLane(int lane)
                 {
                     for (int j = lane; j < batch.Count; j += lanes)
-                        results[j] = RestoreFrame(batch[j]);
+                        results[j] = RestoreFrame(batch[j], token);
                 }
                 if (lanes == 1) DecodeLane(0);
                 else
                 {
-                    try { System.Threading.Tasks.Parallel.For(0, lanes, DecodeLane); }
+                    try { System.Threading.Tasks.Parallel.For(0, lanes, new() { CancellationToken = token }, DecodeLane); }
                     catch (AggregateException ex)
                     {
+                        token.ThrowIfCancellationRequested();
                         throw new InvalidDataException("MDXP 批次恢复失败。", ex.Flatten().InnerExceptions[0]);
                     }
                 }
@@ -350,6 +364,7 @@ public static class MdxReader
                 BinaryPrimitives.WriteUInt32LittleEndian(header, 2);
                 foreach (var (bytes, checksum) in results)
                 {
+                    token.ThrowIfCancellationRequested();
                     int headerLength = checksum.HasValue ? 8 : 0;
                     Require(bytes.Length + (long)headerLength <= total - output.Position, "MDXP 还原结果超过目标大小。");
                     if (checksum is uint adler)
@@ -374,6 +389,7 @@ public static class MdxReader
 
             for (int i = 0; i < count; i++)
             {
+                token.ThrowIfCancellationRequested();
                 byte kind = reader.ReadByte();
                 int size = reader.ReadInt32();
                 int raw = 0, shapedLength = 0;
@@ -393,7 +409,7 @@ public static class MdxReader
                         lengths[j] = (raw, shapedLength);
                         combined += shapedLength;
                     }
-                    byte[] data = ExpandDelivery(ReadBytes(input, size, "MDXP 分组被截断。"), combined);
+                    byte[] data = ExpandDelivery(ReadBytes(input, size, "MDXP 分组被截断。", token), combined, token);
                     int offset = 0;
                     foreach (var member in lengths)
                     {
@@ -412,7 +428,7 @@ public static class MdxReader
                     {
                         FlushBatch();
                         Require(size <= total - output.Position, "MDXP 原样块越界。");
-                        CopyDeliveryBytes(input, output, size, buffer);
+                        CopyDeliveryBytes(input, output, size, buffer, token);
                         continue;
                     }
                 }
@@ -424,20 +440,22 @@ public static class MdxReader
                     Require(raw is > 0 and <= DeliveryBlockLimit && shapedLength is > 0 and <= DeliveryBlockLimit,
                         "MDXP 正文尺寸无效。");
                 }
-                QueueFrame(new DeliveryFrame(ReadBytes(input, size, "MDXP 块被截断。"), raw, shapedLength));
+                QueueFrame(new DeliveryFrame(ReadBytes(input, size, "MDXP 块被截断。", token), raw, shapedLength));
             }
             FlushBatch();
             Require(input.Length - input.Position == total - output.Position, "MDXP 尾部长度不符。");
-            CopyDeliveryBytes(input, output, total - output.Position, buffer);
+            CopyDeliveryBytes(input, output, total - output.Position, buffer, token);
             output.Position = 0;
-            Require(SHA256.HashData(output).AsSpan().SequenceEqual(hash), "MDXP 恢复后的整卷 SHA-256 不符。");
+            Require(HashStream(output, token).AsSpan().SequenceEqual(hash), "MDXP 恢复后的整卷 SHA-256 不符。");
+            token.ThrowIfCancellationRequested();
         });
     }
 
-    public static IndexedReader OpenRecords(string path, string sourceSha256)
+    public static IndexedReader OpenRecords(string path, string sourceSha256, CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         _ = SourceDigest(sourceSha256);
-        return Open(path, sourceSha256);
+        return Open(path, sourceSha256, token);
     }
 
     // MDX1: 固定头 + 每块两个 32 位长度 + 连续的 SHA-256 数组 + 整份目录的 SHA-256。
@@ -453,8 +471,9 @@ public static class MdxReader
         return Convert.FromHexString(hash);
     }
 
-    public static IndexedReader OpenRecords(string path, string sourceSha256, byte[] directory)
+    public static IndexedReader OpenRecords(string path, string sourceSha256, byte[] directory, CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         byte[] expected = SourceDigest(sourceSha256);
         ReadOnlySpan<byte> input = directory;
         Require(input.Length >= DirectoryHeaderSize + HashSize && input.Length <= SizeLimit, "MDX 正文块目录长度无效。");
@@ -465,6 +484,7 @@ public static class MdxReader
         Require(data.Slice(44, HashSize).SequenceEqual(expected), "MDX 正文块目录与词典版本不符。");
         Span<byte> directoryDigest = stackalloc byte[HashSize];
         SHA256.HashData(data[..^HashSize], directoryDigest);
+        token.ThrowIfCancellationRequested();
         Require(directoryDigest.SequenceEqual(data[^HashSize..]), "MDX 正文块目录校验失败。");
         int count = BinaryPrimitives.ReadInt32LittleEndian(data[40..]);
         Require(count >= 0 && (long)DirectoryHeaderSize + HashSize + (long)count * (BlockSizeFields + HashSize) == data.Length,
@@ -489,6 +509,7 @@ public static class MdxReader
             int pos = DirectoryHeaderSize;
             for (int i = 0; i < count; i++, pos += BlockSizeFields)
             {
+                token.ThrowIfCancellationRequested();
                 int packed = BinaryPrimitives.ReadInt32LittleEndian(data[pos..]);
                 int plain = BinaryPrimitives.ReadInt32LittleEndian(data[(pos + 4)..]);
                 Require(packed is >= 8 and <= SizeLimit && plain is >= 0 and <= SizeLimit &&
@@ -508,8 +529,9 @@ public static class MdxReader
         }
     }
 
-    private static IndexedReader Open(string path, string? expectedHash)
+    private static IndexedReader Open(string path, string? expectedHash, CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         // 校验和随机读取共用一个只读句柄，避免校验后又按文件名打开被替换的源。
         // 托管源可原子替换；当前读者继续使用旧句柄。导入要在整个建索引期间固定原路径。
         var share = expectedHash == null ? FileShare.Read : FileShare.Read | FileShare.Delete;
@@ -519,7 +541,7 @@ public static class MdxReader
             string identity;
             if (expectedHash != null)
             {
-                identity = Convert.ToHexString(SHA256.HashData(file));
+                identity = Convert.ToHexString(HashStream(file, token));
                 Require(identity.Equals(expectedHash, StringComparison.OrdinalIgnoreCase), "MDX 源文件 SHA-256 与已导入版本不符。");
                 file.Position = 0;
             }
@@ -528,7 +550,7 @@ public static class MdxReader
                 // 普通导入路径可被替换；未提供内容哈希的独立读取不与历史文件共享块。
                 identity = Guid.NewGuid().ToString("N");
             }
-            return ReadDirectory(file, identity, expectedHash == null);
+            return ReadDirectory(file, identity, expectedHash == null, token: token);
         }
         catch
         {
@@ -537,12 +559,14 @@ public static class MdxReader
         }
     }
 
-    private static IndexedReader ReadDirectory(FileStream file, string identity, bool includeKeys, bool resource = false)
+    private static IndexedReader ReadDirectory(FileStream file, string identity, bool includeKeys, bool resource = false, CancellationToken token = default)
     {
-        byte[] header = ReadBytes(file, Number(file, 4));
+        token.ThrowIfCancellationRequested();
+        byte[] header = ReadBytes(file, Number(file, 4), token: token);
         uint headerSum = BinaryPrimitives.ReadUInt32LittleEndian(ReadBytes(file, 4));
-        Require(Adler(header) == headerSum, "MDX 文件头校验失败。");
+        Require(Adler(header, token) == headerSum, "MDX 文件头校验失败。");
         var xml = XElement.Parse(Encoding.Unicode.GetString(header).TrimEnd('\0'));
+        token.ThrowIfCancellationRequested();
         Require(xml.Name.LocalName == (resource ? "Library_Data" : "Dictionary"), "MDX/MDD 文件类型不符。");
         string version = xml.Attribute("GeneratedByEngineVersion")?.Value ?? "";
         int width = version switch { "1.2" => 4, "2.0" => 8, _ => throw new InvalidDataException($"未支持的 MDX 版本 {version}。") };
@@ -569,13 +593,13 @@ public static class MdxReader
         List<Entry> keys = [];
         if (includeKeys)
         {
-            byte[] keyIndex = ReadBytes(file, packedIndexSize);
+            byte[] keyIndex = ReadBytes(file, packedIndexSize, token: token);
             if (width == 8)
             {
-                if (encryption == "2") DecodeKeyIndex(keyIndex);
-                keyIndex = Unpack(keyIndex, checked((int)indexSize));
+                if (encryption == "2") DecodeKeyIndex(keyIndex, token);
+                keyIndex = Unpack(keyIndex, checked((int)indexSize), token);
             }
-            ReadKeys(file, width, encoding, keyBlockCount, count, keyIndex, keys);
+            ReadKeys(file, width, encoding, keyBlockCount, count, keyIndex, keys, token);
             Require(file.Position == keyEnd && keys.Count == count, "MDX 词头数或分块边界不一致。");
         }
         else file.Position = keyEnd; // 在线查询的词头和区间已在 SQLite；跳过所有词头块。
@@ -595,6 +619,7 @@ public static class MdxReader
         var blocks = new RecordBlock[recordCount];
         for (int i = 0; i < recordCount; i++)
         {
+            token.ThrowIfCancellationRequested();
             Block b = ReadBlockInfo(file, width);
             Require(b.Packed is >= 8 and <= SizeLimit && b.Plain is >= 0 and <= SizeLimit && b.Packed <= fileEnd - fileOffset,
                 "MDX 正文块长度无效。");
@@ -603,16 +628,18 @@ public static class MdxReader
             rawStart = checked(rawStart + b.Plain);
         }
         Require(fileOffset == fileEnd, "MDX 正文块长度不一致。");
-        if (includeKeys) SetRecordEnds(keys, rawStart);
+        if (includeKeys) SetRecordEnds(keys, rawStart, token);
+        token.ThrowIfCancellationRequested();
         return new IndexedReader(file, identity, encoding, keys.AsReadOnly(), blocks, rawStart);
     }
 
-    private static void ReadKeys(Stream file, int width, Encoding encoding, int blockCount, int count, byte[] keyIndex, List<Entry> keys)
+    private static void ReadKeys(Stream file, int width, Encoding encoding, int blockCount, int count, byte[] keyIndex, List<Entry> keys, CancellationToken token)
     {
         int unit = encoding.CodePage == 1200 ? 2 : 1;
         using var index = new MemoryStream(keyIndex);
         for (int i = 0; i < blockCount; i++)
         {
+            token.ThrowIfCancellationRequested();
             long entries = Number(index, width);
             Require(entries <= count - keys.Count, "MDX 词头数超过文件声明。");
             for (int border = 0; border < 2; border++)
@@ -622,16 +649,20 @@ public static class MdxReader
                 index.Position += units * unit;
             }
             Block b = ReadBlockInfo(index, width);
-            byte[] data = Unpack(ReadBytes(file, b.Packed), b.Plain);
+            byte[] data = Unpack(ReadBytes(file, b.Packed, token: token), b.Plain, token);
             int pos = 0;
             for (long j = 0; j < entries; j++)
             {
+                token.ThrowIfCancellationRequested();
                 Require(data.Length - pos >= width, "MDX 词头偏移被截断。");
                 long offset = BigNumber(data.AsSpan(pos, width));
                 pos += width;
                 int start = pos;
                 while (pos + unit <= data.Length && (data[pos] != 0 || (unit == 2 && data[pos + 1] != 0)))
+                {
+                    if ((pos & 65535) == 0) token.ThrowIfCancellationRequested();
                     pos += unit;
+                }
                 Require(pos + unit <= data.Length, "词头缺少结束符。");
                 keys.Add(new(keys.Count + 1, encoding.GetString(data, start, pos - start), offset, 0));
                 pos += unit;
@@ -641,12 +672,13 @@ public static class MdxReader
         Require(index.Position == index.Length, "MDX 词头块索引长度不一致。");
     }
 
-    private static void SetRecordEnds(List<Entry> keys, long total)
+    private static void SetRecordEnds(List<Entry> keys, long total, CancellationToken token = default)
     {
         // 共享起点使用下一组不同起点；物理词序和原有的一基序号保持稳定。
         int[]? order = null;
         for (int i = 1; i < keys.Count; i++)
         {
+            token.ThrowIfCancellationRequested();
             if (keys[i].Start >= keys[i - 1].Start) continue;
             order = Enumerable.Range(0, keys.Count).ToArray();
             Array.Sort(order, (left, right) => keys[left].Start.CompareTo(keys[right].Start));
@@ -655,6 +687,7 @@ public static class MdxReader
         long next = total, previous = total;
         for (int i = keys.Count - 1; i >= 0; i--)
         {
+            token.ThrowIfCancellationRequested();
             int physical = order == null ? i : order[i];
             Entry key = keys[physical];
             Require(key.Start >= 0 && key.Start <= total, "词条正文偏移无效。");
@@ -696,15 +729,22 @@ public static class MdxReader
         // 一次导入只由一个枚举器顺读。同块可承载许多词条，即使它超过在线缓存预算，也只解压一次。
         internal string ReadImportBody(long start, long end) => encoding.GetString(ReadRange(start, end, true).Span).TrimEnd('\0');
         internal string ReadImportExact(long start, long end) => ReadExactBody(start, end, importing: true);
-        internal string ReadExactBody(long start, long end, bool importing)
+        internal string ReadExactBody(long start, long end, bool importing, CancellationToken token = default)
         {
-            string body = encoding.GetString(ReadRange(start, end, importing).Span);
+            string body = encoding.GetString(ReadRange(start, end, importing, token).Span);
+            token.ThrowIfCancellationRequested();
             return body.EndsWith('\0') ? body[..^1] : body;
         }
-        public string ReadBody(long start, long end) => encoding.GetString(ReadRange(start, end, false).Span).TrimEnd('\0');
-
-        internal ReadOnlyMemory<byte> ReadRange(long start, long end, bool importing)
+        public string ReadBody(long start, long end, CancellationToken token = default)
         {
+            string body = encoding.GetString(ReadRange(start, end, false, token).Span).TrimEnd('\0');
+            token.ThrowIfCancellationRequested();
+            return body;
+        }
+
+        internal ReadOnlyMemory<byte> ReadRange(long start, long end, bool importing, CancellationToken token = default)
+        {
+            token.ThrowIfCancellationRequested();
             ObjectDisposedException.ThrowIf(handle.IsClosed, this);
             Require(start >= 0 && start <= end && end <= total && end - start <= SizeLimit, "词条正文偏移或大小无效。");
             if (start == end) return ReadOnlyMemory<byte>.Empty;
@@ -720,11 +760,13 @@ public static class MdxReader
             byte[]? combined = null;
             for (long cursor = start; cursor < end; low++)
             {
+                token.ThrowIfCancellationRequested();
                 RecordBlock b = blocks[low];
                 if (b.Plain == 0) continue;
                 int skip = (int)(cursor - b.RawStart);
                 int take = (int)Math.Min(b.Plain - skip, end - cursor);
-                byte[] bytes = importing ? ImportBlock(low) : GetBlock(this, identity, low);
+                byte[] bytes = importing ? ImportBlock(low, token) : GetBlock(this, identity, low, token);
+                token.ThrowIfCancellationRequested();
                 if (take == length) return bytes.AsMemory(skip, length);
                 // UTF-8 多字节或 UTF-16 码元可能被块分开，完整拼回原始字节再解码。
                 combined ??= new byte[length];
@@ -734,13 +776,14 @@ public static class MdxReader
             return combined!;
         }
 
-        private byte[] ImportBlock(int number)
+        private byte[] ImportBlock(int number, CancellationToken token)
         {
+            token.ThrowIfCancellationRequested();
             if (importBlockNumber == number) return importBlock;
-            DecodeSlots.Wait();
+            DecodeSlots.Wait(token);
             try
             {
-                importBlock = LoadBlock(number);
+                importBlock = LoadBlock(number, token);
                 importBlockNumber = number;
                 return importBlock;
             }
@@ -803,29 +846,32 @@ public static class MdxReader
             return directory;
         }
 
-        private void ReadAt(long offset, Span<byte> bytes)
+        private void ReadAt(long offset, Span<byte> bytes, CancellationToken token = default)
         {
             while (!bytes.IsEmpty)
             {
-                int count = RandomAccess.Read(handle, bytes, offset);
+                token.ThrowIfCancellationRequested();
+                int count = RandomAccess.Read(handle, bytes[..Math.Min(bytes.Length, 64 * 1024)], offset);
                 if (count == 0) throw new EndOfStreamException("MDX 正文块被截断。");
                 offset += count;
                 bytes = bytes[count..];
             }
         }
 
-        internal byte[] LoadBlock(int number)
+        internal byte[] LoadBlock(int number, CancellationToken token = default)
         {
+            token.ThrowIfCancellationRequested();
             RecordBlock b = blocks[number];
             var packed = new byte[b.Packed];
-            ReadAt(b.FileOffset, packed);
+            ReadAt(b.FileOffset, packed, token);
             if (blockHashes is { } hashes)
             {
                 Span<byte> hash = stackalloc byte[HashSize];
                 SHA256.HashData(packed, hash);
+                token.ThrowIfCancellationRequested();
                 Require(hash.SequenceEqual(hashes.Span.Slice(number * HashSize, HashSize)), "MDX 正文块 SHA-256 与导入版本不符。");
             }
-            var bytes = Unpack(packed, b.Plain);
+            var bytes = Unpack(packed, b.Plain, token);
             Interlocked.Increment(ref decodes);
             return bytes;
         }
@@ -857,45 +903,57 @@ public static class MdxReader
         get { lock (CacheLock) return new(hits, Interlocked.Read(ref decodes), retained); }
     }
 
-    private static byte[] GetBlock(IndexedReader reader, string identity, int number)
+    private static byte[] GetBlock(IndexedReader reader, string identity, int number, CancellationToken token)
     {
         var key = new CacheKey(identity, number);
-        Lazy<byte[]> pending;
-        lock (CacheLock)
+        while (true)
         {
-            if (Cached.TryGetValue(key, out var node))
-            {
-                Lru.Remove(node);
-                Lru.AddFirst(node);
-                hits++;
-                return node.Value.Bytes;
-            }
-            if (!InFlight.TryGetValue(key, out pending!))
-            {
-                // 同块只解压一次。读盘、解压、等待均在缓存锁外，不同源使用独立身份。
-                pending = new(() =>
-                {
-                    DecodeSlots.Wait();
-                    try { return reader.LoadBlock(number); }
-                    finally { DecodeSlots.Release(); }
-                });
-                InFlight.Add(key, pending);
-            }
-        }
-        byte[]? bytes = null;
-        try { bytes = pending.Value; return bytes; }
-        finally
-        {
+            token.ThrowIfCancellationRequested();
+            Lazy<byte[]> pending;
             lock (CacheLock)
             {
-                if (InFlight.TryGetValue(key, out var current) && ReferenceEquals(current, pending))
+                if (Cached.TryGetValue(key, out var node))
                 {
-                    InFlight.Remove(key); // 失败允许重试，超过预算的单块只供本轮等候者使用。
-                    if (bytes != null && bytes.Length <= budget)
+                    Lru.Remove(node);
+                    Lru.AddFirst(node);
+                    hits++;
+                    return node.Value.Bytes;
+                }
+                if (!InFlight.TryGetValue(key, out pending!))
+                {
+                    // 同块只解压一次。读盘、解压、等待均在缓存锁外，不同源使用独立身份。
+                    pending = new(() =>
                     {
-                        Cached.Add(key, Lru.AddFirst(new CachedBlock(key, bytes)));
-                        retained += bytes.Length;
-                        TrimCache();
+                        DecodeSlots.Wait(token);
+                        try { return reader.LoadBlock(number, token); }
+                        finally { DecodeSlots.Release(); }
+                    });
+                    InFlight.Add(key, pending);
+                }
+            }
+            byte[]? bytes = null;
+            // Lazy 的同块等待不能独立中断，但最多等一个有界块完成；不会因此继续读下一块。
+            // 如果创建该块的请求已取消，仍有效的调用者用自己的 reader 重试，而不继承其取消。
+            try
+            {
+                bytes = pending.Value;
+                token.ThrowIfCancellationRequested();
+                return bytes;
+            }
+            catch (OperationCanceledException) when (!token.IsCancellationRequested) { }
+            finally
+            {
+                lock (CacheLock)
+                {
+                    if (InFlight.TryGetValue(key, out var current) && ReferenceEquals(current, pending))
+                    {
+                        InFlight.Remove(key); // 失败允许重试，超过预算的单块只供本轮等候者使用。
+                        if (bytes != null && bytes.Length <= budget)
+                        {
+                            Cached.Add(key, Lru.AddFirst(new CachedBlock(key, bytes)));
+                            retained += bytes.Length;
+                            TrimCache();
+                        }
                     }
                 }
             }
@@ -936,20 +994,47 @@ public static class MdxReader
         return BigNumber(buffer[..width]);
     }
 
-    private static byte[] ReadBytes(Stream input, long count, string error = "MDX 数据块长度无效。")
+    private static byte[] ReadBytes(Stream input, long count, string error = "MDX 数据块长度无效。", CancellationToken token = default)
     {
         Require(count >= 0 && count <= SizeLimit && count <= input.Length - input.Position, error);
         byte[] bytes = new byte[(int)count];
-        input.ReadExactly(bytes);
+        ReadCancellable(input, bytes, token);
         return bytes;
     }
 
-    private static uint Adler(byte[] bytes)
+    // 单次同步读取/解码仍不能被强行打断；将流式工作切成 64 KiB，以便后续块及时停下。
+    private static void ReadCancellable(Stream input, Span<byte> bytes, CancellationToken token)
+    {
+        while (!bytes.IsEmpty)
+        {
+            token.ThrowIfCancellationRequested();
+            int length = Math.Min(bytes.Length, 64 * 1024);
+            input.ReadExactly(bytes[..length]);
+            bytes = bytes[length..];
+        }
+        token.ThrowIfCancellationRequested();
+    }
+
+    private static byte[] HashStream(Stream input, CancellationToken token)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        byte[] buffer = new byte[64 * 1024];
+        while (true)
+        {
+            token.ThrowIfCancellationRequested();
+            int count = input.Read(buffer);
+            if (count == 0) return hash.GetHashAndReset();
+            hash.AppendData(buffer, 0, count);
+        }
+    }
+
+    private static uint Adler(byte[] bytes, CancellationToken token = default)
     {
         uint a = 1, b = 0;
         // 分段取模，避免在大块正文上溢出或逐字节除法。
         for (int start = 0; start < bytes.Length; start += 5552)
         {
+            token.ThrowIfCancellationRequested();
             int end = Math.Min(start + 5552, bytes.Length);
             for (int i = start; i < end; i++) { a += bytes[i]; b += a; }
             a %= 65521;
@@ -958,8 +1043,9 @@ public static class MdxReader
         return (b << 16) | a;
     }
 
-    private static byte[] Unpack(byte[] packed, int size)
+    private static byte[] Unpack(byte[] packed, int size, CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         Require(packed.Length >= 8 && size is >= 0 and <= SizeLimit, "MDX 压缩块长度无效。");
         byte[] output = new byte[size];
         switch (BinaryPrimitives.ReadUInt32LittleEndian(packed))
@@ -969,26 +1055,26 @@ public static class MdxReader
                 Buffer.BlockCopy(packed, 8, output, 0, size);
                 break;
             case 1:
-                DecodeLzo(packed, output);
+                DecodeLzo(packed, output, token);
                 break;
             case 2:
                 using (var compressed = new MemoryStream(packed, 8, packed.Length - 8))
                 using (var zlib = new ZLibStream(compressed, CompressionMode.Decompress))
                 {
-                    zlib.ReadExactly(output);
+                    ReadCancellable(zlib, output, token);
                     Require(zlib.ReadByte() == -1, "zlib 正文超过块声明长度。");
                 }
                 break;
             default:
                 throw new InvalidDataException("未支持的 MDX 块压缩格式。");
         }
-        Require(Adler(output) == BinaryPrimitives.ReadUInt32BigEndian(packed.AsSpan(4)), "MDX 数据块校验失败。");
+        Require(Adler(output, token) == BinaryPrimitives.ReadUInt32BigEndian(packed.AsSpan(4)), "MDX 数据块校验失败。");
         return output;
     }
 
     // 1.2 词库使用无容器 LZO1X。指令 0..15 的语义取决于此前复制的字面量个数。
     // 格式参考 https://docs.kernel.org/staging/lzo.html
-    private static void DecodeLzo(byte[] input, byte[] output)
+    private static void DecodeLzo(byte[] input, byte[] output, CancellationToken token)
     {
         int pos = 8, written = 0, state = 0;
         int Next() => pos < input.Length ? input[pos++] : throw new InvalidDataException("LZO 数据被截断。");
@@ -998,7 +1084,11 @@ public static class MdxReader
             if (length != 0) return length;
             int extra;
             length = mask;
-            while ((extra = Next()) == 0) length = checked(length + 255);
+            while ((extra = Next()) == 0)
+            {
+                token.ThrowIfCancellationRequested();
+                length = checked(length + 255);
+            }
             return checked(length + extra);
         }
         void Literals(int n)
@@ -1014,6 +1104,7 @@ public static class MdxReader
         if (input[pos] > 17) Literals(Next() - 17);
         for (;;)
         {
+            token.ThrowIfCancellationRequested();
             int op = Next(), distance, length, trailing;
             if (op < 16 && state == 0)
             {
@@ -1053,14 +1144,18 @@ public static class MdxReader
             }
             Require(distance <= written && length <= output.Length - written, "LZO 引用越界。");
             // 允许自重叠复制，例如重复单个字符的编码。
-            for (int i = 0; i < length; i++, written++) output[written] = output[written - distance];
+            for (int i = 0; i < length; i++, written++)
+            {
+                if ((i & 65535) == 0) token.ThrowIfCancellationRequested();
+                output[written] = output[written - distance];
+            }
             Literals(trailing);
         }
     }
 
     // 2.0 的 Encrypted=2 只编码无密码的块索引。密钥是 8 字节参数的 RIPEMD-128。
     // 见 writemdict/fileformat.md 与 https://homes.esat.kuleuven.be/~bosselae/ripemd/rmd128.txt
-    private static void DecodeKeyIndex(byte[] data)
+    private static void DecodeKeyIndex(byte[] data, CancellationToken token)
     {
         Require(data.Length >= 8, "MDX 词头索引过短。");
         uint[] words = new uint[16];
@@ -1103,6 +1198,7 @@ public static class MdxReader
         int previous = 0x36;
         for (int i = 0; i < data.Length - 8; i++)
         {
+            if ((i & 65535) == 0) token.ThrowIfCancellationRequested();
             int value = data[i + 8];
             int key = (byte)(digest[(i % 16) / 4] >> (8 * (i % 4)));
             data[i + 8] = (byte)(((value << 4) | (value >> 4)) ^ previous ^ i ^ key);

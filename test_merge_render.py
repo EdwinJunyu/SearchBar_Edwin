@@ -348,6 +348,76 @@ class RenderTests(unittest.TestCase):
         self.assertFalse(list(self.renderer.helpers()))
 
 
+class MdictWriteCleanupTests(unittest.TestCase):
+    def setUp(self):
+        import mdict_io
+        self.mdict = mdict_io
+        self.upstream = mdict_io._writer_backend()
+        self.root = Path(self.enterContext(TemporaryDirectory()))
+
+    def test_write_failure_removes_partial_and_preserves_destination(self):
+        from unittest.mock import patch
+        failure = OSError('injected write failure')
+        def fail(writer, stream):
+            stream.write(b'incomplete archive')
+            raise failure
+        for resource in (False, True):
+            with self.subTest(resource=resource):
+                target = self.root / ('book.mdd' if resource else 'book.mdx')
+                target.write_bytes(b'original archive')
+                with patch.object(self.upstream.MDictWriter, 'write', fail):
+                    with self.assertRaises(OSError) as caught:
+                        self.mdict.write_mdict(target, [], '', '', resource)
+                self.assertIs(caught.exception, failure)
+                self.assertEqual(target.read_bytes(), b'original archive')
+                self.assertEqual(list(self.root.glob('*.partial')), [])
+                self.assertEqual(list(self.root.glob('.mdict-*')), [])
+
+    def test_replace_failure_cleans_only_this_attempt(self):
+        from unittest.mock import patch
+        unrelated = self.root / '.other.partial'
+        unrelated.write_bytes(b'other operation')
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                target = self.root / ('existing.mdx' if existing else 'new.mdx')
+                if existing:
+                    target.write_bytes(b'original archive')
+                failure = PermissionError('injected replace failure')
+                with patch.object(self.mdict.os, 'replace', side_effect=failure):
+                    with self.assertRaises(PermissionError) as caught:
+                        self.mdict.write_mdict(target, [], '', '')
+                self.assertIs(caught.exception, failure)
+                self.assertEqual(target.exists(), existing)
+                if existing:
+                    self.assertEqual(target.read_bytes(), b'original archive')
+                self.assertEqual(list(self.root.glob('*.partial')), [unrelated])
+                self.assertEqual(unrelated.read_bytes(), b'other operation')
+                self.assertEqual(list(self.root.glob('.mdict-*')), [])
+
+    def test_exclusive_create_failure_does_not_delete_existing_partial(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        target = self.root / 'book.mdx'
+        partial = self.root / '.book.mdx.collision.partial'
+        partial.write_bytes(b'another writer owns this')
+        with patch.object(self.mdict, 'uuid4', return_value=SimpleNamespace(hex='collision')):
+            with self.assertRaises(FileExistsError):
+                self.mdict.write_mdict(target, [], '', '')
+        self.assertEqual(partial.read_bytes(), b'another writer owns this')
+        self.assertFalse(target.exists())
+
+    def test_success_publishes_readable_mdx_and_mdd_without_partial(self):
+        for resource, rows in ((False, [('食べる', '吃'.encode())]),
+                               (True, [(r'\image.png', b'\x00\xff')])):
+            with self.subTest(resource=resource):
+                target = self.root / ('book.mdd' if resource else 'book.mdx')
+                target.write_bytes(b'old archive')
+                self.mdict.write_mdict(target, rows, 'test', '', resource)
+                self.assertEqual([(key, body) for _, key, body in self.mdict.read_entries(target)], rows)
+                self.assertEqual(list(self.root.glob('*.partial')), [])
+                self.assertEqual(list(self.root.glob('.mdict-*')), [])
+
+
 class RenderDatabaseTests(unittest.TestCase):
     def setUp(self):
         from unittest.mock import patch
@@ -672,10 +742,12 @@ class CompactIndexTests(unittest.TestCase):
                 db.executemany("INSERT INTO terms VALUES (?,?,?,?)", rows)
             db.close()
             before = original.read_bytes()
-            result = audit_merged.compare_term_layouts(original, root / "trial")
+            result = audit_merged.compare_term_layouts(original, root / "trial", fresh_process=True)
             self.assertEqual(result["verified"], {"keys":4,"mappings":7})
             self.assertEqual(set(result["blocks"]), {"4","8","16","32"})
             self.assertIn("packed_nonterm_db_bytes", result, "缺少重建后基础库的真实文件大小")
+            for measurement in result['point_queries'].values():
+                self.assertGreater(measurement['fresh_process']['n'], 0)
             self.assertEqual(original.read_bytes(), before)
             with self.assertRaises(FileExistsError):
                 audit_merged.compare_term_layouts(original, root / "trial")
@@ -689,6 +761,31 @@ class CompactIndexTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 with audit_merged.CompactTermReader(root / "trial", 4) as reader:
                     reader.lookup("😀")
+
+    def test_experiment_module_and_legacy_cli_preserve_snapshot(self):
+        import sys
+        import term_layout_experiments as experiments
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source.db'
+            with sqlite3.connect(source) as db:
+                db.executescript("""
+                    CREATE TABLE dictionaries(id TEXT PRIMARY KEY);
+                    INSERT INTO dictionaries VALUES ('a');
+                    CREATE TABLE terms(term,kind,dict,ordinal);
+                    INSERT INTO terms VALUES ('桜',0,'a',7);
+                """)
+            db.close()
+            before = source.read_bytes()
+            report = root / 'report.json'
+            result = subprocess.run([sys.executable, '-B', '-X', 'utf8', str(Path(audit_merged.__file__)),
+                                     '--compare-term-layouts', str(source), str(root / 'trial'),
+                                     '--output', str(report)], capture_output=True, encoding='utf-8')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(report.read_text('utf-8'))['verified'], {'keys': 1, 'mappings': 1})
+            with experiments.CompactTermReader(root / 'trial', 4) as reader:
+                self.assertEqual(reader.lookup('桜'), [(0, 'a', 7)])
+            self.assertEqual(source.read_bytes(), before)
 
 
 @unittest.skipUnless(os.name == "nt", "Windows x64 发布程序的集成测试")
@@ -981,6 +1078,97 @@ class EnglishLayoutTests(unittest.TestCase):
         for original in (body.replace("sf_cb.css", "another.css"), body.replace('class="CK"', 'class="else"'),
                          '<template>' + body + '</template>', '<!--' + body + '-->'):
             self.assertEqual(merge_render.repair_english_display(original, "hanying"), original)
+
+
+class ParserTraversalTests(unittest.TestCase):
+    def test_visibility_and_offsets_survive_malformed_nesting(self):
+        cases = [
+            ('<i hidden><b>old</i>old', 1),
+            ('<i hidden>old</unknown>old</i>old', 2),
+            ('<i hidden/><b>old</b></i>old', 1),
+            ('<img hidden/>old<br hidden>old', 0),
+            ('<i style="display:block" style="display:none">old</i>', 0),
+            ('<i style="display:none" style="display:block">old</i>old', 1),
+            ('<!-- old -->\r\n<i hidden>old</i>\nold', 2),
+        ]
+        import re
+        cleaner = merge_render.MergedDisplayCleaner({'sango': [('old', 'new')]})
+        for fragment, first_visible in cases:
+            with self.subTest(fragment=fragment):
+                positions = [match.start() for match in re.finditer('old', fragment)]
+                allowed = merge_render._VisibleLocations(fragment, dict.fromkeys(positions, 'text')).allowed
+                self.assertEqual(allowed, set(positions[first_visible:]))
+                prefix = '<!--ESHELP1--><div class="es-source es-sango"><a name="es-sango-1"></a><div class="es-label"><b>sango</b></div>'
+                expected = fragment
+                for pos in reversed(positions[first_visible:]):
+                    expected = expected[:pos] + 'new' + expected[pos+3:]
+                self.assertEqual(cleaner.clean((prefix + fragment + '</div>').encode()),
+                                 (prefix + expected + '</div>').encode())
+
+    def test_end_tag_visibility_is_checked_before_popping(self):
+        fragment = '<i hidden><b>x</i>\r\n</unknown>'
+        hidden_end = fragment.index('</i>')
+        visible_end = fragment.index('</unknown>')
+        allowed = merge_render._VisibleLocations(fragment, {hidden_end: 'end', visible_end: 'end'}).allowed
+        self.assertEqual(allowed, {visible_end})
+
+
+class Html5DependencyTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        import importlib
+        import sys
+        import types
+        import zipfile
+        self.loader = importlib.import_module('html5_dependency')
+        self.root = Path(self.enterContext(TemporaryDirectory()))
+        self.enterContext(patch.object(self.loader, '__file__', str(self.root / 'html5_dependency.py')))
+        self.base = self.root / '.tools'
+        self.base.mkdir()
+        self.native = b'fixture native module'
+        self.wheel = self.base / self.loader.HTML5_PROFILE['wheel']
+        with zipfile.ZipFile(self.wheel, 'w') as archive:
+            archive.writestr('selectolax/lexbor.cp314-win_amd64.pyd', self.native)
+        self.enterContext(patch.dict(self.loader.HTML5_PROFILE, {
+            'wheel_sha256': hashlib.sha256(self.wheel.read_bytes()).hexdigest(),
+            'pyd_sha256': hashlib.sha256(self.native).hexdigest(),
+        }))
+        self.pyd = self.base / 'selectolax-1.0.2/selectolax/lexbor.cp314-win_amd64.pyd'
+        # 只替代 Windows 扩展导入；归档读取、解压与哈希校验使用真实文件。
+        module = types.ModuleType('selectolax.lexbor')
+        self.parser = type('FixtureParser', (), {})
+        module.LexborHTMLParser = self.parser
+        self.enterContext(patch.dict(sys.modules, {'selectolax.lexbor': module}))
+        self.enterContext(patch.object(sys, 'path', sys.path.copy()))
+        merge_render.browser_fragment_parser.cache_clear()
+        self.addCleanup(merge_render.browser_fragment_parser.cache_clear)
+
+    def test_both_callers_extract_and_load_validated_dependency(self):
+        self.assertIs(merge_render.browser_fragment_parser(), self.parser)
+        self.assertEqual(self.pyd.read_bytes(), self.native)
+        self.assertIs(audit_merged.html5_parser(), self.parser)
+
+    def test_invalid_wheel_is_rejected_before_extraction(self):
+        self.wheel.write_bytes(b'invalid wheel')
+        for caller in (merge_render.browser_fragment_parser, audit_merged.html5_parser):
+            with self.subTest(caller=caller.__name__), self.assertRaises(ValueError):
+                caller()
+        self.assertFalse(self.pyd.exists())
+
+    def test_invalid_native_module_is_not_overwritten_or_loaded(self):
+        self.pyd.parent.mkdir(parents=True)
+        self.pyd.write_bytes(b'corrupted native module')
+        for caller in (merge_render.browser_fragment_parser, audit_merged.html5_parser):
+            with self.subTest(caller=caller.__name__), self.assertRaises(ValueError):
+                caller()
+        self.assertEqual(self.pyd.read_bytes(), b'corrupted native module')
+
+    def test_audit_rechecks_native_module_after_render_cache_is_warm(self):
+        self.assertIs(merge_render.browser_fragment_parser(), self.parser)
+        self.pyd.write_bytes(b'changed after render')
+        self.assertIs(merge_render.browser_fragment_parser(), self.parser)
+        with self.assertRaises(ValueError):
+            audit_merged.html5_parser()
 
 
 if __name__ == "__main__":

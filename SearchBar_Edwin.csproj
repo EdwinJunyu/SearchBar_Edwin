@@ -7,7 +7,7 @@
     <Product>SearchBar_Edwin</Product>
     <Version>0.2.1</Version>
     <!-- 归档含旧项目与测试构建副本，避免 SDK 自动收集其中的源码和 XAML。 -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);.tools/**;.data/**;归档/**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);.tools/**;.data/**;归档/**;tests/**</DefaultItemExcludes>
     <ReverseModelDirectory Condition="'$(ReverseModelDirectory)' == ''">$(E_SEARCH_REVERSE_MODEL)</ReverseModelDirectory>
   </PropertyGroup>
   <!-- 发行时及首次安装时需要相同的 DEFLATE 编码器，才能逐字节还原 MDX。
@@ -117,9 +117,11 @@
     <WriteLinesToFile File="$(_SdkCache)/Everything-SDK-LICENSE.txt" Lines="$(_SdkNotice)" Overwrite="true" WriteOnlyWhenDifferent="true" Encoding="UTF-8" />
   </Target>
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
-    <Compile Remove="SearchWindow.xaml.cs;SettingsWindow.xaml.cs" />
+    <!-- Everything worker、文件历史及结果行只由 Windows 桌面入口使用。 -->
+    <Compile Remove="SearchWindow.xaml.cs;SettingsWindow.xaml.cs;EverythingSearch.cs;FileHit.cs;FileRefindHistory.cs" />
   </ItemGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="SearchBar_Edwin.TestSupport" />
     <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.0" />
     <PackageReference Include="SQLitePCLRaw.provider.winsqlite3" Version="2.1.11" />
     <!-- 中文释义反查在 Windows CPU 上运行本地 ONNX 模型，命令行与桌面使用同一个推理运行时。 -->

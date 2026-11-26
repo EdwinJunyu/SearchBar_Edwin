@@ -548,8 +548,22 @@ def verified_render_inputs(stage, previous, volumes, ledger, render_dbs=None, *,
     return result
 
 
+def create_renderer(db, sources):
+    """按卷收集来源资源及 UTF-8 样式，供完整构建和增量重排共用。"""
+    from merge_render import Renderer
+
+    mapping = {source: {} for source in sources}
+    styles = {}
+    for source, original, packaged, body in db.execute("SELECT source,original,packaged,body FROM resource"):
+        if source in mapping:
+            mapping[source][original] = packaged
+            if original.casefold().endswith(".css"):
+                styles[source, original] = body.decode("utf-8")
+    return Renderer(db, mapping, styles)
+
+
 def build(stage, output, resume_volume=None):
-    from merge_render import GD_PROFILE, GD_TABLES, HTML5_PROFILE, Renderer
+    from merge_render import GD_PROFILE, GD_TABLES, HTML5_PROFILE
 
     ledger = json.loads((stage / "stage.json").read_text("utf-8"))
     validate_sources(SOURCES,VOLUMES,ledger["sources"],stage)
@@ -585,14 +599,7 @@ def build(stage, output, resume_volume=None):
                     prior = db.execute(f"SELECT 1 FROM {table} WHERE source IN ({placeholders}) LIMIT 1", sources).fetchone()
                     if prior:
                         raise ValueError(f"{table} 已有该卷审计资料；请使用 repack 或全新暂存")
-            mapping = {source: {} for source in sources}
-            styles = {}
-            for source, original, packaged, body in db.execute("SELECT source,original,packaged,body FROM resource"):
-                if source in mapping:
-                    mapping[source][original] = packaged
-                    if original.casefold().endswith(".css"):
-                        styles[source, original] = body.decode("utf-8")
-            renderer = Renderer(db, mapping, styles)
+            renderer = create_renderer(db, sources)
             # 真实输入含大量在原书中缺少同名目标的跳转。给 SQLite 真实词头选择率，
             # 防止它为 ordinal 排序而反复扫描整本词典。
             db.execute("ANALYZE render_gd_lookup")
@@ -721,7 +728,7 @@ def pack_index_compatibility(stage, previous, output, render_dbs=None):
 
 def refine_layout(stage, previous, output, render_dbs=None):
     """在两份各自独立的已验证渲染库上应用物理 HTML 尾部改写，重新回读整套归档。"""
-    from merge_render import HTML5_PROFILE, Renderer
+    from merge_render import HTML5_PROFILE
     started = time.monotonic()
     ledger = json.loads((stage/"stage.json").read_text("utf-8"))
     with ExitStack() as handles:
@@ -758,12 +765,7 @@ def refine_layout(stage, previous, output, render_dbs=None):
         for volume,(title,sources) in VOLUMES.items():
             _, stats = selected[volume]
             schema = schemas[volume]
-            mapping={s:{} for s in sources}; styles={}
-            for s,old,new,body in db.execute("SELECT source,original,packaged,body FROM resource"):
-                if s in mapping:
-                    mapping[s][old]=new
-                    if old.lower().endswith(".css"): styles[s,old]=body.decode("utf8")
-            renderer=Renderer(db,mapping,styles)
+            renderer = create_renderer(db, sources)
             renderer.logging=False
             dirty={s:set() for s in sources}
             # 局部替换只重登变更物理记录的原坐标。其他引用边与物理输入保持先前逐条验证的版本。

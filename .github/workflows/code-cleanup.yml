@@ -1,0 +1,64 @@
+name: Code cleanup verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build CLI and Windows desktop
+        run: dotnet build -c Release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          architecture: x64
+      - name: Prepare pinned dictionary tool dependencies
+        shell: python
+        run: |
+          if __name__ == '__main__':
+              import subprocess
+              import sys
+              from pathlib import Path
+              from urllib.request import urlretrieve
+              sys.path.insert(0, str(Path.cwd()))
+              from merge_render import GD_TABLES
+              from audit_merged import GOLDENDICT_COMMIT
+              subprocess.run([sys.executable, '-m', 'pip', 'download', '--only-binary=:all:',
+                              '--no-deps', 'mdict-utils==1.3.14', 'selectolax==1.0.2', '-d', '.tools'], check=True)
+              for name, (_, url, _) in GD_TABLES.items():
+                  urlretrieve(url, Path('.tools') / name)
+              for name in ('folding.cc', 'inc_diacritic_folding.hh'):
+                  urlretrieve(f'https://raw.githubusercontent.com/goldendict/goldendict/{GOLDENDICT_COMMIT}/{name}',
+                              Path('.tools') / ('goldendict-bd95948-' + name))
+      - name: Dictionary rendering and dependency checks
+        run: python -B -X utf8 -m unittest -v test_merge_render
+      - name: Independent archive and HTML5 audit self-test
+        run: python -B -X utf8 audit_merged.py --self-test --check-dom
+      - name: Calculator and request context checks
+        run: dotnet run --project tests/RefactorChecks/RefactorChecks.csproj -c Release
+      - name: Reverse search policy checks
+        run: dotnet run --project tests/ReverseSearchChecks/ReverseSearchChecks.csproj -c Release
+      - name: SQLite cancellation checks
+        run: dotnet run --project tests/SqliteCancellationChecks/SqliteCancellationChecks.csproj -c Release
+      - name: Japanese lookup and display rule checks
+        run: dotnet run --project tests/LookupDisplayChecks/LookupDisplayChecks.csproj -c Release
+      - name: Detail cancellation and shared-resource checks
+        run: dotnet run --project tests/DetailTaskChecks/DetailTaskChecks.csproj -c Release
+      - name: Release helper and integrity checks
+        shell: pwsh
+        run: ./tests/ReleaseChecks.ps1
+      - name: Existing regression suite
+        shell: pwsh
+        run: ./regressions.ps1

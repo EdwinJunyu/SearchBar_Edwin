@@ -24,9 +24,9 @@
 # 将已校验的二轮八书索引、两部 MDX 和配套 MDD 复制到独立目录，供发布工具读取。
 $seedCopy = Join-Path '.data' ('release-seed-' + [guid]::NewGuid().ToString('N'))
 Copy-Item -LiteralPath '.data/词书合并交付-20261123/index' -Destination $seedCopy -Recurse
-.\regressions.ps1 -PackageSeed (Join-Path $seedCopy 'dictionaries.db')
+.\release.ps1 -PackageSeed (Join-Path $seedCopy 'dictionaries.db')
 $zip = Get-ChildItem .\bin\release-delivery\E_Search-0.2.0-*-win-x64*.zip | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-.\regressions.ps1 -VerifyReleaseZip $zip.FullName
+.\release.ps1 -VerifyReleaseZip $zip.FullName
 ```
 
 构建 Release 后运行 `.\regressions.ps1` 可检查查询、导入和命令行。下面的桌面验收使用临时词库副本、专属实例和测试快捷键。文件样本目录需已被 Everything 索引。第 11 至 15 节保留此前各阶段的交付记录。
