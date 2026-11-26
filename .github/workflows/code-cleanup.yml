@@ -55,6 +55,9 @@ jobs:
         run: dotnet run --project tests/LookupDisplayChecks/LookupDisplayChecks.csproj -c Release
       - name: Detail cancellation and shared-resource checks
         run: dotnet run --project tests/DetailTaskChecks/DetailTaskChecks.csproj -c Release
+      - name: Release helper and integrity checks
+        shell: pwsh
+        run: ./tests/ReleaseChecks.ps1
       - name: Existing regression suite
         shell: pwsh
         run: ./regressions.ps1

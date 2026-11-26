@@ -120,6 +120,7 @@
     <Compile Remove="SearchWindow.xaml.cs;SettingsWindow.xaml.cs" />
   </ItemGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="SearchBar_Edwin.TestSupport" />
     <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.0" />
     <PackageReference Include="SQLitePCLRaw.provider.winsqlite3" Version="2.1.11" />
     <!-- 中文释义反查在 Windows CPU 上运行本地 ONNX 模型，命令行与桌面使用同一个推理运行时。 -->
