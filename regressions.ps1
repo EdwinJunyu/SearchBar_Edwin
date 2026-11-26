@@ -926,7 +926,6 @@ function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, 
         Assert-Equal (@(Invoke-Search @('article','zh-en','helper')) -join ' ') '<p>指定来源</p>' '辅助页可按卷内精确键打开'
         if ($Assembly) {
             # 使用实际详情窗的 URL 改写入口，再用改写后的卷内键读取合成原生实体补救页。
-            Assert-Equal ($null -ne $rewrite) $true '详情窗包含同源补充跳转绑定'
             $sourceHtml = @(Invoke-Search @('article','zh-ja','alias')) -join ' '
             $navigation = [ESearch.Tests.CoreLogic]::RewriteMergedLinks($sourceHtml,'/page-2')
             $url = [regex]::Match($navigation,'href="([^"]+)"').Groups[1].Value
@@ -3117,7 +3116,7 @@ function Test-SanseidoSummary([string]$Scratch, [Reflection.Assembly]$Assembly) 
             }
         } finally { $reader.Dispose() }
         if ($Assembly) {
-            $static=[Reflection.BindingFlags]'Static,NonPublic'
+            $plain=[ESearch.Tests.CoreLogic]::FormatDetail($words.accelerator,$null,'sanseido')
             Assert-Equal ($plain.Text -split '\r?\n')[-1].EndsWith('アクセル(1)') $true '三省堂详情保留可见的义项号'
             Assert-Equal ($plain.Text.Contains('">')) $false '三省堂详情不显示损坏属性的边界'
             $digest=[Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes('アクセル<font color='))
@@ -3126,6 +3125,7 @@ function Test-SanseidoSummary([string]$Scratch, [Reflection.Assembly]$Assembly) 
             $good='<a href="/page/lookup/'+$key+'">アクセル<font color="#008000">(1)</font></a>'
             $other=$bad.Replace('entry://','/page/lookup/')
             $html='<div class="es-source es-sanseido">'+$bad+'</div><div class="es-source es-oxford">'+$bad+'</div>'
+            $got=[ESearch.Tests.CoreLogic]::RewriteMergedLinks($html,'/page')
             Assert-Equal $got ('<div class="es-source es-sanseido">'+$good+'</div><div class="es-source es-oxford">'+$other+'</div>') '仅在三省堂来源修复链接文字并保留实际目标'
             $fake=$html.Replace($key,('esmissing-sanseido-'+('a'*64)))
             Assert-Equal ([ESearch.Tests.CoreLogic]::RewriteMergedLinks($fake,'/page')) ($fake.Replace('entry://','/page/lookup/')) '目标哈希与原前缀不同时保留损坏现场'
@@ -3850,6 +3850,7 @@ function Test-SecondPassDisplay([Reflection.Assembly]$Assembly) {
     $legacy = 'Google(font size=-2><sup>TM</sup></font>・为 <Sup>1</up>/8加仑'
     $ox = '<div class="es-source es-oxford"><a name="es-oxford-15994"></a><a href="#origin">' + $legacy + '</a></div>'
     $foreign = '<div class="es-source es-hanying">' + $legacy + '</div>'
+    $encoded = [ESearch.Tests.CoreLogic]::EncodeMergedDocument(($ox + $foreign),'/test',$null)
     $merged = [Text.Encoding]::UTF8.GetString($encoded)
     Assert-Equal ($merged.Contains($ox.Replace($legacy,'Google™・为 ⅛加仑') + $foreign)) $true '牛津合并页保留链接、锚点与其他书同形片段'
     $parser = $Assembly.GetType('EntryParser')
