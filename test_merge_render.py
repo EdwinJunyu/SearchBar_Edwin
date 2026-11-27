@@ -16,6 +16,30 @@ import merge_render
 from merge_render import Renderer
 
 
+class JapaneseReleaseTests(unittest.TestCase):
+    def test_public_and_helper_pages_exclude_english_japanese_sources(self):
+        from merge_dictionaries import HELPER, metadata, restrict_japanese_page
+        from merge_render import NAMES
+
+        def section(ids, body):
+            anchors = "".join(f'<a name="es-{s}-1"></a>' for s in ids)
+            labels = " · ".join(f"{NAMES[s]} #1" for s in ids)
+            return (f'<div class="es-source es-{ids[0]}">{anchors}'
+                    f'<div class="es-label"><b>{labels}</b></div>{body}</div>').encode()
+
+        kept = ["shogakukan", 1, "橋", "桥"]
+        excluded = ["eijiro", 1, "橋", "桥"]
+        mixed = section(("eijiro", "shogakukan"), "桥")
+        english = section(("sanseido",), "English gloss")
+        css = b'<style>.es-sanseido div {color:red}</style>'
+        expected = section(("shogakukan",), "桥")
+        self.assertEqual(restrict_japanese_page(metadata([excluded, kept]) + css + mixed),
+                         metadata([kept]) + expected)
+        self.assertEqual(restrict_japanese_page(HELPER + mixed + english), HELPER + expected)
+        self.assertIsNone(restrict_japanese_page(HELPER + english))
+        self.assertIsNone(restrict_japanese_page(metadata([excluded]) + section(("eijiro",), "桥")))
+
+
 class MergedDisplayTests(unittest.TestCase):
     rules = {"sango": [["D?bel", "Dübel"]], "shinseiki": [["\ue003", "様"]],
              "oxford": [["BUY NOW&NDASH;PAY LATER", "BUY NOW–PAY LATER"]]}

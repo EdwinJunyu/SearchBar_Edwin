@@ -41,11 +41,22 @@ internal sealed record TableMapping(int Headword, int Gloss, int? Reading, bool 
 }
 internal sealed partial class DictionaryStore : IDisposable
 {
+    internal static string? BundledEdition()
+    {
+        string marker = Path.Combine(AppContext.BaseDirectory, "Data", "dictionary-edition.txt");
+        if (!File.Exists(marker)) return null;
+        string edition = File.ReadAllText(marker).Trim();
+        return edition is "zh-en" or "zh-ja" ? edition
+            : throw new InvalidDataException("随包词库版本标记无效。");
+    }
+
     internal static string PersonalDirectory()
     {
         string profile = Environment.GetEnvironmentVariable("LOCALAPPDATA") ??
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         string directory = Path.Combine(profile, "SearchBar_Edwin");
+        // 单卷版各用自己的词库，双卷版及旧安装继续访问原有数据。
+        if (BundledEdition() is string edition) return Path.Combine(directory, edition);
         string legacy = Path.Combine(profile, "E_Search");
         // 原安装的词库、快捷键及缓存留在同一目录；首次安装使用新产品名。
         return !File.Exists(Path.Combine(directory, "dictionaries.db")) && File.Exists(Path.Combine(legacy, "dictionaries.db"))
@@ -621,12 +632,13 @@ internal sealed partial class DictionaryStore : IDisposable
         return article with { Html = page[(prefixEnd + 3)..] };
     });
 
-    public void ImportMerged(string directory, Action<string,int>? progress = null) =>
+    public void ImportMerged(string directory, Action<string,int>? progress = null, bool japaneseRelease = false) =>
         ImportMergedWithProgress(directory, progress == null ? null : (stage,done,total) => {
             if (stage is "zh-en" or "zh-ja") progress(stage, checked((int)done));
-        }, default);
+        }, default, japaneseRelease);
 
-    public void ImportMergedWithProgress(string directory, Action<string,long,long>? progress, CancellationToken token)
+    public void ImportMergedWithProgress(string directory, Action<string,long,long>? progress, CancellationToken token,
+        bool japaneseRelease = false)
     {
         sourceOperation = true;
         token.ThrowIfCancellationRequested();
@@ -637,11 +649,14 @@ internal sealed partial class DictionaryStore : IDisposable
         if (root.ValueKind != JsonValueKind.Object || root.EnumerateObject().Any(field => !fields.Add(field.Name)))
             throw new InvalidDataException("双卷清单字段重复或格式无效。");
         if (root.GetProperty("format").GetInt32() != 1) throw new InvalidDataException("双卷清单版本不受支持。");
+        if (japaneseRelease && (!root.TryGetProperty("edition", out var edition) || edition.GetString() != "zh-ja"))
+            throw new InvalidDataException("准备发布种子需要明确标记为 zh-ja 的清单。");
         var counts = root.GetProperty("sources").EnumerateObject().ToDictionary(p => p.Name, p => p.Value.GetInt32(), StringComparer.Ordinal);
-        var sources = Source.All.ToDictionary(s => s.Id, StringComparer.Ordinal);
+        // 中日发行只收四个含中日释义的原书；普通双卷导入继续核对八个来源。
+        var sources = Source.All.Where(s => !japaneseRelease || s.InJapaneseRelease).ToDictionary(s => s.Id, StringComparer.Ordinal);
         if (sources.Count != counts.Count || sources.Keys.Any(s => !counts.TryGetValue(s, out int n) || n < 1))
-            throw new InvalidDataException("双卷清单缺少来源或词条数无效。");
-        string[] groups = ["zh-en", "zh-ja"];
+            throw new InvalidDataException("合卷清单来源不符或词条数无效。");
+        string[] groups = japaneseRelease ? ["zh-ja"] : ["zh-en", "zh-ja"];
         var hashes = root.GetProperty("files").EnumerateObject().ToDictionary(p => p.Name,
             p => p.Value.GetString() ?? "", StringComparer.Ordinal);
         var expected = groups.Select(g => $"E_search-{g}.mdx").ToHashSet(StringComparer.Ordinal);
@@ -1796,6 +1811,54 @@ internal sealed partial class DictionaryStore : IDisposable
     {
         using var check = Command("SELECT 1 FROM sqlite_master WHERE type='table' AND name='merged_mdx_volumes'", tx);
         return check.ExecuteScalar() != null;
+    }
+
+    internal void ExportVolumeSeed(string volume, string destination)
+    {
+        if (VolumeHash(volume) == null)
+            throw new InvalidDataException($"源词库缺少已建立索引的 {volume} 卷。");
+        destination = Path.GetFullPath(destination);
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        // 备份 SQLite 快照，只在全新的发布临时目录里裁剪数据和资源。
+        using (File.Open(destination, FileMode.CreateNew)) { }
+        using (var target = new SqliteConnection(new SqliteConnectionStringBuilder {
+            DataSource = destination, Mode = SqliteOpenMode.ReadWrite, Pooling = false
+        }.ToString()))
+        {
+            target.Open();
+            db.BackupDatabase(target);
+            using var command = target.CreateCommand();
+            command.CommandText = "PRAGMA journal_mode=DELETE; PRAGMA foreign_keys=ON;";
+            command.ExecuteNonQuery();
+            using (var transaction = target.BeginTransaction())
+            {
+                command.Transaction = transaction;
+                command.Parameters.AddWithValue("$volume", volume);
+                // 先按来源级联移除词条，再移除另一卷的词页，保留所选卷的词页 ID 和正文偏移。
+                command.CommandText = """
+                    CREATE INDEX release_origins_page ON merged_origins(page);
+                    DELETE FROM dictionaries WHERE id NOT IN (SELECT dict FROM merged_sources WHERE volume=$volume);
+                    DELETE FROM merged_articles WHERE volume<>$volume;
+                    DELETE FROM merged_volumes WHERE volume<>$volume;
+                    DELETE FROM mdx_layouts WHERE sha256 NOT IN (SELECT sha256 FROM merged_mdx_volumes);
+                    DROP INDEX release_origins_page;
+                    """;
+                command.ExecuteNonQuery();
+                if (openedSchema.HasCatalogNames)
+                {
+                    command.CommandText = """
+                        DELETE FROM catalog_names WHERE (kind='volume' AND id<>$volume)
+                            OR (kind='source' AND id NOT IN (SELECT id FROM dictionaries));
+                        """;
+                    command.ExecuteNonQuery();
+                }
+                transaction.Commit();
+                command.Transaction = null;
+            }
+            command.CommandText = "VACUUM";
+            command.ExecuteNonQuery();
+        }
+        ManagedMdx.CopySources(destination, db.DataSource, destination);
     }
 
     private bool sourceOperation;

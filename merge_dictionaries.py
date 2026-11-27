@@ -11,6 +11,7 @@ from itertools import groupby
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -37,6 +38,10 @@ VOLUMES = {
 
 PREFIX = b"<!--ESMERGE1:"
 HELPER = b"<!--ESHELP1-->"
+JAPANESE_RELEASE_SOURCES = frozenset(("shogakukan", "shinseiki", "sango", "shogakukan-zhja"))
+_EXCLUDED_JAPANESE_MARKUP = re.compile(rb'es(?:ref|missing)?-(?:eijiro|sanseido)(?![a-z])')
+_SCOPED_STYLE = re.compile(r"<style>.*?</style>", re.S)
+_SOURCE_ANCHOR = re.compile(r'<a name="es-([a-z-]+)-(\d+)"></a>')
 
 
 def log(message):
@@ -1086,6 +1091,109 @@ def clean_books(books, output, rules_path, *, repair_layout=False):
     write_report(output / manifest_name, manifest)
 
 
+def restrict_japanese_page(payload):
+    """去掉英日及混合来源，保留已校勘的其余正文与原文元数据。"""
+    from merge_render import NAMES, _SECTION
+
+    header, separator, page = payload.partition(b"-->")
+    if not separator or not (header.startswith(PREFIX) or header + separator == HELPER):
+        raise ValueError("词页缺少可核验的合卷标记")
+    public = header.startswith(PREFIX)
+    records = json.loads(base64.b64decode(header[len(PREFIX):], validate=True)) if public else []
+    kept = [record for record in records if record[0] in JAPANESE_RELEASE_SOURCES]
+    if public and not kept:
+        return None
+    if kept == records and not _EXCLUDED_JAPANESE_MARKUP.search(page):
+        return payload
+
+    html = page.decode("utf-8")
+    sections = list(_SECTION.finditer(html))
+    if not sections or len(sections) != html.count('<div class="es-source '):
+        raise ValueError("无法核对合卷来源分段")
+    styles = html[:sections[0].start()]
+    if _SCOPED_STYLE.sub("", styles):
+        raise ValueError("合卷来源段前存在未识别的内容")
+    parts = [style for style in _SCOPED_STYLE.findall(styles)
+             if not _EXCLUDED_JAPANESE_MARKUP.search(style.encode())]
+    observed = []
+    for index, section in enumerate(sections):
+        refs = _SOURCE_ANCHOR.findall(section[2])
+        if not refs or refs[0][0] != section[1]:
+            raise ValueError("合卷显示段与来源锚点不符")
+        remaining = [(source, number) for source, number in refs if source in JAPANESE_RELEASE_SOURCES]
+        if not remaining:
+            continue
+        end = sections[index + 1].start() if index + 1 < len(sections) else len(html)
+        body = html[section.end():end]
+        if not body.endswith("</div>"):
+            raise ValueError("合卷显示段缺少结束边界")
+        observed.extend((source, int(number)) for source, number in remaining)
+        if remaining == refs:
+            parts.append(html[section.start():end])
+            continue
+        # 多来源仅在原正文相同的纯文本条目上共用一个显示段。
+        anchors = "".join(f'<a name="es-{source}-{number}"></a>' for source, number in remaining)
+        labels = " · ".join(f"{NAMES[source]} #{number}" for source, number in remaining)
+        parts.append(f'<div class="es-source es-{remaining[0][0]}">{anchors}'
+                     f'<div class="es-label"><b>{labels}</b></div>{body}')
+    if public and Counter(observed) != Counter((source, number) for source, number, *_ in kept):
+        raise ValueError("中日发布词页的可见来源与原文记录不一致")
+    if not observed:
+        return None
+    result = "".join(parts).encode()
+    if _EXCLUDED_JAPANESE_MARKUP.search(result):
+        raise ValueError("中日发布词页仍引用被排除的来源")
+    return (metadata(kept) if public else HELPER) + result
+
+
+def build_japanese_release(books, output):
+    from mdict_io import read_entries, read_header, write_mdict
+
+    manifest_name = "E_search-merge.json"
+    manifest = json.loads((books / manifest_name).read_text(encoding="utf-8"))
+    archive, resources = "E_search-zh-ja.mdx", "E_search-zh-ja.mdd"
+    for name in (archive, resources):
+        if manifest["format"] != 1 or file_hash(books / name) != manifest["files"][name]:
+            raise ValueError(f"日语输入卷与清单不符：{name}")
+    if any(not key.startswith("\\es\\shinseiki\\") for _, key, _ in read_entries(books / resources)):
+        raise ValueError("中日发行的 MDD 包含未知来源资源")
+    output.mkdir(parents=True)
+    shutil.copyfile(books / resources, output / resources)
+    if file_hash(output / resources) != manifest["files"][resources]:
+        raise ValueError("中日发行资源复制校验失败")
+    excluded_helpers = {row["key"] for row in manifest.get("goldendict_compatibility", ())
+                        if row["volume"] == "zh-ja" and any(s not in JAPANESE_RELEASE_SOURCES for s, _ in row["origins"])}
+    expected = hashlib.sha256()
+    kept = 0
+
+    def rows():
+        nonlocal kept
+        for ordinal, key, payload in read_entries(books / archive):
+            try:
+                restricted = None if key in excluded_helpers and payload.startswith(HELPER) else restrict_japanese_page(payload)
+            except ValueError as error:
+                raise ValueError(f"第 {ordinal} 行 {key!r}：{error}") from error
+            if restricted is not None:
+                update_hash(expected, key, restricted)
+                kept += 1
+                yield key, restricted
+            if ordinal % 250000 == 0:
+                log(f"中日发行已检查 {ordinal:,} 页，保留 {kept:,} 页")
+
+    header = read_header(books / archive)
+    write_mdict(output / archive, rows(), "中日合并词典", header["Description"])
+    actual = hashlib.sha256()
+    for _, key, payload in read_entries(output / archive):
+        update_hash(actual, key, payload)
+    if expected.digest() != actual.digest() or file_hash(books / archive) != manifest["files"][archive]:
+        raise ValueError("中日发行词卷回读校验失败")
+    write_report(output / manifest_name, {
+        "format": 1, "edition": "zh-ja",
+        "sources": {source: manifest["sources"][source] for source in sorted(JAPANESE_RELEASE_SOURCES)},
+        "files": {archive: file_hash(output / archive), resources: manifest["files"][resources]}})
+    log(f"中日发行词卷已回读校验，保留 {kept:,} 页")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1094,6 +1202,9 @@ def main():
     clean.add_argument("--output", type=Path, required=True)
     clean.add_argument("--rules", type=Path, required=True, help="E_Search export-display-rules 导出的 JSON")
     clean.add_argument("--repair-layout", action="store_true", help="同时校勘来源段内的公式、词头模板及例句排版")
+    japanese = commands.add_parser("build-japanese-release", help="由已校勘的日语卷提取中日发布词卷")
+    japanese.add_argument("--books", type=Path, required=True)
+    japanese.add_argument("--output", type=Path, required=True)
     make_stage = commands.add_parser("stage")
     make_stage.add_argument("--source-root", type=Path, default=DEFAULT_INPUT)
     make_stage.add_argument("--stage", type=Path, required=True)
@@ -1129,6 +1240,8 @@ def main():
     args = parser.parse_args()
     if args.command == "clean-display":
         clean_books(args.books, args.output, args.rules, repair_layout=args.repair_layout)
+    elif args.command == "build-japanese-release":
+        build_japanese_release(args.books, args.output)
     elif args.command == "stage":
         stage_inputs(args.source_root, args.stage)
     elif args.command == "build":

@@ -68,6 +68,11 @@ static void RunDesktop(string? id, string? mergedDatabase = null)
         string hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(mergedDatabase.ToUpperInvariant())));
         pipeName += ".Merged." + hash[..32];
     }
+    else if (DictionaryStore.BundledEdition() is string edition)
+    {
+        // 各版把二次启动转发给自己的常驻窗口。
+        pipeName += "." + edition;
+    }
     if (Environment.GetEnvironmentVariable("E_SEARCH_TEST_INSTANCE") is { Length: > 0 } scope)
     {
         // 同一轮验收的首次和后续启动共享独立的互斥量及管道，个人实例沿用原名。
@@ -270,6 +275,7 @@ if (args is [] or ["help"] or ["--help"])
         indexed-sources             列出当前数据库引用的 MDX 内容哈希
         indexed-ja-source           输出合并日语卷的原始 MDX 哈希（没有则留空）
         indexed-volume-source <zh-en|zh-ja>  输出所选合并卷的原始 MDX 哈希（没有则留空）
+        export-volume-seed <zh-en|zh-ja> <目标数据库>  从指定词库导出单卷发布种子和资源
         install-seed                首次安装随包词典到个人目录，并输出可使用的数据库路径
         pack-ja <MDX> <MDXP>        创建日语词典分发文件
         restore-ja <MDXP> <MDX> <SHA256>  还原并校验原始日语词典
@@ -279,6 +285,7 @@ if (args is [] or ["help"] or ["--help"])
         export-display-rules        导出双卷生成工具使用的显示规则（JSON）
         compact                     整理现有数据库，回收重导后空闲的 SQLite 页
         import-merged <双卷目录>     校验两个卷及其资源，原子导入独立库（可用 E_SEARCH_DB 指定）
+        import-japanese-release <中日卷目录>  导入中日发布种子（须用 E_SEARCH_DB 指定新文件）
         article <卷ID> <原词头>      输出合并卷公开词头或辅助页的 HTML
         list                        查看词典标识、语言、条数、哈希与文件名
         query <输入> [词典ID或卷ID]  查询全部词库、单一来源或 zh-en / zh-ja 卷
@@ -287,7 +294,7 @@ if (args is [] or ["help"] or ["--help"])
         reverse-lexical <中文描述> [词典ID或卷ID]  用原书词语匹配反查，供对照
         prepare-reverse [词典ID或卷ID]  为所选词典准备离线语义索引，可指定 shinseiki 或 oxford
         entry <词典ID> <序号>        查看读音依据与 MDX 原始正文
-        verify                      核对四本基础词典和已启用的扩展词典样本
+        verify [zh-en|zh-ja]         核对双卷或指定单卷的词典样本
         --version                   查看版本、构建标识和支持的词典（JSON）
         """);
 #if WINDOWS
@@ -363,6 +370,15 @@ try
             using (var store = OpenReader())
                 if (store.VolumeHash(args.Length == 1 ? "zh-ja" : args[1]) is string volumeHash) Console.WriteLine(volumeHash);
             break;
+        case ["export-volume-seed","zh-en" or "zh-ja",var destination]:
+        {
+            var sourcePath = Environment.GetEnvironmentVariable("E_SEARCH_DB");
+            if (string.IsNullOrWhiteSpace(sourcePath))
+                throw new ArgumentException("请用 E_SEARCH_DB 指定用于发布的源词库。");
+            using var store = OpenReader();
+            store.ExportVolumeSeed(args[1], destination);
+            break;
+        }
         case ["import-merged",var package]:
         {
             string path = MergedDatabase();
@@ -371,9 +387,26 @@ try
             Console.WriteLine(path);
             break;
         }
+        case ["import-japanese-release",var releasePackage]:
+        {
+            string configured = Environment.GetEnvironmentVariable("E_SEARCH_DB") ?? "";
+            if (string.IsNullOrWhiteSpace(configured))
+                throw new ArgumentException("请用 E_SEARCH_DB 指定中日发布种子的新文件。");
+            string path = Path.GetFullPath(configured);
+            // 发布种子必须写到新文件，避免影响现有双卷库或个人词库。
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            using (File.Open(path, FileMode.CreateNew)) { }
+            using var store = new DictionaryStore(path);
+            store.ImportMerged(releasePackage, (group, pages) => Console.Error.WriteLine($"{group} 已读词页 {pages:N0}"),
+                japaneseRelease: true);
+            store.Compact();
+            Console.WriteLine(path);
+            break;
+        }
         case ["article",var group,var head]:
         {
-            using var store = new DictionaryStore(MergedDatabase(), readOnly: true);
+            using var store = DictionaryStore.BundledEdition() == group
+                ? OpenReader() : new DictionaryStore(MergedDatabase(), readOnly: true);
             var article = store.MergedArticleByKey(group, head) ?? throw new InvalidOperationException("找不到卷内词条");
             Console.WriteLine(article.Html);
             break;
@@ -458,8 +491,8 @@ try
         }
         case ["query" or "prefix" or "reverse" or "reverse-lexical",_] or ["query" or "prefix" or "reverse" or "reverse-lexical",_,_]:
         {
-            // 未指定 E_SEARCH_DB 时，按卷查询与 import-merged、article 使用同一份独立库。
-            using var store = args.Length == 3 && args[2] is "zh-en" or "zh-ja"
+            // 随包卷从本版词库读取，其他显式卷查询仍可使用单独导入的双卷库。
+            using var store = args.Length == 3 && args[2] is ("zh-en" or "zh-ja") && DictionaryStore.BundledEdition() != args[2]
                 ? new DictionaryStore(MergedDatabase(), readOnly: true) : OpenReader();
             var only=args.Length==3 ? LookupId(store,args[2]) : null;
             if (args[0] == "prefix")
@@ -488,11 +521,12 @@ try
             Console.WriteLine(detail.Raw);
             break;
         }
-        case ["verify"]:
+        case ["verify"] or ["verify","zh-en" or "zh-ja"]:
         {
             using var store = OpenReader();
-            long? expectedId=null;
-            foreach(var (input,method,term,display) in new[]{
+            string? edition = args.Length == 2 ? args[1] : DictionaryStore.BundledEdition();
+            long? expectedId = null;
+            foreach (var (input,method,term,display) in edition == "zh-en" ? [] : new[]{
                 ("食べる","headword","食べる","たべる · 吃"),("たべる","reading","たべる","食べる（たべる）· 吃"),
                 ("taberu","romaji","たべる","食べる（たべる）· 吃"),("食べました","deinflection","食べる","食べる（たべる）· 吃")})
             {
@@ -506,6 +540,7 @@ try
             }
             foreach(var (dict,input,gloss) in new[]{("sanseido","食べる","eat"),("oxford","apple","苹果"),("hanying","苹果","apple")})
             {
+                if (edition != null && (Resolve(dict).MergeGroup != edition || dict == "sanseido")) continue;
                 var hit=store.Search(input,dict).FirstOrDefault() ?? throw new InvalidDataException($"{dict} 未命中 {input}");
                 if (hit.Entry.Gloss != gloss || string.IsNullOrWhiteSpace(store.Detail(dict,hit.Entry.EntryId).Raw))
                     throw new InvalidDataException($"{dict} 词条或首义与样本不符");
@@ -516,6 +551,8 @@ try
                 ("sango", "等角写像", "保角映射"), ("eijiro", "absquatulate", "逃げる"),
                 ("shogakukan-zhja", "预约", "予約する") })
             {
+                if (edition == "zh-en") continue;
+                if (edition == "zh-ja" && !Resolve(dict).InJapaneseRelease) continue;
                 var installedId = store.InstalledId(Resolve(dict));
                 if (!enabled.Contains(installedId)) continue;
                 var hit = store.Search(input, installedId).FirstOrDefault(h => h.Method == "headword" && h.Display.Contains(gloss));
@@ -537,6 +574,7 @@ catch (Exception error)
 internal sealed record Source(string Id,string Language,int Priority,string RelativePath,bool Optional = false)
 {
     public string MergeGroup => Id is "oxford" or "hanying" ? "zh-en" : "zh-ja";
+    public bool InJapaneseRelease => Id is "shogakukan" or "shinseiki" or "sango" or "shogakukan-zhja";
     // 同级命中优先使用双语词典；三省堂还混有日语和英语释义。
     public static readonly Source[] All = [
         new("shogakukan","ja",1,"中日/[5《小学馆V2日汉辞典》.mdx"),

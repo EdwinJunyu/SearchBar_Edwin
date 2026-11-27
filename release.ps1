@@ -1,11 +1,12 @@
 # 从独立 SQLite 种子发布，或复验已有 ZIP；不运行日常回归。
-param([string]$PackageSeed, [string]$VerifyReleaseZip)
+param([string]$PackageSeed, [string]$VerifyReleaseZip,
+      [ValidateSet('zh-en','zh-ja')][string]$Edition)
 
 function Get-ReleaseAppName([string]$Directory) {
     if (Test-Path -LiteralPath (Join-Path $Directory 'SearchBar_Edwin.exe')) { return 'SearchBar_Edwin' }
     return 'E_Search'
 }
-function Get-ReleaseEvidence([string]$Directory, [string]$Database) {
+function Get-ReleaseEvidence([string]$Directory, [string]$Database, [string]$Edition) {
     # 从 EXE 读取支持的辞书，再用包内种子运行验收。个人安装和用户词库不参与发布测试。
     $previousDb = $env:E_SEARCH_DB
     try {
@@ -16,12 +17,22 @@ function Get-ReleaseEvidence([string]$Directory, [string]$Database) {
         $info = ($version -join "") | ConvertFrom-Json
         $catalog = @(& $exe list | ForEach-Object { ($_ -split "`t")[0] })
         if ($LASTEXITCODE -ne 0) { throw '包内种子词库无法读取' }
+        $expectedCatalog = switch ($Edition) {
+            'zh-en' { 'hanying','oxford' }
+            'zh-ja' { 'sango','shinseiki','shogakukan','shogakukan-zhja' }
+        }
+        if ($Edition -and (($catalog | Sort-Object) -join ',') -cne ($expectedCatalog -join ',')) {
+            throw "包内词典来源与 $Edition 不符：$($catalog -join ', ')"
+        }
         $samples = @(& $exe verify | ForEach-Object { $_ })
-        if ($LASTEXITCODE -ne 0 -or $samples.Count -lt 7 -or @($samples -notmatch '^PASS\t').Count) {
+        $minimumSamples = if ($Edition -eq 'zh-en') { 2 } else { 7 }
+        if ($LASTEXITCODE -ne 0 -or $samples.Count -lt $minimumSamples -or @($samples -notmatch '^PASS\t').Count) {
             throw '发布程序的词典样本验收失败'
         }
-        if (!($samples -cmatch '^PASS\t食べる\theadword\t食べる\tshogakukan:\d+\t')) {
-            throw '发布验收没有读到原始 UTF-8 日语词头，请核对 EXE 输出的解码方式'
+        $samplePattern = if ($Edition -eq 'zh-en') { '^PASS\t苹果\thanying:\d+\t' }
+            else { '^PASS\t食べる\theadword\t食べる\tshogakukan:\d+\t' }
+        if (!($samples -cmatch $samplePattern)) {
+            throw '发布验收没有读到原始 UTF-8 词头，请核对 EXE 输出的解码方式'
         }
         return [ordered]@{ version=$info.version; build=$info.build; supportedDictionaries=$info.supportedDictionaries
             bundledDictionaries=$catalog; samples=$samples }
@@ -117,6 +128,12 @@ function Test-ReleaseZip([string]$Archive, [string]$Cache) {
         }
         if ((Get-ReleaseFingerprint $manifest.sourceFiles) -cne $manifest.sourceSha256 -or
             (Get-FileHash -LiteralPath $seed).Hash -cne $manifest.seedSha256) { throw 'ZIP 的源码清单或种子与发布记录不一致' }
+        $edition = $manifest.edition
+        $marker = Join-Path $directory 'Data/dictionary-edition.txt'
+        if ($edition) {
+            if ($edition -cnotin 'zh-en','zh-ja' -or ![IO.File]::Exists($marker) -or
+                [IO.File]::ReadAllText($marker).Trim() -cne $edition) { throw 'ZIP 的词库版本标记与分发清单不一致' }
+        } elseif ([IO.File]::Exists($marker)) { throw 'ZIP 缺少版本标记对应的分发清单' }
         $deliveries = @{}
         if ($manifest.ContainsKey('volumeDeliveries')) {
             $deliveries = $manifest.volumeDeliveries
@@ -130,6 +147,20 @@ function Test-ReleaseZip([string]$Archive, [string]$Cache) {
             # 老包只记录了日语卷，包内程序也只有当时的 CLI；保留其原来的验收入口。
             $deliveries = @{'zh-ja'=$manifest.japaneseDelivery}
             $codecHash = $manifest.japaneseDelivery.codecSha256
+        }
+        if ($edition) {
+            if ($deliveries.Count -ne 1 -or !$deliveries.Contains($edition) -or $manifest.indexedSources.Count -ne 1) {
+                throw '单卷版应只引用所选卷的原书'
+            }
+            $expectedData = @('dictionaries.db','dictionary-edition.txt',
+                "dictionaries.db.sources/$($deliveries[$edition].sourceSha256).mdxp")
+            $expectedData += @($manifest.mergedResources | ForEach-Object { "merged-resources/$_.mdd" })
+            $prefix = "$folder/Data/"
+            $actualData = @($members | Where-Object { $_.StartsWith($prefix,[StringComparison]::Ordinal) } |
+                ForEach-Object { $_.Substring($prefix.Length) })
+            if ((($actualData | Sort-Object) -join ',') -cne (($expectedData | Sort-Object) -join ',')) {
+                throw '单卷 ZIP 的数据文件与分发清单不一致'
+            }
         }
         if ($deliveries.Count) {
             if ((Get-FileHash -LiteralPath (Join-Path $directory 'es-zlib-ng.dll')).Hash -cne $codecHash) {
@@ -163,11 +194,22 @@ function Test-ReleaseZip([string]$Archive, [string]$Cache) {
                 $env:LOCALAPPDATA = $profileDirectory
                 $env:E_SEARCH_DB = $null
                 $timer = [Diagnostics.Stopwatch]::StartNew()
-                $paths = @(& (Join-Path $directory ((Get-ReleaseAppName $directory) + '.exe')) install-seed | ForEach-Object { $_ })
+                $exe = Join-Path $directory ((Get-ReleaseAppName $directory) + '.exe')
+                $paths = @(& $exe install-seed | ForEach-Object { $_ })
                 if ($LASTEXITCODE -ne 0) { throw '新用户安装分发卷失败' }
-                $seed = Join-Path $profileDirectory ((Get-ReleaseAppName $directory) + '/dictionaries.db')
+                $profile = Join-Path $profileDirectory (Get-ReleaseAppName $directory)
+                if ($edition) { $profile = Join-Path $profile $edition }
+                $seed = Join-Path $profile 'dictionaries.db'
                 if ($paths.Count -ne 1 -or $paths[0] -ne [IO.Path]::GetFullPath($seed)) { throw '首启没有生成个人词库' }
                 Write-Output ("PASS 首次创建个人词库 {0:N2} 秒" -f $timer.Elapsed.TotalSeconds)
+                if ($edition) {
+                    # 不传 E_SEARCH_DB，复验用户正常调用时的卷查询和正文读取。
+                    $head = if ($edition -eq 'zh-en') { 'apple' } else { '食べる' }
+                    $results = @(& $exe query $head $edition | ForEach-Object { $_ })
+                    if ($LASTEXITCODE -ne 0 -or !$results.Count) { throw "$edition 安装后按卷查询失败" }
+                    $article = (& $exe article $edition $head | Out-String)
+                    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($article)) { throw "$edition 安装后无法读取合卷正文" }
+                }
             } finally {
                 $env:LOCALAPPDATA = $previousProfile
                 $env:E_SEARCH_DB = $previousDb
@@ -177,7 +219,7 @@ function Test-ReleaseZip([string]$Archive, [string]$Cache) {
             ((@(Get-IndexedSeedHashes $directory $seed) -join ',') -cne ($manifest.indexedSources -join ','))) {
             throw 'ZIP 的 MDX 与种子引用清单不一致'
         }
-        $observed = Get-ReleaseEvidence $directory $seed
+        $observed = Get-ReleaseEvidence $directory $seed $edition
         if ($manifest.ContainsKey('mergedResources') -and
             ((@(Get-IndexedSeedHashes $directory $seed -Resources) -join ',') -cne ($manifest.mergedResources -join ','))) {
             throw 'ZIP 内 MDD 与双卷种子不符'
@@ -201,7 +243,7 @@ function Test-ReleaseZip([string]$Archive, [string]$Cache) {
     } finally { $guard.Dispose() }
 }
 
-function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache) {
+function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache,[string]$Edition) {
     $work = [IO.Directory]::CreateDirectory((Join-Path $delivery ('.work/' + [guid]::NewGuid().ToString('N')))).FullName
 
     $seed = (Resolve-Path -LiteralPath $PackageSeed).Path
@@ -235,7 +277,20 @@ function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache) {
     }
     if ((git @gitArgs rev-parse --verify HEAD) -cne $commit -or
         (Get-ReleaseFingerprint (Get-ReleaseSources $PSScriptRoot $inputs)) -cne $fingerprint) { throw '构建时源码发生变化，请用当前工作区重新发布。' }
-    $evidence = Get-ReleaseEvidence $directory $seed
+    if ($Edition) {
+        $exe = Join-Path $directory 'SearchBar_Edwin.exe'
+        $previousDb = $env:E_SEARCH_DB
+        try {
+            $env:E_SEARCH_DB = $seed
+            $seed = Join-Path $work 'seed/dictionaries.db'
+            & $exe export-volume-seed $Edition $seed | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw "无法生成 $Edition 单卷种子" }
+        } finally { $env:E_SEARCH_DB = $previousDb }
+        # 两版使用相同的程序文件，ZIP 中的标记决定安装位置和默认词库。
+        $data = [IO.Directory]::CreateDirectory((Join-Path $directory 'Data')).FullName
+        Set-Content -LiteralPath (Join-Path $data 'dictionary-edition.txt') -Value $Edition -Encoding utf8
+    }
+    $evidence = Get-ReleaseEvidence $directory $seed $Edition
     $indexedSources = @(Get-IndexedSeedHashes $directory $seed)
     $mergedResources = @(Get-IndexedSeedHashes $directory $seed -Resources)
     if ($evidence.build -cne "$($evidence.version)+$tag") { throw '编译标识与本次源码不一致' }
@@ -243,6 +298,7 @@ function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache) {
         binaries=(Get-ReleaseBinaries $directory)
         seedSha256=(Get-FileHash -LiteralPath $seed).Hash
         indexedSources=$indexedSources; mergedResources=$mergedResources; sampleEncoding='utf-8'; verified=$evidence }
+    if ($Edition) { $manifest.edition = $Edition }
     # 从种子识别卷，普通单书仍随包提供原 MDX。相同 SHA 只需一个载体。
     $volumes = Get-ReleaseVolumeHashes $directory $seed
     $byHash = @{}
@@ -267,7 +323,8 @@ function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache) {
         $manifest.volumeDeliveries[$volume] = $byHash[$hash]
     }
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $directory 'release.json')
-    $filename = "SearchBar_Edwin-$($evidence.version)-$($commit.Substring(0,7))-$($fingerprint.Substring(0,12))-win-x64.zip"
+    $editionSuffix = if ($Edition) { "-$Edition" }
+    $filename = "SearchBar_Edwin-$($evidence.version)${editionSuffix}-$($commit.Substring(0,7))-$($fingerprint.Substring(0,12))-win-x64.zip"
     $candidate = Join-Path $work $filename
     # 以流式创建模式写入程序和种子，避免在内存或暂存目录中再复制整份大数据库。
     $source = [IO.File]::Open($seed,'Open','Read','Read')
@@ -314,6 +371,7 @@ function New-ReleaseZip([string]$PackageSeed,[string]$delivery,[string]$cache) {
 # Dot-sourcing exposes release helpers for isolated checks without publishing.
 if ($MyInvocation.InvocationName -eq '.') { return }
 if (!$PackageSeed -and !$VerifyReleaseZip) { throw '请指定 -PackageSeed 或 -VerifyReleaseZip。' }
+if ($Edition -and !$PackageSeed) { throw '-Edition 只适用于 -PackageSeed。' }
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $dotnet = Join-Path $PSScriptRoot '.tools/dotnet/dotnet.exe'
@@ -328,7 +386,7 @@ if ($PackageSeed -or $VerifyReleaseZip) {
         # EXE 始终输出 UTF-8。打包和解压复验共用该合同，避免两次都按同一个错误代码页解码而误报通过。
         [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
         if ($VerifyReleaseZip) { Test-ReleaseZip (Resolve-Path -LiteralPath $VerifyReleaseZip).Path $cache }
-        else { New-ReleaseZip $PackageSeed $delivery $cache }
+        else { New-ReleaseZip $PackageSeed $delivery $cache $Edition }
     } finally { [Console]::OutputEncoding = $previousEncoding }
     return
 }

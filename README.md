@@ -1,7 +1,7 @@
 # SearchBar_Edwin
 Windows 搜索工具（自用）。默认按 `Alt + Space` 唤起搜索框，输入一次就能同时查本地词典和搜索文件。
 
-Windows x64 完整包内含中英、日语两部合并词典，保留八部原书的来源和释义。下载 ZIP、解压后打开 `SearchBar_Edwin-win-x64/SearchBar_Edwin.exe`，旧版下载包的入口为 `E_Search.exe`。首次启动会在本机安装词库。[下载最新版本](https://github.com/EdwinJunyu/SearchBar_Edwin/releases/latest)
+Windows x64 提供 [中英词典版](https://github.com/EdwinJunyu/SearchBar_Edwin/releases/tag/v0.2.2-zh-en) 和 [中日词典版](https://github.com/EdwinJunyu/SearchBar_Edwin/releases/tag/v0.2.2-zh-ja)。中英版内置两本中英辞书，中日版内置四本中日辞书。两版的程序功能相同。解压 ZIP 后打开 `SearchBar_Edwin-win-x64/SearchBar_Edwin.exe`。首次启动会安装该版的独立词库，已有双卷词库和手动导入的数据保留在原安装中。
 
 - **离线查词**：整合八部词典，支持日语假名、罗马字和常见活用，也支持英文短语和拼写建议。搜索框旁可速览释义，展开后可阅读词典原文和排版详情。
 - **联想与反查**：输入词头前缀可看补全建议；想不起词时，可以输入中文描述，查找对应的日语或英语词。
@@ -13,7 +13,7 @@ Windows x64 完整包内含中英、日语两部合并词典，保留八部原�
 # SearchBar_Edwin
 Personal search tool for Windows. Press `Alt + Space` by default to look up a word in local dictionaries and search for files with the same query.
 
-The Windows x64 ZIP includes Chinese–English and Japanese volumes with entries from eight source dictionaries. Extract the ZIP and open `SearchBar_Edwin-win-x64/SearchBar_Edwin.exe` to install the dictionaries on first launch. Earlier packages use `E_Search.exe`. [Download the latest release](https://github.com/EdwinJunyu/SearchBar_Edwin/releases/latest)
+Windows x64 comes in [Chinese–English](https://github.com/EdwinJunyu/SearchBar_Edwin/releases/tag/v0.2.2-zh-en) and [Chinese–Japanese](https://github.com/EdwinJunyu/SearchBar_Edwin/releases/tag/v0.2.2-zh-ja) editions. The editions have the same features and bundle two Chinese–English or four Chinese–Japanese dictionary sources, respectively. Extract the ZIP and open `SearchBar_Edwin-win-x64/SearchBar_Edwin.exe` to install that edition's separate dictionary database. Existing combined and manually imported dictionaries remain in the original installation.
 
 - **Offline dictionaries** — Search eight dictionaries using Japanese kana, romaji, or common inflected forms. English lookups support phrases and spelling suggestions. Read a short definition beside the search box or expand the entry to see the original text and formatting.
 - **Suggestions and reverse lookup** — Type the start of a word for completions. If you can describe a word in Chinese but can’t recall it in Japanese or English, search by that description.

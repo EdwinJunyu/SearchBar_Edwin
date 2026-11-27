@@ -1,4 +1,4 @@
-# Isolated checks: no publish, real dictionaries, or packaged executable is required.
+# Isolated checks use the CLI build and synthetic databases, without publishing or real dictionaries.
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $root = Split-Path $PSScriptRoot
@@ -59,7 +59,41 @@ try {
             Assert-Check ($null -ne $caught -and $caught.Contains($expected)) "corrupt $product $kind was not rejected at the expected integrity check: $caught"
         }
     }
-    Write-Output 'PASS release scripts parse; source fingerprints track release changes; current and legacy ZIP corruption is rejected'
+    $dotnet = Join-Path $root '.tools/dotnet/dotnet.exe'
+    if (!([IO.File]::Exists($dotnet))) { $dotnet = (Get-Command dotnet -ErrorAction Stop).Source }
+    $build = Join-Path $root 'bin/Release/net10.0'
+    $previousDb = $env:E_SEARCH_DB
+    $previousProfile = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = Join-Path $scratch 'profile'
+        $oldProfile = [IO.Directory]::CreateDirectory((Join-Path $env:LOCALAPPDATA 'SearchBar_Edwin')).FullName
+        $oldDatabase = Join-Path $oldProfile 'dictionaries.db'
+        Set-Content -LiteralPath $oldDatabase -Value 'existing combined library'
+        foreach ($edition in 'zh-en','zh-ja') {
+            $bundle = Join-Path $scratch ("cli-" + $edition)
+            Copy-Item -LiteralPath $build -Destination $bundle -Recurse
+            $cli = Join-Path $bundle 'SearchBar_Edwin.dll'
+            $data = [IO.Directory]::CreateDirectory((Join-Path $bundle 'Data')).FullName
+            $seed = Join-Path $data 'dictionaries.db'
+            [IO.File]::Create($seed).Dispose()
+            $env:E_SEARCH_DB = $seed
+            & $dotnet $cli compact
+            Assert-Check ($LASTEXITCODE -eq 0) 'synthetic seed could not be initialized'
+            Set-Content -LiteralPath (Join-Path $data 'dictionary-edition.txt') -Value $edition -Encoding utf8
+            $env:E_SEARCH_DB = $null
+            $expected = Join-Path $oldProfile "$edition/dictionaries.db"
+            foreach ($attempt in 1,2) {
+                $installed = @(& $dotnet $cli install-seed)
+                Assert-Check ($LASTEXITCODE -eq 0 -and $installed.Count -eq 1 -and $installed[0] -ceq $expected -and
+                    [IO.File]::Exists($expected)) "the $edition package must use its own database on launch $attempt"
+            }
+        }
+        Assert-Check ((Get-Content -LiteralPath $oldDatabase) -ceq 'existing combined library') 'the combined library must be preserved'
+    } finally {
+        $env:E_SEARCH_DB = $previousDb
+        $env:LOCALAPPDATA = $previousProfile
+    }
+    Write-Output 'PASS release integrity and both editions install independently of the combined library'
 } finally {
     if (Test-Path -LiteralPath $scratch) { Remove-Item -LiteralPath $scratch -Recurse -Force }
 }

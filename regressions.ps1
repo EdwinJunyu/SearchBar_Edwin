@@ -1024,8 +1024,27 @@ function Test-MergedPackage([string]$Directory, [Reflection.Assembly]$Assembly, 
         $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestFile -Encoding utf8
         Invoke-Search @('import-merged',$dir) 1 | Out-Null
         Assert-Equal (@(Invoke-Search @('article','zh-en','sample')) -join ' ') '<p>两份原文</p>' '缺卷、资源校验或来源对账失败后旧快照可查'
+        $release = [IO.Directory]::CreateDirectory((Join-Path $dir 'japanese-release')).FullName
+        $releaseMdx = Join-Path $release 'E_search-zh-ja.mdx'
+        $releaseMdd = Join-Path $release 'E_search-zh-ja.mdd'
+        $releaseSources = [ordered]@{shogakukan=1; shinseiki=1; sango=1; 'shogakukan-zhja'=1}
+        $releaseRows = @($jaRows | Where-Object { $_[0] -in $releaseSources.Keys })
+        Write-Mdx $releaseMdx ([ordered]@{test=(Article $releaseRows '<p>保留的中日释义</p>')})
+        Copy-Item -LiteralPath $mdd -Destination $releaseMdd
+        [ordered]@{format=1; edition='zh-ja'; sources=$releaseSources; files=[ordered]@{
+            'E_search-zh-ja.mdx'=(Get-FileHash -LiteralPath $releaseMdx).Hash
+            'E_search-zh-ja.mdd'=(Get-FileHash -LiteralPath $releaseMdd).Hash
+        }} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $release 'E_search-merge.json') -Encoding utf8
+        $env:E_SEARCH_DB = Join-Path $dir 'reject-partial.db'
+        Invoke-Search @('import-merged',$release) 1 | Out-Null
+        $env:E_SEARCH_DB = Join-Path $dir 'japanese-seed/dictionaries.db'
+        Invoke-Search @('import-japanese-release',$release) | Out-Null
+        Invoke-Search @('import-japanese-release',$release) 1 | Out-Null
+        $catalog = @(Invoke-Search @('list') | ForEach-Object { ($_ -split "`t")[0] } | Sort-Object)
+        Assert-Equal ($catalog -join '|') 'sango|shinseiki|shogakukan|shogakukan-zhja' '中日发布种子只有四个来源，且重导拒绝覆盖'
+        Assert-Equal (@(Invoke-Search @('article','zh-ja','test')) -join ' ') '<p>保留的中日释义</p>' '中日发布种子能读所保留的正文'
     } finally { $env:E_SEARCH_DB = $previous }
-    Write-Output 'PASS 双卷来源、原书检索、富文本与失败回滚'
+    Write-Output 'PASS 双卷来源、原书检索、失败回滚与独立中日发布种子'
 }
 if ($MergedTestDirectory) {
     # 单独运行双卷验收会提前返回；CLI 始终输出 UTF-8，日文 Windows 的默认代码页会误读中文词条。

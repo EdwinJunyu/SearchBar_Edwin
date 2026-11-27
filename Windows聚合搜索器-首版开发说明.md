@@ -3,9 +3,9 @@
 首版供个人在 Windows 上使用。按 `Alt + Space` 唤起一个搜索框，一次输入同时查询本地词典和 Everything。读译义只需看输入框右侧，打开文件只需按回车。词典与文件结果独立返回，任一侧等待期间，另一侧仍可使用。
 
 
-**当前构建。** 0.2.0 的 Windows x64 包位于 `bin/release-delivery/`，文件名含版本、基准提交和源码指纹。解压后打开 `E_Search-win-x64/E_Search.exe`。切换版本时，先从托盘退出当前运行的 E_Search，再打开新版本。新版本沿用个人词库。包内 `release.json` 列出支持的词典、实际随包的词典及逐项验收结果。在命令行运行 `E_Search.exe --version` 也可查看构建标识。
+**当前构建。** 0.2.2 的 Windows x64 中英版和中日版在 `bin/release-delivery/`，文件名含版本、语种、基准提交和源码指纹。解压后打开 `SearchBar_Edwin-win-x64/SearchBar_Edwin.exe`。包内 `release.json` 列出词库版本、实际随包的来源和词条验收结果。用 `SearchBar_Edwin.exe --version` 可查看构建标识。
 
-中英和日语合并卷在发布 ZIP 中均使用 `.mdxp`。中英卷逐块编码，日语卷还会合并压缩相邻的小块。全新用户首次打开桌面程序时，程序将词库安装到 `%LOCALAPPDATA%\E_Search`，把两卷还原为标准 MDX，逐卷核对 SHA-256 后才启用个人库。也可在解压目录提前运行 `E_Search.exe install-seed` 完成这一步。以后查词直接读取本地 MDX。已有个人词库的用户沿用原库及其设置。
+两版各包含一个 `.mdxp` 合卷。首次启动时将词库安装到 `%LOCALAPPDATA%\SearchBar_Edwin\zh-en` 或 `%LOCALAPPDATA%\SearchBar_Edwin\zh-ja`，逐卷还原并核对 MDX 哈希。也可在解压目录运行 `SearchBar_Edwin.exe install-seed` 完成安装。
 
 搜索框支持词典、文件、算式及浏览器提问。粘贴英语或日语句子可查其中收录的短语；输入 `2^3` 可直接看计算结果；输入 `ai ` 加问题并按回车，会在默认浏览器打开 ChatGPT，由你在网页中发送。普通文件结果用回车打开、Shift+回车定位，回到搜索窗后可继续使用原来的列表和选中项。
 
@@ -21,11 +21,20 @@
 **发布与复验。** 在 Windows PowerShell 7 中运行以下命令。打包使用指定的独立 SQLite 备份，生成自包含程序，解压最终 ZIP 并重新执行其中 EXE 的版本、清单与词条验收。只有通过的包才进入交付目录。可以用 `-VerifyReleaseZip` 独立复验。若源码含未提交改动，包内 reports 还会保存相对基准提交的构建输入差异。
 
 ```powershell
-# 将已校验的二轮八书索引、两部 MDX 和配套 MDD 复制到独立目录，供发布工具读取。
-$seedCopy = Join-Path '.data' ('release-seed-' + [guid]::NewGuid().ToString('N'))
-Copy-Item -LiteralPath '.data/词书合并交付-20261123/index' -Destination $seedCopy -Recurse
-.\release.ps1 -PackageSeed (Join-Path $seedCopy 'dictionaries.db')
-$zip = Get-ChildItem .\bin\release-delivery\E_Search-0.2.0-*-win-x64*.zip | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+# 从已校勘的合卷发布中英版，并准备去掉英辞郎和三省堂的中日卷。
+$base = Resolve-Path '.data/词书合并交付-20261123'
+$work = Join-Path (Resolve-Path 'bin') ('release-seed-' + [guid]::NewGuid().ToString('N'))
+.\release.ps1 -PackageSeed (Join-Path $base 'index/dictionaries.db') -Edition zh-en
+py -3.14 -B -X utf8 merge_dictionaries.py build-japanese-release --books (Join-Path $base 'books') --output (Join-Path $work 'books')
+dotnet build -c Release
+$previous = $env:E_SEARCH_DB
+$japaneseSeed = Join-Path $work 'index/dictionaries.db'
+try {
+    $env:E_SEARCH_DB = $japaneseSeed
+    dotnet ./bin/Release/net10.0/SearchBar_Edwin.dll import-japanese-release (Join-Path $work 'books')
+} finally { $env:E_SEARCH_DB = $previous }
+.\release.ps1 -PackageSeed $japaneseSeed -Edition zh-ja
+$zip = Get-ChildItem .\bin\release-delivery\SearchBar_Edwin-*-zh-ja-*-win-x64*.zip | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 .\release.ps1 -VerifyReleaseZip $zip.FullName
 ```
 
@@ -34,7 +43,7 @@ $zip = Get-ChildItem .\bin\release-delivery\E_Search-0.2.0-*-win-x64*.zip | Sort
 ```powershell
 $expanded = Join-Path $zip.DirectoryName $zip.BaseName
 if (!(Test-Path $expanded)) { Expand-Archive -LiteralPath $zip.FullName -DestinationPath $expanded }
-.\regressions.ps1 -RealDatabase .data/stage5-delivery/dictionaries.db -Desktop -WindowDesktop -FileActionsDesktop -SettingsDesktop -FileFixtureRoot $env:TEMP -GuiExecutable (Join-Path $expanded 'E_Search-win-x64/E_Search.exe')
+.\regressions.ps1 -RealDatabase .data/stage5-delivery/dictionaries.db -Desktop -WindowDesktop -FileActionsDesktop -SettingsDesktop -FileFixtureRoot $env:TEMP -GuiExecutable (Join-Path $expanded 'SearchBar_Edwin-win-x64/SearchBar_Edwin.exe')
 ```
 **第一个任务是交出一条真实词条的查询记录。** 先读第 1 节看四种输入，再读第 4 节看匹配顺序。基本术语可以用同一条记录理解：“词头”是词典收录的写法「食べる」，“读音”是「たべる」，“原形”是从「食べました」还原得到的「食べる」。“条目标识”用来判断四种输入是否真的找到了同一条记录。
 
